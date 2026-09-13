@@ -44,3 +44,18 @@ PLLJ_PLLMGS_INFO.txt
 .idea/
 .vscode/
 *.swp
+
+# --- Another World (a5k) port -------------------------------------------------
+# upstream design: fetched by ports/another-world/fetch_upstream.sh, pinned in UPSTREAM_PIN
+ports/another-world/upstream/
+# Silice build trees and the user's own game files / converted packs
+**/BUILD_*/
+ports/another-world/gamedata/
+ports/another-world/roms/
+# probe synthesis state (keep the .qpf/.qsf/.v, not the databases)
+ports/**/db/
+ports/**/incremental_db/
+ports/**/output_files/
+ports/**/*.log
+# generated upstream output - regenerate with the command in docs/another-world/feasibility-probes.md
+ports/another-world/probe/build.v
