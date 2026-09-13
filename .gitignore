@@ -1,0 +1,46 @@
+# Quartus scratch / build state
+db/
+incremental_db/
+greybox_tmp/
+output/
+build/
+.home/
+*.rpt
+*.summary
+*.smsg
+*.cdf
+*.jdi
+*.qws
+*.qar
+*.qarlog
+c5_pin_model_dump.txt
+cr_ie_info.json
+*_assignment_defaults.qdf
+PLLJ_PLLMGS_INFO.txt
+*.bak
+*.ap-tool-bak
+
+# programming files are artifacts, not sources (the template ships its own
+# exception files inside src/fpga/output_files/.gitignore)
+*.sof
+*.rbf
+*.rbf_r
+*.pof
+*.svf
+*.vip
+
+# keep the reference bitstreams that Analogue ships inside the template
+!cores/core-template/output/bitstream.rbf_r
+!cores/core-template/src/fpga/output_files/*.rbf
+!cores/core-template/src/fpga/output_files/*.sof
+
+# vendored / ported cores are usually their own repos - decide per core
+# cores/mygame/
+
+# agent/session state
+.pi/
+
+# editor noise
+.idea/
+.vscode/
+*.swp

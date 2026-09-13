@@ -1,0 +1,3 @@
+[submodule "cores/core-template"]
+	path = cores/core-template
+	url = https://github.com/open-fpga/core-template

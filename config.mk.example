@@ -1,0 +1,26 @@
+# Copy to config.mk and edit - the Makefile includes it if present.
+# (config.mk is yours; keep machine-local settings out of git.)
+
+# core that bare `make build` / `make package` works on
+CORE        := core-template
+AUTHOR      := yourname
+
+# the pre-built Quartus image and the derived env built from it
+BASE_IMAGE  := didiermalenfant/quartus:22.1-apple-silicon
+IMAGE       := local/ap-pocket:quartus22.1
+
+# fitter parallelism (blank = all cores)
+JOBS        := 16
+
+# run Quartus inside the container as root instead of your uid
+# AP_RUN_AS   := root
+
+# ignore negative slack (a core that fails STA can still work, but expect
+# intermittent, hardware-only bugs)
+# ALLOW_TIMING_FAIL := 1
+
+# extra args for 'quartus_sh --flow compile'
+# QUARTUS_ARGS := --force
+
+# pass extra host directories into the container, colon separated
+# AP_EXTRA_MOUNT := /home/me/roms:/home/me/roms

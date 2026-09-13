@@ -1,0 +1,20 @@
+# Keep the docker build context tiny: only the env definition and the tooling
+# are copied into the image. Sources are bind-mounted at runtime instead.
+.git
+.gitignore
+.home
+build
+cores
+sd
+docs
+README.md
+config.mk
+config.mk.example
+**/db
+**/incremental_db
+**/greybox_tmp
+**/output_files
+**/*.sof
+**/*.rbf
+**/*.rbf_r
+**/*.qws
