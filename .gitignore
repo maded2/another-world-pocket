@@ -34,6 +34,11 @@ PLLJ_PLLMGS_INFO.txt
 !cores/core-template/src/fpga/output_files/*.rbf
 !cores/core-template/src/fpga/output_files/*.sof
 
+# the APF regenerates build_id.mif (build date/time) at the start of every
+# compile. core-template tracks its own copy, which is why it shows as modified
+# after any build; for our own cores keep it out so git status stays clean.
+cores/*/src/fpga/apf/build_id.mif
+
 # vendored / ported cores are usually their own repos - decide per core
 # cores/mygame/
 

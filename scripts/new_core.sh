@@ -65,6 +65,13 @@ mkdir -p "$DEST"
                   --exclude='output_files/*.rbf' --exclude='output_files/*.sof' \
                   --exclude='output/*.rbf_r' -cf - . ) | ( cd "$DEST" && tar -xf - )
 
+# The template ships src/fpga/output_files/.gitignore containing nothing but
+# `!*.sof` / `!*.rbf`, so that it can commit a reference bitstream. A port does
+# not want that file: it re-un-ignores every programming file, so the first
+# rebuild drops ~3 MB of .sof/.rbf into the working tree and they end up in the
+# next commit. Drop it and let the repo-level rules apply.
+rm -f "$DEST/src/fpga/output_files/.gitignore"
+
 # ---- rename the Quartus project --------------------------------------------
 OLD="$(ls "$DEST"/src/fpga/*.qpf 2>/dev/null | head -1)"
 if [ -n "$OLD" ]; then

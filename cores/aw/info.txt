@@ -1,0 +1,4 @@
+aw
+
+openFPGA core for Analogue Pocket by author
+Built with the ap-tool environment (Quartus Prime Lite in Docker).
