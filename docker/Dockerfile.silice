@@ -6,8 +6,13 @@
 # `silice` / `silice-make.py` so the a5k design can be translated to Verilog,
 # which is the input the Pocket (Quartus) flow actually consumes.
 #
+#   make silice-image                                  # or:
 #   docker build -f docker/Dockerfile.silice -t local/ap-silice:latest .
-#   docker run --rm -v $PWD:/work local/ap-silice:latest <command>
+#   ./docker/run-silice.sh <command>
+#
+# Run it with docker/run-silice.sh, not a bare `docker run`: the wrapper maps
+# your uid/gid so the BUILD_* trees Silice writes into the repo stay yours.
+# As root they come out root:root 755 and cannot be deleted without sudo.
 #
 # Deliberately separate from the Quartus image: different base, different job.
 # ============================================================================

@@ -34,7 +34,10 @@ if [ -x "$here/upstream/hardware/common/download_all.sh" ] || \
 fi
 
 echo "done. translate with:"
-echo "  docker build -f docker/Dockerfile.silice -t local/ap-silice:latest ."
-echo "  docker run --rm -v \$PWD:/work -w /work/ports/another-world/upstream/hardware \\"
-echo "    local/ap-silice:latest python3 /opt/Silice/bin/silice-make.py \\"
-echo "    -s a5k.si -b icebreaker -p basic,vga,qspiflash,buttons -o BUILD_probe --no_build"
+echo "  make silice-image       # once: build the Silice toolchain"
+echo "  make a5k-translate      # -> upstream/hardware/BUILD_probe/build.v"
+echo ""
+echo "Both go through docker/run-silice.sh, which runs as your uid so the"
+echo "generated BUILD_* tree stays yours. A bare 'docker run' (as the early probe"
+echo "notes used to suggest) runs as root and leaves BUILD_probe root:root 755 -"
+echo "undeletable from the host without sudo.")

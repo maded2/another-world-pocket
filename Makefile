@@ -17,12 +17,19 @@
 #   JOBS              parallelism for Quartus (default: all cpus)
 #   QUARTUS_ARGS      extra args handed to 'quartus_sh --flow compile'
 #   ALLOW_TIMING_FAIL set to 1 to keep going when STA reports negative slack
+#
+# There is a second, separate workstream in this repo: ports/another-world
+# (the a5k / Silice port). It has its own image and its own targets at the
+# bottom of this file - 'make help' lists them. Silice translates .si to
+# Verilog; only then does the Quartus flow above apply to it.
 # ============================================================================
 
-CORE        ?= core-template
-AUTHOR      ?= author
-BASE_IMAGE  ?= didiermalenfant/quartus:22.1-apple-silicon
-IMAGE       ?= local/ap-pocket:quartus22.1
+CORE         ?= core-template
+AUTHOR       ?= author
+BASE_IMAGE   ?= didiermalenfant/quartus:22.1-apple-silicon
+IMAGE        ?= local/ap-pocket:quartus22.1
+SILICE_IMAGE ?= local/ap-silice:latest
+AW           := ports/another-world
 CORE_DIR    := cores/$(CORE)
 BUILD       := build/$(CORE)
 OUT_DIR     := /work/build          # same folder, seen from inside the container
@@ -35,7 +42,8 @@ CORES    := $(notdir $(wildcard cores/*))
 
 .DEFAULT_GOAL := help
 .PHONY: help image pull doctor smoke shell build clean-build rev package test \
-        new report list size clean distclean prune
+        new report list size clean distclean prune \
+        silice-image silice-shell silice a5k-translate upstream probe
 
 help:
 	@echo "Analogue Pocket openFPGA build env (CORE=$(CORE), image=$(IMAGE))"
@@ -57,12 +65,24 @@ help:
 	@echo
 	@echo "  make list                  list cores and their Quartus projects"
 	@echo "  make size                  disk used by builds"
+	@echo
 	@echo "  make clean [CORE=x]        remove Quartus DBs + build output for a core"
 	@echo "  make distclean             remove all build output"
 	@echo "  make prune                 docker image/layer cleanup for this project"
 	@echo
+	@echo "Another World (a5k / Silice) port - see docs/another-world/"
+	@echo "  make upstream              fetch/refresh pinned upstream a5k sources"
+	@echo "  make silice-image          build the Silice toolchain image"
+	@echo "  make a5k-translate         .si -> build.v (input for the Quartus flow)"
+	@echo "  make silice-shell          shell in the Silice image"
+	@echo "  make silice CMD='...'      run any Silice-image command"
+	@echo "  make probe SCRIPT=...      run a feasibility probe in the Quartus image"
+	@echo
 	@echo "Debugging: make build QUARTUS_ARGS=--effort=standard, JOBS=8,"
 	@echo "           ALLOW_TIMING_FAIL=1 to ignore STA failures."
+	@echo "           'make build' on an unchanged tree is answered by Quartus'"
+	@echo "           smart recompilation in seconds and re-prints the previous"
+	@echo "           STA summary - use 'make clean-build' to force a real one."
 
 # --------------------------------------------------------------- environment --
 pull:
@@ -161,3 +181,37 @@ prune:
 	@echo "removing leftover build containers/images (keeps $(IMAGE))"
 	@docker ps -aq --filter label=ap-tool=1 | xargs -r docker rm -f
 	@docker image prune -f >/dev/null && echo "pruned dangling images"
+
+# ------------------------------------------------ Another World (a5k) port --
+# Silice is a different toolchain in a different image: a5k is written in .si,
+# translated to Verilog, and only then does the Quartus flow above consume it.
+# Everything runs through docker/run-silice.sh, which maps your uid so the
+# generated BUILD_* trees stay deletable by you (a bare `docker run` leaves
+# them root:root 755 and you need sudo to clean them up).
+
+silice-image:
+	docker build -f docker/Dockerfile.silice -t $(SILICE_IMAGE) .
+
+silice-shell:
+	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh
+
+silice:
+	@test -n "$(CMD)" || { echo "usage: make silice CMD='silice --help'"; exit 1; }
+	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh $(CMD)
+
+# regenerate upstream/hardware/BUILD_probe/build.v (gitignored output)
+a5k-translate:
+	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh scripts/a5k_translate.sh
+
+# upstream a5k at the commit pinned in $(AW)/UPSTREAM_PIN; needs network
+upstream:
+	@./$(AW)/fetch_upstream.sh
+
+# feasibility probes expect to run inside the Quartus container:
+#   make probe SCRIPT=probe/pll/run.sh
+probe:
+	@test -n "$(SCRIPT)" || { echo "usage: make probe SCRIPT=probe/pll/run.sh"; \
+		echo "available:"; ls $(AW)/probe/*/*.sh 2>/dev/null | sed 's|$(AW)/||'; exit 1; }
+	@t=$(AW)/$(SCRIPT); test -f "$$t" || { echo "no such probe: $$t"; exit 1; }; \
+	 echo "[probe] $$t - inside the Quartus container; some run for many minutes"; \
+	 $(AP) "$$t"

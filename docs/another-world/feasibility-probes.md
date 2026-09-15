@@ -27,7 +27,7 @@ toolchain — it is one memory property.**
 
 ```
 silice-make.py -s a5k.si -b icebreaker -p basic,vga,qspiflash,buttons \
-               -o BUILD_probe --no_build          ->  build.v (181 KB, 8152 lines, 32 modules)
+               -o BUILD_probe --no_build          ->  build.v (181 KB, 8152 lines, 31 modules)
 quartus_map (SYSTEMVERILOG off)  ->  rc=3, 19x Error (10170) at 16 distinct lines
 ```
 
@@ -119,16 +119,31 @@ palette).
 
 ## How to re-run
 
-```bash
-# Silice toolchain (builds Silice from source in Ubuntu 24.04)
-docker build -f docker/Dockerfile.silice -t local/ap-silice:latest .
+Everything goes through `make`, which drives the two wrapper scripts. Both
+wrappers map your uid/gid; that is not cosmetic — a bare `docker run` on the
+Silice image runs as root, lays `BUILD_probe` down as `root:root 755`, and you
+cannot delete files inside a directory you cannot write to.
 
-# emit Verilog for the upstream design
-docker run --rm -v $PWD:/work -w /work/ports/another-world/upstream/hardware \
-  local/ap-silice:latest python3 /opt/Silice/bin/silice-make.py \
-  -s a5k.si -b icebreaker -p basic,vga,qspiflash,buttons -o BUILD_probe --no_build
+```bash
+make upstream          # fetch upstream a5k at the pinned commit (if not present)
+make silice-image      # build Silice from source in Ubuntu 24.04 (once)
+make a5k-translate     # -> upstream/hardware/BUILD_probe/build.v
+                       #    (181,419 B / 8152 lines / 31 modules, re-verified)
 
 # Quartus probes (probe/ holds a1probe.qpf/qsf, lattice_stubs.v, ramshape/)
-docker run --rm -v $PWD:/work -w /work local/ap-silice:latest true   # tool check
-docker/run.sh ports/another-world/probe/ramshape/run.sh              # the 4 shapes
+make probe                                        # list the probe scripts
+make probe SCRIPT=probe/ramshape/run.sh           # framebuffer shapes a..e
+make probe SCRIPT=probe/pll/run.sh                # PLL counters + achieved fmax
+make probe SCRIPT=probe/c1rom/run.sh              # does the ROM bank infer M9K
+make probe SCRIPT=probe/c1rom/run_budget.sh       # whole-design ROM budget
 ```
+
+Equivalent low-level commands, if you would rather not use `make`:
+
+```bash
+./docker/run-silice.sh scripts/a5k_translate.sh
+./docker/run.sh      ports/another-world/probe/ramshape/run.sh
+```
+
+The translate step is also parameterised:
+`SILICE_BOARD`, `SILICE_PERIPH`, `SILICE_OUT` (see `scripts/a5k_translate.sh`).

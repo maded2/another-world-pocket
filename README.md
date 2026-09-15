@@ -18,6 +18,8 @@ make test     open-fpga/core-template compiled in 57s, positive slack in every
               414/18,480 ALMs, bitstream reversed, packaged + zipped: OK
 make new      scaffolded a fresh core, renamed the Quartus project, built and
               packaged it as Cores/<author>.<core>/ - end to end
+a5k port    make a5k-translate reproduces upstream build.v (181,419 B / 8152 lines)
+            / 31 modules from the pinned commit, every file owned by your uid
 artifacts     owned by the host user; no sudo, no root-owned files
 ```
 
@@ -60,9 +62,14 @@ scripts run in both places).
 | `docker/entrypoint.sh` | writable-`HOME` fallback, keeps the base image's `quartus-entrypoint` (GitHub auth, JTAG server), chowns output back when running as root |
 | `scripts/build.sh` | the compile driver: finds the `.qpf`, applies build-time QSF tweaks, runs `quartus_sh --flow compile`, collects the bitstream, parses the fitter/STA summaries, reverses the bits |
 | `scripts/reverse_bits.py` | `.rbf` → `.rbf_r` (per-byte bit reversal — the step Analogue calls "Creating a reversed RBF") |
-| `scripts/package_core.py` | validates the core JSON contract and assembles the SD layout + release zip |
+| `scripts/package_core.py` | validates the core JSON contract and assembles the SD layout + release zip. Every filename in `core.cores[]` must be backed by its own artifact — it will not reuse one bitstream for several variants |
 | `scripts/new_core.sh` | scaffolds `cores/<name>` from the template and renames the Quartus project |
 | `scripts/doctor.sh` | environment checks, plus `--smoke` which compiles a throwaway design for the Pocket device |
+| `scripts/a5k_translate.sh` | `.si` → Verilog for the a5k port; runs inside the Silice image (see §5) |
+| `docker/Dockerfile.silice` | the **second** image: Silice toolchain, needed only for `ports/another-world` |
+| `docker/run-silice.sh` | same uid-mapping wrapper as `run.sh`, for the Silice image — use it instead of a bare `docker run` |
+| `ports/another-world/` | the a5k (*Another World*) port study: pinned upstream, feasibility probes (§5) |
+| `docs/another-world/` | problem analysis + measured feasibility probes for that port |
 | `cores/core-template/` | git submodule of [`open-fpga/core-template`](https://github.com/open-fpga/core-template) pinned at **v1.3.0** (`da3a021`) — Analogue's official starting point, containing the APF (Analogue Pocket Framework). Clone with `git clone --recurse-submodules`, or `git submodule update --init` afterwards |
 | `build/<core>/` | `compile.log`, `report.txt`, `ap_core.rbf`, `ap_core.sof`, `bitstream.rbf_r` |
 | `Makefile` | the front door; `make help` lists every target |
@@ -307,7 +314,49 @@ compatibility):
 
 ---
 
-## 5. Troubleshooting (all of these were hit for real while building this env)
+## 5. The second workstream: Another World (a5k / Silice)
+
+`ports/another-world/` is a port study for **a5k**, the hardware design behind
+[*Another World*](https://github.com/sylefeb/a5k). It is not a Pocket core yet
+and it does not enter the flow above through `.qpf`: a5k is written in **Silice**
+(`.si`, compiled by a C++/ANTLR frontend), so it must be translated to Verilog
+before `quartus_map` sees it. That is why there is a second image.
+
+| Target | What it does |
+|---|---|
+| `make upstream` | clone/refresh upstream a5k at the commit pinned in `ports/another-world/UPSTREAM_PIN` |
+| `make silice-image` | build the Silice toolchain from `docker/Dockerfile.silice` |
+| `make a5k-translate` | `.si` → `upstream/hardware/BUILD_probe/build.v`, the Quartus input |
+| `make silice-shell` | shell in the Silice image |
+| `make silice CMD='silice --help'` | any other command in that image |
+| `make probe SCRIPT=probe/pll/run.sh` | run one feasibility probe inside the **Quartus** container (`make probe` alone lists them) |
+
+The findings live in [`docs/another-world/problem-analysis.md`](docs/another-world/problem-analysis.md)
+(sizing the design against 18,480 ALMs) and
+[`docs/another-world/feasibility-probes.md`](docs/another-world/feasibility-probes.md)
+(the SystemVerilog switch that gets Silice output past `quartus_map`, PLL reachability,
+and the sub-byte write-masked framebuffer that does **not** map to Cyclone V M9K).
+
+Both images are driven by a wrapper — `docker/run.sh` for Quartus,
+`docker/run-silice.sh` for Silice — and both map your uid/gid. Do not `docker run`
+the Silice image directly: as root it lays `BUILD_*` down as `root:root 755`, and
+a directory you cannot write into is a directory you cannot delete files in,
+sudo or `chown` required. See Troubleshooting.
+
+Verified here: `make a5k-translate` regenerates `build.v` at the documented
+181,419 B / 8,152 lines / 31 modules, with all 43 generated files owned by the
+host user.
+
+---
+
+## 6. Troubleshooting (all of these were hit for real while building this env)
+
+* **`BUILD_*` under `ports/another-world/upstream/` is root-owned and `rm` says
+  Permission denied** — Silice was run through a bare `docker run` instead of
+  `docker/run-silice.sh`. The directory itself is `root:root 755`, so the host
+  user cannot unlink inside it even though its parent is theirs. Repair:
+  `docker run --rm -v $PWD:/work ubuntu:latest chown -R $(id -u):$(id -g) /work/ports`
+  then use `make a5k-translate`.
 
 * **`quartus_sh: error while loading shared libraries: libprotobuf.so.14`** when
   not root — the base image was built with a restrictive umask, so ~23k files of
@@ -348,7 +397,7 @@ compatibility):
 
 ---
 
-## 6. Notes on the base image
+## 7. Notes on the base image
 
 `didiermalenfant/quartus:22.1-apple-silicon` is the only tag on that repository
 (≈5.9 GB compressed). It contains Quartus Prime **Lite** 22.1std.2 build 922
@@ -362,7 +411,7 @@ Because that Python is 3.5, everything in `scripts/` is written to run on
 Python 3.5 and on modern Python alike — no f-strings, no `dirs_exist_ok`, no
 PEP-604 annotations. Keep it that way if you add tooling.
 
-## 7. Licensing
+## 8. Licensing
 
 The APF sources under `src/fpga/apf/` are Analogue's, licensed under their
 [Pocket EULA](https://www.analogue.link/pocket-eula) — use them only to build

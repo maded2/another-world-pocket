@@ -100,7 +100,7 @@ esac
 [ -w "${HOME:-/nonexistent}" ] && ok "HOME=$HOME is writable" || bad "HOME=$HOME not writable (Quartus needs this)"
 
 here="$(cd "$(dirname "$0")" && pwd)"
-for s in build.sh reverse_bits.py package_core.py new_core.sh; do
+for s in build.sh reverse_bits.py package_core.py new_core.sh a5k_translate.sh; do
     [ -f "$here/$s" ] && ok "script $s" || wrn "script $s missing next to doctor.sh"
 done
 

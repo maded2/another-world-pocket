@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Host-side wrapper: run anything in the Silice container (the a5k frontend).
+#
+#   docker/run-silice.sh                                  # shell in the image
+#   docker/run-silice.sh silice --help                    # any command
+#   docker/run-silice.sh scripts/a5k_translate.sh         # regenerate build.v
+#
+# This mirrors docker/run.sh on purpose. The reason it exists: Silice writes
+# its whole BUILD_* tree into the repo, and a bare `docker run` (which the
+# probe docs used to suggest) runs as root and leaves root-owned files you
+# cannot delete from the host without sudo - the BUILD_* directory ends up
+# root:root 755, so even unlinking inside it is denied. Running as your uid
+# keeps every artifact yours, which is what the rest of this repo promises.
+#
+# Recognised environment:
+#   SILICE_IMAGE   image to run   (default local/ap-silice:latest)
+#   AP_RUN_AS      root | user    (default user; root only for tool debugging)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${SILICE_IMAGE:-local/ap-silice:latest}"
+RUN_AS="${AP_RUN_AS:-user}"
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "error: docker not found on PATH" >&2
+    exit 127
+fi
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "error: image $IMAGE not found - run 'make silice-image' first" >&2
+    exit 1
+fi
+
+# Silice and its python driver want a writable HOME; keep it in the mount.
+mkdir -p "$ROOT/.home"
+chmod 777 "$ROOT/.home" 2>/dev/null || true
+
+docker_args=(
+    --rm
+    -v "$ROOT:/work"
+    -w /work
+    -e HOME=/work/.home
+    -e SILICE_ROOT=/opt/Silice
+    -e PYTHONPATH=/opt/Silice/python
+    --label ap-tool=1
+)
+
+if [ "$RUN_AS" != "root" ] && [ "$(id -u)" != "0" ]; then
+    docker_args+=(--user "$(id -u):$(id -g)")
+fi
+
+if [ $# -eq 0 ] && [ -t 1 ]; then
+    docker_args+=(-it)
+elif [ -t 1 ]; then
+    docker_args+=(-t)
+fi
+
+if [ -n "${AP_EXTRA_MOUNT:-}" ]; then
+    IFS=: read -ra extras <<< "$AP_EXTRA_MOUNT"
+    for m in "${extras[@]}"; do
+        [ -n "$m" ] && docker_args+=(-v "$m")
+    done
+fi
+
+exec docker run "${docker_args[@]}" "$IMAGE" "$@"
