@@ -206,8 +206,24 @@ Arria-10 (110K–480K LE, 4–8 MB of block RAM) will **not** fit here unmodifie
    `input.json` (which controls/axes your core reads), `audio.json`,
    `data.json` (ROM slots + extensions), `interact.json` (on-screen menu
    variables), `variants.json`, `info.txt`.
-   `make package` validates these (`magic: APF_VER_1`, unique variant ids,
-   every declared bitstream present, every declared platform has a definition).
+   `make package` validates these (`magic: APF_VER_1`, unique variant ids in
+   both `core.cores[]` and `variants.json`, every declared bitstream present,
+   every declared platform has a definition).
+
+   If `core.cores[]` declares **more than one** entry, each needs its own build
+   artifact: `--bitstream` only ever satisfies a single-variant core (or the one
+   entry whose filename it matches). Map the rest explicitly — packaging refuses
+   to copy one image under several names, because that packages a core whose
+   variants all silently boot the same bitstream:
+
+   ```bash
+   python3 scripts/package_core.py --core-dir cores/mygame --out build/sd \
+       --variant default=build/mygame/default.rbf_r \
+       --variant hispeed=build/mygame/hispeed.rbf_r --zip
+   ```
+
+   A variant file already sitting in `cores/<name>/`, `output/`, `dist/` or
+   `src/fpga/output_files/` is picked up without being named.
 
 7. **Build early, build often:**
 

@@ -13,12 +13,21 @@ Output: the tree the Pocket expects at the root of its SD card:
     <out>/Assets/<platform>/common/
 
 A ``.rbf`` passed with --bitstream is reversed for you; a ``.rbf_r`` is copied.
-The JSON contract (magic APF_VER_1, declared bitstreams, declared platform ids)
-is validated and a release .zip can be produced with --zip.
+The JSON contract (magic APF_VER_1, unique variant ids in both core.cores[] and
+variants.json, every declared bitstream present, every declared platform id
+defined) is validated and a release .zip can be produced with --zip.
 
     package_core.py --core-dir cores/mygame --out build/sd --zip
     package_core.py --core-dir cores/mygame --bitstream build/mygame/bitstream.rbf_r
     package_core.py --core-dir cores/mygame --out build/sd --release   # strict checks
+
+A core that declares more than one entry in core.cores[] needs one artifact per
+entry; --bitstream only ever satisfies a single-variant core (or the entry whose
+filename matches it). Map the others explicitly:
+
+    package_core.py --core-dir cores/mygame --out build/sd \\
+        --variant default=build/mygame/default.rbf_r \\
+        --variant hispeed=build/mygame/hispeed.rbf_r
 
 Written for Python 3.5+ (the Quartus container ships Debian 9's Python 3.5).
 """
@@ -119,8 +128,19 @@ def write_reversed(src, dst):
     dst.write_bytes(src.read_bytes().translate(REVERSE_TABLE))
 
 
+def find_declared(core_dir, fname):
+    """Locate a bitstream a core tree already holds for a declared variant."""
+    for cand in (core_dir / fname,
+                 core_dir / "output" / fname,
+                 core_dir / "dist" / fname,
+                 core_dir / "src" / "fpga" / "output_files" / fname):
+        if cand.is_file():
+            return cand
+    return None
+
+
 def package(core_dir, out_dir, core_id=None, bitstream=None,
-            make_zip=False, release=False):
+            make_zip=False, release=False, variant_bits=None):
     report = Report()
     core_dir = Path(core_dir)
     out_dir = Path(out_dir)
@@ -166,22 +186,27 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
     if len(set(v.get("name") for v in variants)) != len(variants):
         report.error("core.cores[] has duplicate 'name' values")
 
-    # optional JSON files, and their magic
+    # optional JSON files, and their magic.  Each file is parsed once: calling
+    # load_json twice on a broken file reported the same error two times.
+    subs = {}
     for name in CORE_FILES[1:]:
         if not name.endswith(".json"):
             continue
-        sub = load_json(core_dir / name, report)
-        if sub is None:
+        if not (core_dir / name).is_file():
             if name in ("video.json", "input.json", "data.json", "audio.json"):
                 report.warn("{} not present - Analogue OS tolerates it, but most "
                             "cores ship one".format(name))
             continue
+        sub = load_json(core_dir / name, report)
+        if sub is None:
+            continue
+        subs[name] = sub
         section = sub.get(name[:-5], {})
         if section.get("magic") != MAGIC:
             report.warn('{}: magic is {!r}, expected "{}"'.format(
                 name, section.get("magic"), MAGIC))
 
-    video = load_json(core_dir / "video.json", report) or {}
+    video = subs.get("video.json") or {}
     modes = video.get("video", {}).get("scaler_modes", [])
     for i, m in enumerate(modes):
         if not m.get("width") or not m.get("height"):
@@ -190,7 +215,45 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
             report.warn("video scaler_modes[{}].rotation={} (expected 0/90/180/270)"
                         .format(i, m.get("rotation")))
 
+    # variants.json: the list the OSD offers the user. core.cores[] above is the
+    # *bitstream* list; these are different lists and both need unique ids.
+    if "variants.json" in subs:
+        vlist = subs["variants.json"].get("variants", {}).get("variant_list", [])
+        if not isinstance(vlist, list):
+            report.error("variants.variant_list must be a list")
+            vlist = []
+        for i, v in enumerate(vlist):
+            if not isinstance(v, dict) or v.get("id") is None or not v.get("name"):
+                report.error("variants.variant_list[{}] needs both 'id' and 'name'"
+                             .format(i))
+                continue
+        good = [v for v in vlist if isinstance(v, dict)]
+        vids = [v.get("id") for v in good]
+        if len(set(vids)) != len(vids):
+            report.error("variants.json has duplicate variant 'id' values - Analogue "
+                         "OS would pick the wrong variant: {}".format(
+                             ", ".join(str(i) for i in sorted(set(
+                                 x for x in vids if vids.count(x) > 1)))))
+        vnames = [v.get("name") for v in good]
+        if len(set(vnames)) != len(vnames):
+            report.error("variants.json has duplicate variant 'name' values")
+
     # ---------------------------------------------------------------- bitstream
+    # --variant name=path (repeatable) maps a core.cores[] entry to its own
+    # build artifact; a bare --bitstream covers the single-variant case.
+    supplied = {}
+    for spec in (variant_bits or []):
+        if "=" not in spec:
+            report.error("--variant expects name=path/to/x.rbf[_r], got {!r}"
+                         .format(spec))
+            continue
+        name, path = spec.split("=", 1)
+        vpath = Path(path.strip())
+        if not vpath.is_file():
+            report.error("--variant {}: {} does not exist".format(name.strip(), vpath))
+            continue
+        supplied[name.strip()] = vpath
+
     if bitstream is None:
         bitstream = find_bitstream(core_dir, out_dir)
     else:
@@ -198,7 +261,7 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
         if not bitstream.is_file():
             report.error("--bitstream {} does not exist".format(bitstream))
             bitstream = None
-    if bitstream is None:
+    if bitstream is None and not supplied:
         report.error("no bitstream found; build it first (make build) or pass "
                      "--bitstream path/to/x.rbf[_r]")
         return 2
@@ -217,17 +280,52 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
             copied += 1
     report.ok("{}/ <- {} definition file(s)".format(cid, copied))
 
+    # Every filename declared in core.cores[] has to be backed by its own real
+    # artifact. Writing the one supplied bitstream under all of them packages a
+    # core whose variants all silently boot the same image, so resolve each name
+    # individually and fail loudly when one has no source.
     wanted = [v["filename"] for v in variants if v.get("filename")] or ["bitstream.rbf_r"]
+    if len(set(wanted)) != len(wanted):
+        report.error("core.cores[] declares the same filename more than once")
+        wanted = sorted(set(wanted))
+    by_filename = {v.get("filename"): v.get("name") for v in variants}
+
+    missing, used, sources = [], {}, {}
     for fname in wanted:
+        vname = by_filename.get(fname)
+        source = supplied.get(vname) or supplied.get(fname)
+        if source is None and len(wanted) == 1 and bitstream is not None:
+            source = bitstream
+        if source is None and bitstream is not None and bitstream.name == fname:
+            source = bitstream
+        if source is None:
+            source = find_declared(core_dir, fname)
+        if source is None:
+            missing.append("{}{}".format(fname,
+                                         " (variant '{}')".format(vname) if vname else ""))
+            continue
         target = dest / fname
-        if bitstream.name.endswith("_r"):
-            shutil.copy2(str(bitstream), str(target))
+        if source.name.endswith("_r"):
+            shutil.copy2(str(source), str(target))
             how = "copied"
         else:
-            write_reversed(bitstream, target)
+            write_reversed(source, target)
             how = "reversed from"
+        real = source.resolve() if hasattr(source, "resolve") else source
+        used.setdefault(real, []).append(fname)
+        sources[fname] = source
         report.ok("{}/{} {} {} ({:,} bytes)".format(
-            cid, fname, how, bitstream, target.stat().st_size))
+            cid, fname, how, source, target.stat().st_size))
+
+    if missing:
+        report.error("no bitstream for declared variant(s): {}. Build each one and "
+                     "pass --variant <name>=<path.rbf[_r]> (or --bitstream when the "
+                     "core has a single variant); refusing to reuse one image for "
+                     "several variants.".format(", ".join(missing)))
+    reused = [names for names in used.values() if len(names) > 1]
+    for names in reused:
+        report.warn("{} share one bitstream file - intended?".format(
+            " and ".join(sorted(names))))
 
     # --------------------------------------------------------------- platforms
     platform_ids = md.get("platform_ids") or []
@@ -296,12 +394,16 @@ def main(argv=None):
                    help="override the Author.CoreName folder name")
     p.add_argument("--bitstream", type=Path,
                    help=".rbf (reversed automatically) or an already reversed .rbf_r")
+    p.add_argument("--variant", dest="variant_bits", action="append",
+                   metavar="NAME=PATH",
+                   help="bitstream for one core.cores[] entry, by variant name or by "
+                        "filename; repeat, once per declared variant")
     p.add_argument("--zip", action="store_true", help="also write <id>-<version>.zip")
     p.add_argument("--release", action="store_true",
                    help="strict metadata checks for a public release")
     opts = p.parse_args(argv)
     return package(opts.core_dir, opts.out, opts.core_id, opts.bitstream,
-                   opts.zip, opts.release)
+                   opts.zip, opts.release, opts.variant_bits)
 
 
 if __name__ == "__main__":
