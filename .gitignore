@@ -37,6 +37,10 @@ PLLJ_PLLMGS_INFO.txt
 # vendored / ported cores are usually their own repos - decide per core
 # cores/mygame/
 
+# python bytecode from the packaging scripts
+__pycache__/
+*.pyc
+
 # agent/session state
 .pi/
 
@@ -52,10 +56,18 @@ ports/another-world/upstream/
 **/BUILD_*/
 ports/another-world/gamedata/
 ports/another-world/roms/
-# probe synthesis state (keep the .qpf/.qsf/.v, not the databases)
+# probe synthesis state. Each probe/<name>/<variant>/ project dir is written by
+# that probe's own run.sh heredoc - it does `rm -rf` on it before every run - so
+# it is output, not source; tracking it would freeze a stale copy (c1_192 and
+# c1_240 already exist although run.sh now loops over 160 only). Keep the .v and
+# .sdc sources and the run*.sh scripts.
 ports/**/db/
 ports/**/incremental_db/
 ports/**/output_files/
 ports/**/*.log
+ports/another-world/probe/c1rom/c1_*/
+ports/another-world/probe/c1rom/budget/
+ports/another-world/probe/pll/pllp_*/
+ports/another-world/probe/ramshape/rs_*/
 # generated upstream output - regenerate with the command in docs/another-world/feasibility-probes.md
 ports/another-world/probe/build.v
