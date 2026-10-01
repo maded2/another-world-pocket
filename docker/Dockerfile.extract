@@ -1,0 +1,29 @@
+# Toolchain for turning a licensed *Another World* release into the per-part
+# data packs the a5k design reads.
+#
+#   docker build -t local/ap-extract -f docker/Dockerfile.extract .
+#
+# The upstream extractor is a fork of Gregory Montoir's GPL'd rawgl
+# (https://github.com/sylefeb/Another-World-Bytecode-Interpreter, branch a5k).
+# It needs SDL2 headers to build, so we build it in here rather than on the
+# host: the host has the SDL2 runtime but not the -dev package, and ap-tool
+# deliberately keeps host installs at zero.
+#
+# verilator comes along for the ride: it is the only way to run the Silice
+# design (and therefore the packs) without Pocket hardware.
+FROM ubuntu:latest
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates wget \
+      build-essential cmake \
+      libsdl2-dev zlib1g-dev \
+      verilator make \
+ && rm -rf /var/lib/apt/lists/*
+
+# the extractor calls SDL_Init() even when only extracting data; dummy drivers
+# keep that happy in a container with no display and no sound card
+ENV SDL_VIDEODRIVER=dummy
+ENV SDL_AUDIODRIVER=dummy
+
+WORKDIR /work

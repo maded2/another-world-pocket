@@ -76,3 +76,27 @@ ports/another-world/probe/pll/pllp_*/
 ports/another-world/probe/ramshape/rs_*/
 # generated upstream output - regenerate with the command in docs/another-world/feasibility-probes.md
 ports/another-world/probe/build.v
+
+# --- licensed game data -------------------------------------------------------
+# The user's own game files and the packs extracted from them. Nothing here is
+# ours to publish, and the packs are 17 MB of derived binaries: keep them out of
+# every commit, including an accidental `git add .`.
+gamedata/
+ports/another-world/packs/
+
+# --- generated SoC netlist ----------------------------------------------------
+# cores/aw/src/fpga/core/aw_pocket_build.v is produced by `make pocket-translate`
+# from cores/aw/src/si/aw_pocket.si plus the pinned upstream vm.si. Nobody edits
+# it; a fresh clone must run that target before `make build` (scripts/build.sh
+# says so explicitly if the file is missing).
+cores/*/src/fpga/core/aw_pocket_build.v
+
+# --- simulator scratch --------------------------------------------------------
+# Verilator writes its --Mdir wherever it is run from; a bare relative path once
+# put 137 MB of it at the repo root.
+/obj*/
+obj_*/
+# Silice writes its generated netlist and .lpp annotations next to the probe .si.
+# Same rule as ports/another-world/probe/build.v: it is generated output, and the
+# probe's run script regenerates it.
+ports/**/gen/

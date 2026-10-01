@@ -8,7 +8,10 @@
 #   make doctor                    is the toolchain sane for the Pocket device?
 #   make new CORE=mygame AUTHOR=me PLATFORM=nes
 #   make build CORE=mygame         quartus_sh --flow compile + rbf_r
-#   make package CORE=mygame       -> build/sd/{Cores,Platforms,Assets} + zip
+#   make package CORE=mygame       -> build/sd/<core>/{Cores,Platforms,Assets} + zip
+#   make check-build CORE=mygame   audit the Quartus reports for dead logic / bad clocks
+#   make sim | sim-write | sim-rom | sim-soc   simulate (Silice image: verilator)
+#   make pocket-translate          .si -> cores/aw/src/fpga/core/aw_pocket_build.v
 #
 # Variables (override on the command line or in config.mk):
 #   CORE              core under cores/ to work on        (default core-template)
@@ -33,10 +36,14 @@ AW           := ports/another-world
 CORE_DIR    := cores/$(CORE)
 BUILD       := build/$(CORE)
 OUT_DIR     := /work/build          # same folder, seen from inside the container
-SD          := build/sd
+# Per core, deliberately: the packager merges into this directory and zips whatever
+# is in it, and a shared build/sd meant that packaging aw shipped Developer.CoreTemplate
+# and Platforms/ex_platform.json - 12 files belonging to other cores - inside aw's zip.
+SD          := build/sd/$(CORE)
 -include config.mk
 
 AP       := ./docker/run.sh
+SILICE   := ./docker/run-silice.sh
 PY       ?= python3
 CORES    := $(notdir $(wildcard cores/*))
 
@@ -126,6 +133,33 @@ rev:
 report:
 	@cat $(BUILD)/report.txt 2>/dev/null || { echo "no report yet for $(CORE)"; exit 1; }
 
+# ------------------------------------------------------------------ verify ---
+# Audit the Quartus reports rather than trusting the exit status: a design can
+# build, place, route and close timing while a RAM has become a ROM or a register
+# cannot change. Runs on the host - it only reads reports.
+check-build:
+	@$(PY) scripts/check_build.py --core-dir $(CORE_DIR) $(if $(CLOCK_MHZ),--expect-clock $(CLOCK_MHZ),)
+
+# The worst failing paths, which the plain .sta.rpt summarises but never lists.
+worst-path:
+	@$(AP) sh -c 'cd $(CORE_DIR)/src/fpga && quartus_sta -t /work/scripts/worst_path.tcl'
+	@sed -n '/Summary of Paths/,/^+---/p' $(BUILD)/aw_worst.txt 2>/dev/null \
+		|| sed -n '/Summary of Paths/,/^+---/p' build/aw_worst.txt
+
+# Simulation: the Silice image carries iverilog and verilator. sim-write is the
+# two-second version of the ROM question; sim_rom is the whole 2 MB pack with every
+# access pattern the VM uses; sim_soc boots the design and captures frames.
+sim-write:
+	@$(SILICE) scripts/sim_write.sh
+
+sim-rom:
+	@$(SILICE) scripts/sim_rom.sh $(if $(PACK),$(PACK),)
+
+sim-soc:
+	@$(SILICE) scripts/sim_soc.sh $(if $(PACK),$(PACK),)
+
+sim: sim-write sim-rom
+
 # ------------------------------------------------------------------- package --
 package:
 	@test -d $(CORE_DIR) || { echo "no such core: $(CORE_DIR)"; exit 1; }
@@ -202,6 +236,12 @@ silice:
 # regenerate upstream/hardware/BUILD_probe/build.v (gitignored output)
 a5k-translate:
 	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh scripts/a5k_translate.sh
+
+# Our SoC top + upstream vm.si -> cores/aw/src/fpga/core/aw_pocket_build.v, the file
+# Quartus consumes. It is generated and gitignored: a fresh clone needs this before
+# `make build`, and it needs the pinned upstream tree (make upstream).
+pocket-translate:
+	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh scripts/pocket_translate.sh
 
 # upstream a5k at the commit pinned in $(AW)/UPSTREAM_PIN; needs network
 upstream:

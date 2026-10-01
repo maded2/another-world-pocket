@@ -1,0 +1,650 @@
+// ---------------------------------------------
+//
+// Another World on Analogue Pocket - the SoC top.
+//
+// This is a port of:
+//
+//    a5k - "Another World on a chip"
+//    Copyright (C) 2021 Sylvain Lefebvre
+//    https://github.com/sylefeb/a5k        (MIT)
+//
+// which is itself a hardware remake of:
+//
+//    Raw - Another World Interpreter
+//    Copyright (C) 2004 Gregory Montoir
+//    GNU General Public License v2
+//
+// Upstream commit is pinned in ports/another-world/UPSTREAM_PIN. The VM (the
+// processor the game runs on) is *not* duplicated here: it is $include'd from
+// the upstream tree unchanged, so the instruction semantics stay upstream's.
+// What this file owns is everything upstream tied to a board:
+//
+//   - the program source. Upstream fetches instructions straight out of Quad-SPI
+//     flash. The Pocket has no such memory: the ROM arrives from the SD card
+//     over the host bridge and is placed in cellular PSRAM by core_top, which
+//     then presents the very same byte-stream handshake this file expects on
+//     the mem_* ports. Nothing in the VM knows the difference.
+//   - the framebuffers. Upstream has two implementations: iCE40 SPRAM (16-bit
+//     port with a nibble write mask) and a plain per-pixel 4-bit BRAM for ECP5.
+//     Only the second one maps on Cyclone V - a sub-byte write mask on a wide
+//     port does not (measured: ports/another-world/probe/ramshape, nibble- and
+//     byte-masked variants both blew a 420 s synthesis timeout while the
+//     per-pixel shape mapped instantly at 1,024,000 of 3,153,920 memory bits).
+//     So this file uses the per-pixel shape unconditionally.
+//   - the display. Upstream emits VGA/HDMI with its own pad timing. The Pocket
+//     wants a pixel clock it declares, plus data-enable, and consumes a
+//     continuous stream: see the display section below.
+//   - the game clock. Upstream: 25 MHz from a board oscillator. Here: 24.75 MHz
+//     = 74.25 / 3, the only relationship the Pocket's single 74.25 MHz input
+//     gives us with an integer divider, 1 % below upstream.
+//
+// Port work (c) 2026, MIT, same terms as a5k.
+//
+// ---------------------------------------------
+// https://github.com/sylefeb/Silice
+// ---------------------------------------------
+
+$$if SIMULATION then
+$$verbose = nil
+$$end
+
+// ---------------------------------------------
+// Program memory interface.
+//
+// Identical to upstream's, so that the ROM provider can be swapped underneath
+// without touching the VM. Directions are from the point of view of whoever
+// uses the memory:
+//
+//   in_ready        "stream to me from addr" - held high while bytes are wanted
+//   addr            read start; sampled once, at acceptance, then ignored
+//   data            the byte presented with data_available
+//   data_available  a byte is presented this cycle
+//   busy            1 while a stream is running; 0 when the provider will
+//                   accept a new addr/in_ready
+//
+// The provider must sustain one byte per design cycle once the first byte has
+// arrived: op_blitFramebuffer/prefetch consume one byte every cycle while
+// in_ready is high, and upstream's adapterDataAvailable makes data_available
+// sticky for exactly that reason. core_top's PSRAM ROM delivers two.
+// ---------------------------------------------
+
+group mem_io {
+  uint1  in_ready(0),
+  uint24 addr(0),
+  uint8  data(0),
+  uint1  data_available(0),
+  uint1  busy(1),
+}
+
+interface mem_user {
+  output in_ready,
+  output addr,
+  input  data,
+  input  data_available,
+  input  busy,
+}
+
+// ---------------------------------------------
+// The VM, unmodified, from the pinned upstream tree, and upstream's clean_reset
+// (the algorithm reset in Silice has to be bound to something produced inside
+// the design; a5k uses this 4-cycle release for it).
+$include('../../../ports/another-world/upstream/hardware/vm.si')
+$include('../../../ports/another-world/upstream/hardware/common/clean_reset.si')
+
+// ---------------------------------------------
+// Display geometry.
+//
+// One design clock = one pushed pixel, no doubling: the Pocket's scaler does
+// the upscaling, so there is no reason to spend clocks pushing the same pixel
+// four times the way the VGA path does.
+//
+// 825 x 500 at 24.75 MHz is exactly 60.000 Hz, and leaves 300 of 500 lines
+// blanked. That matters: the blitter and the rasterizer may only touch the
+// displayed page while nothing is being displayed (upstream rule, kept below),
+// so blanking is the only time they make progress. Upstream gets 80 blanked
+// lines of 525 (15 %); here they get 60 %, which is roughly 4x the throughput
+// for full-screen blits at the same clock.
+//
+// hs/vs are single-clock pulses, de marks active pixels - the shape the APF
+// scaler expects (see the template's own video generator).
+// ---------------------------------------------
+
+// blanking is split 218 before / 287 after the active pixels horizontally and
+// 150 before / 150 after vertically
+$$H_TOTAL = 825
+$$V_TOTAL = 500
+$$H_ACTIVE = 320
+$$V_ACTIVE = 200
+$$H_BPORCH = 218
+$$V_BPORCH = 150
+
+// ---------------------------------------------
+// Pacing - nothing to change, recorded here because at first glance it looks
+// wrong and is not.
+//
+// op_blitFramebuffer (vm.si case 8'h10) is the only thing that paces the game:
+//
+//     uint24 pause = slices * (2^18 + 2^17);      // slices * 393216
+//     while (~pause[23,1]) { pause = pause - 1; } // burn `pause` cycles
+//     ... blit / wait for the rasterizer ...
+//     while (~vblank)      { }                    // then line the frame up
+//
+// Silice bit ranges are [start,width], so pause[23,1] is bit 23. slices is 1..5
+// in the game code, so pause never reaches 2^23 and the countdown only stops
+// when the subtraction wraps through zero: the wait is exactly slices*393216
+// cycles plus two. Correct as written, and it is the same arithmetic the
+// interpreter's own sleep() uses.
+//
+// 393216 cycles is 15.73 ms at upstream's 25 MHz and 15.86 ms here; in both
+// cases it is SHORTER than one frame (upstream 420000 cycles, ours 412500), so
+// the vblank wait that follows is what actually paces the game: one frame per
+// slice, exactly 60 Hz on this timing. That relationship is the thing to keep -
+// a slice wait above 412500 cycles would put every frame a frame-and-a-bit
+// apart and drop the game to ~50 Hz. Tempting, because rawgl sleeps
+// slices*20 ms per frame; rawgl's 20 ms is itself clamped by its vsync, so the
+// number to match is the frame, not the constant.
+// ---------------------------------------------
+
+// ---------------------------------------------
+// Blitter: copies one framebuffer into another, one byte per cycle.
+// (from upstream a5k.si, unchanged)
+// ---------------------------------------------
+
+unit blitter(
+  input   uint1  start, // pulse high to start
+  output  uint1  busy(0),
+  output! uint16 src_addr,
+  input   uint4  src_data,
+  output! uint16 dst_addr,
+  output! uint4  dst_data,
+  output! uint1  dst_wenable,
+  input   uint1  enabled // in some cases the blitter reads from the front
+                         // buffer so we disallow blitter when video is active
+) {
+  uint16 count      = 0;
+  uint16 prev_count = 0;
+
+  always {
+    if (busy) {
+      if (start) {
+        __display("ERROR: blitter still busy");
+$$if SIMULATION then
+        __finish();
+$$end
+      }
+    }
+    busy        = start ? 1 : (prev_count == 63999 ? 0 : busy);
+    prev_count  = start ? 0 : (enabled ?  count      : prev_count);
+    count       = start ? 0 : (enabled ? (count + 1) : count);
+    src_addr    = count;
+
+    dst_addr    = prev_count; // we write what was read previous cycle
+    dst_data    = src_data;
+    dst_wenable = busy & enabled;
+  }
+}
+
+// ---------------------------------------------
+// A video page: 320x200 of 4-bit indices.
+//
+// The per-pixel shape only (see the header for why the SPRAM shape is out).
+// This is upstream's ULX3S implementation, which is also what the C2 probe
+// measured as the one Quartus can map.
+// ---------------------------------------------
+
+unit videopage(
+  input     uint16 addr,
+  output(!) uint4  rdata,
+  input     uint1  wenable,
+  input     uint4  wdata,
+) {
+$$if SIMULATION then
+  // zeroed in simulation only: undefined content in a video page shows up as X
+  // across the whole frame and hides the bug you are actually chasing.
+  bram uint4 pixels[$320*200$] = { pad(0) };
+$$else
+  // upstream's ECP5 path is also uninitialized. Not initialized in synthesis
+  // either: an initializer here is emitted as a 64,000-entry list per page, and
+  // four of those turn the generated file into 5 MB / a quarter million lines of
+  // Verilog for no functional gain - the game paints every page before showing
+  // it, and core_top keeps the design in reset until the ROM is in place.
+  bram uint4 pixels[$320*200$] = uninitialized;
+$$end
+
+  always {
+    rdata          = pixels.rdata;
+    pixels.addr    = addr;
+    pixels.wenable = wenable;
+    pixels.wdata   = wdata;
+  }
+}
+
+// ---------------------------------------------
+// Rasterizer, specialized to Another World polygons.
+// (from upstream a5k.si, unchanged)
+// ---------------------------------------------
+
+unit rasterizer(
+  input  uint1               start,     // pulse high to start
+  output uint1               busy(0),
+  simple_dualport_bram_port0 polygon,   // polygon data
+  input  uint6               polygon_numv,
+  input  uint10              polygon_bbw,
+  input  uint10              polygon_bbh,
+  input  int12               polygon_px,
+  input  int12               polygon_py,
+  input  uint5               polygon_color,
+  input  uint9               polygon_zoom,
+  output uint1               pix_wenable,
+  output uint16              pix_waddr, // pixel address to write to
+  output uint4               pix_palid, // pixel palette index to write
+  output uint16              src_addr,
+  input  uint4               src_data,
+  input  uint1  enabled // in some cases the blitter reads from the front
+                        // buffer so we disallow blitter when video is active
+) {
+$$if SIMULATION then
+  uint32 cycle(0);
+$$end
+
+  brom uint17 inv_y[1024] = {
+    16384,16384,
+$$for y=2,1023 do
+    $16384//y$,
+$$end
+  };
+
+  always_before {
+    pix_wenable = 0;
+    // color to write to output
+    pix_palid = polygon_color[4,1]
+            ? ((polygon_color[0,3] == 0 ? 4b1000 : 4b0000) | src_data)
+            : polygon_color;
+  }
+
+  algorithm <autorun> {
+
+    while (1) {
+
+      if (start) {
+
+        int12 x1  = polygon_px - __signed(polygon_bbw>>1);
+        int12 x2  = polygon_px + __signed(polygon_bbw>>1);
+        int12 y1  = polygon_py - __signed(polygon_bbh>>1);
+        int12 y2  = polygon_py + __signed(polygon_bbh>>1);
+
+$$if SIMULATION then
+        if (!(x1 > 319 || x2 < 0 || y1 > 199 || y2 < 0))
+$$end
+        {
+
+        busy      = 1;
+        uint6 n   = polygon_numv;
+
+        uint32 p_i(0);   // x:16,16 y:0,16
+        uint32 p_i_m1(0);
+        uint32 p_j(0);
+        uint32 p_j_p1(0);
+
+      	uint6 i = 0;
+	      uint6 j = n - 1;
+
+        polygon.addr0 = i;
+++:
+        p_i = polygon.rdata0;
+        polygon.addr0 = j;
+++:
+        p_j = polygon.rdata0;
+
+        p_i_m1 = p_i;
+        i      = i + 1;
+        p_j_p1 = p_j;
+        j      = j - 1;
+
+	      int12 init_cpt2 = __signed(p_i[16,12]) + x1;
+	      int12 init_cpt1 = __signed(p_j[16,12]) + x1;
+        int32 cpt2      = init_cpt2 << 16;
+        int32 cpt1      = init_cpt1 << 16;
+
+        while (y1 < 200) {
+
+          n = n - 2;
+          if (n == 0) { break; }
+
+          cpt1 = (cpt1 & 32hFFFF0000) | 32h7FFF;
+          cpt2 = (cpt2 & 32hFFFF0000) | 32h8000;
+
+          polygon.addr0 = i;
+++:
+          p_i    = polygon.rdata0;
+          polygon.addr0 = j;
+++:
+          p_j    = polygon.rdata0;
+
+          // calcStep
+          uint12 dy1   = __signed(p_j[ 0,12]) - __signed(p_j_p1[ 0,12]);
+          inv_y.addr   = dy1;
+++:
+          int12  dx1   = __signed(p_j[16,12]) - __signed(p_j_p1[16,12]);
+          int32  step1 = (dx1 * __signed(inv_y.rdata)) <<< 2;
+          // calcStep
+          uint12 dy    = __signed(p_i[ 0,12]) - __signed(p_i_m1[ 0,12]);
+          inv_y.addr   = dy;
+++:
+          int12  dx    = __signed(p_i[16,12]) - __signed(p_i_m1[16,12]);
+          int32  step2 = (dx * __signed(inv_y.rdata)) <<< 2;
+
+          p_i_m1 = p_i;
+          i      = i + 1;
+          p_j_p1 = p_j;
+          j      = j - 1;
+
+          if (dy == 0) {
+            cpt1 = cpt1 + step1;
+            cpt2 = cpt2 + step2;
+          }
+
+          while (dy != 0 && y1 != 200) {
+            int12 sx1 = cpt1 >>> 16;
+            int12 sx2 = cpt2 >>> 16;
+            if (sx1 <= 319 && sx2 >= 0 && y1 >= 0) {
+              if (sx1 < __signed(0))   { sx1 =   0; }
+              if (sx2 > __signed(319)) { sx2 = 319; }
+
+              uint16 base          = (y1<<8) + (y1<<6);
+              uint1  x1_smaller_x2 = (sx1 < sx2);
+              pix_waddr   = base + (x1_smaller_x2 ? sx1 : sx2);
+              uint16 stop = base + (x1_smaller_x2 ? sx2 : sx1) + 1;
+              // draw span (possibly with blending, could be faster without
+              //            but a single loop saves logic, we can afford it)
+++:             // one cycle added latency (registered outputs on src_*)
+              while (pix_waddr != stop) {
+                pix_wenable = 1; // write result (see pix_palid in always before)
+++:
+                pix_waddr   = enabled ? (pix_waddr + 1) : pix_waddr;
+++:             // one cycle added latency (registered outputs on src_*)
+              }
+            }
+            cpt1 = cpt1 + step1;
+            cpt2 = cpt2 + step2;
+            y1   = y1 + 1;
+            dy   = dy - 1;
+          }
+        }
+
+        busy = 0;
+      }
+      }
+
+    }
+
+  }
+
+  always_after {
+    // read where we want to write (happens in two cycles since in same page)
+    src_addr = pix_waddr;
+$$if SIMULATION then
+    cycle    = cycle + 1;
+$$end
+  }
+}
+
+// vm.si is translated verbatim: scripts/pocket_translate.sh rewrites include
+// paths and nothing else. An earlier revision of this port substituted the
+// pacing constant there; the note above is why that was a mistake.
+
+// ---------------------------------------------
+// Where everything is put together.
+//
+// Single clock domain on purpose: the design clock is also the pixel clock, so
+// the framebuffer arbitration stays exactly as upstream reasons about it and
+// nothing here crosses a clock domain. The ROM provider (core_top/aw_rom) runs
+// on a faster clock and hides the crossing behind its own FIFO; from in here it
+// is just the mem_* handshake.
+// ---------------------------------------------
+
+unit main(
+  // program memory, byte-stream handshake (aw_rom.v)
+  output uint1  mem_in_ready,
+  output uint24 mem_addr,
+  input  uint8  mem_data,
+  input  uint1  mem_data_available,
+  input  uint1  mem_busy,
+  // controls: bit5 fire, bit3 down, bit2 up, bit1 left, bit0 right (upstream order)
+  input  uint6  jstick,
+  // video to the Pocket scaler
+  output uint8  video_r,
+  output uint8  video_g,
+  output uint8  video_b,
+  output uint1  video_de,
+  output uint1  video_hs,      // one-clock pulse, once per line
+  output uint1  video_vs,      // one-clock pulse, once per frame
+  // status
+  output uint8  leds(0),
+  output uint1  vblank,        // high while nothing is being displayed
+)
+<@clock,!rst>
+{
+  // ---- reset release (upstream's clean_reset: holds for 4 clocks after the
+  //      board reset lets go, so no algorithm starts on an unlocked PLL)
+  uint1 rst(1);
+  clean_reset _<@clock,!reset>(out :> rst);
+
+  // ---- palette, two of them so we can swap
+  simple_dualport_bram uint16 palette[32] = uninitialized;
+
+  // ---- VM memory interface, wired out to the ROM provider
+  mem_io mem_vm;
+
+  // ---- polygon storage
+  simple_dualport_bram uint32 polygon[64] = uninitialized;
+
+  // ---- high when rasterizer/blitter cannot write to videopage
+  uint1 display_conflict(0);
+  uint1 no_display_conflict <:: (~display_conflict) | vblank;
+
+  // ---- joystick
+  uint6 jstick_delay(0);
+
+  // ---- display position (free running; the only thing that stops a page read
+  //      is vblank, and vblank is a whole number of lines, so the pipeline can
+  //      never lose or gain a pixel against the timing it generates)
+  uint16 x(0);
+  uint16 y(0);
+
+  // `active`/`active_v` are combinational decodes of the position whose pixel is
+  // being fetched *now*; the color for that pixel comes back two RAM reads
+  // later, so the gating that travels to the output goes through two registered
+  // stages (::= is a registered assignment in Silice; a plain assignment inside
+  // always would be folded into a wire and delay nothing at all).
+  uint1  active <:: (x >= $H_BPORCH$) & (x <  $H_BPORCH$ + $H_ACTIVE$)
+                               & (y >= $V_BPORCH$) & (y <  $V_BPORCH$ + $V_ACTIVE$);
+  uint1  active_v <:: (y >= $V_BPORCH$) & (y <  $V_BPORCH$ + $V_ACTIVE$);
+  uint1  show_page1 <:: vm.page_swap;
+  uint1  active_p1(0);
+  uint1  active_p2(0);
+  uint1  swap_p1(0);
+
+  // ---- rasterizer
+  rasterizer rast(
+     start        <:  vm.rasterizer_start,
+     busy          :> vm.rasterizer_busy,
+     polygon      <:> polygon,
+     polygon_numv <:  vm.polygon_numv,
+     polygon_bbw  <:  vm.polygon_bbw,
+     polygon_bbh  <:  vm.polygon_bbh,
+     polygon_px   <:  vm.polygon_px,
+     polygon_py   <:  vm.polygon_py,
+     polygon_color<:  vm.polygon_color,
+     polygon_zoom <:  vm.polygon_zoom,
+     enabled      <:  no_display_conflict,
+  );
+
+  // ---- virtual machine
+  uint1 vm_reset(0);
+  vm vm<!vm_reset>( mem     <:> mem_vm,
+                    polygon <:> polygon,
+                    palette <:> palette,
+                    vblank  <:: vblank,
+                    jstick  <:: jstick_delay
+        );
+
+  // ---- video pages
+  videopage page0;
+  videopage page1;
+  videopage page2;
+  videopage page3;
+
+  // ---- blitter
+  blitter blit( enabled  <: no_display_conflict );
+
+  /// always logic
+  always {
+
+    // ---- pacing table read is done inside vm.si; here we only own the
+    //      display, the arbiter and the outputs.
+
+    // ---- decode the position we are fetching this cycle. Everything below
+    //      reads x/y before the counters are advanced at the end of the block:
+    //      statements in a Silice always block see the most recent value, so
+    //      advancing first would shift the whole pipeline by a pixel.
+    // gating for the color that comes back two RAM reads later: exactly two
+    // registered stages. (active/active_v/show_page1 are <:: aliases, so they
+    // add no register of their own; assigning them with a plain = here would
+    // have made each one a flop and put the picture a pixel out of step.)
+    active_p1 ::= active;
+    active_p2 ::= active_p1;
+    swap_p1   ::= show_page1;
+
+    video_hs = (x == 3);
+    video_vs = (x == 0) & (y == 0);
+    vblank   = ~active_v;
+
+    // ---- ROM byte stream straight through to the provider in core_top
+    mem_in_ready = mem_vm.in_ready;
+    mem_addr     = mem_vm.addr;
+    mem_vm.data  = mem_data;
+    // The provider presents a byte every design cycle while it is streaming, so
+    // data_available is already at the rate the VM consumes - upstream's
+    // adapterDataAvailable pulse-to-level shim is not needed (it existed to move
+    // the pulse from the 2x flash clock into the 1x design clock).
+    mem_vm.data_available = mem_data_available;
+    mem_vm.busy           = mem_busy;
+
+    // ---- video page defaults to reading ----
+    page0.wenable = 0; page1.wenable = 0;
+    page2.wenable = 0; page3.wenable = 0;
+
+    // ---- blitter ----
+    blit.start      = vm.blitter_start;
+    vm.blitter_busy = blit.busy;
+
+    // NOTE: no conflict blitter <-> rasterizer, both cannot be busy together
+
+    // ---- video page arbiter ----
+    //
+    // Upstream writes this as "the display assigns page1/page2 addresses in its
+    // own algorithm stage, which overrides this stage". Doing it as an explicit
+    // mux keeps one writer per signal and makes the priority visible: while a
+    // pixel is being fetched, the displayed page belongs to the display.
+    uint16 fb_x     = x - $H_BPORCH$;
+    uint16 fb_y     = y - $V_BPORCH$;
+    uint16 fb_addr  = fb_x + (fb_y<<8) + (fb_y<<6);   // x + y*320
+
+    uint1 read_page1 = active &  show_page1;
+    uint1 read_page2 = active & ~show_page1;
+
+    uint16 src_addr  = rast.busy ? rast.src_addr : blit.src_addr;
+
+    // blitter and rasterizer sources
+    blit.src_data = (vm.blitter_src == 3b000 ? page0.rdata      : 0)
+                  | (vm.blitter_src == 3b001 ? page1.rdata      : 0)
+                  | (vm.blitter_src == 3b010 ? page2.rdata      : 0)
+                  | (vm.blitter_src == 3b011 ? page3.rdata      : 0)
+                  | (vm.blitter_src == 3b100 ? vm.blitter_color : 0);
+    rast.src_data = (vm.rasterizer_dst == 2b00 ? page0.rdata    : 0)
+                  | (vm.rasterizer_dst == 2b01 ? page1.rdata    : 0)
+                  | (vm.rasterizer_dst == 2b10 ? page2.rdata    : 0)
+                  | (vm.rasterizer_dst == 2b11 ? page3.rdata    : 0);
+    if (vm.polygon_color[0,5] > 16) {rast.src_data = page0.rdata;} // drawLineP
+
+    page0.addr = src_addr;
+    page1.addr = read_page1 ? fb_addr : src_addr;
+    page2.addr = read_page2 ? fb_addr : src_addr;
+    page3.addr = src_addr;
+
+    // ---- outputs ---- (only one of blitter, rasterizer, vm writes at once)
+    uint16 waddr  = (rast.pix_wenable ? rast.pix_waddr : 0)
+                  | (vm.pix_wenable   ? vm.pix_waddr   : 0)
+                  | (blit.dst_wenable ? blit.dst_addr  : 0);
+    uint4  wdata  = (rast.pix_wenable ? rast.pix_palid : 0)
+                  | (vm.pix_wenable   ? vm.pix_palid   : 0)
+                  | (blit.dst_wenable ? blit.dst_data  : 0);
+    uint1  wen    = (rast.pix_wenable | vm.pix_wenable | blit.dst_wenable);
+    uint2  wpage  = (rast.pix_wenable ? vm.rasterizer_dst : 0)
+                  | (vm.pix_wenable   ? vm.rasterizer_dst : 0)
+                  | (blit.dst_wenable ? vm.blitter_dst    : 0);
+    if (wen) {
+      switch (wpage) {
+        case 0:  {page0.wenable = 1; page0.addr = waddr; page0.wdata = wdata;}
+        case 1:  {page1.wenable = 1; page1.addr = waddr; page1.wdata = wdata;}
+        case 2:  {page2.wenable = 1; page2.addr = waddr; page2.wdata = wdata;}
+        case 3:  {page3.wenable = 1; page3.addr = waddr; page3.wdata = wdata;}
+      }
+    }
+    display_conflict = (vm.blitter_src[0,1] ^ vm.blitter_src[1,1])  // reading from page 1/2
+                     & (vm.page_swap        ^ vm.blitter_src[1,1]); // from displayed page
+
+    // ---- pixel pipeline: page read (this cycle) -> palette (next) -> rgb.
+    //      swap_p1 picks the page the address was issued to, not the page being
+    //      selected now, or the two would disagree on the frame boundary.
+    uint4  pixel = swap_p1 ? page1.rdata : page2.rdata;
+
+    palette.addr0  = {swap_p1,4b000} | pixel;
+
+    // palette entries are RGB565, like the game's own palette data:
+    //   bits 4..0 R, bits 10..5 G, bits 15..11 B
+    uint8 c1 = palette.rdata0[ 0,8];
+    uint8 c2 = palette.rdata0[ 8,8];
+    uint5 r5 = c1[ 0,5];                  // bits  4..0
+    uint6 g6 = { c2[ 0,3], c1[ 5,3] };    // bits 10..5
+    uint5 b5 = c2[ 3,5];                  // bits 15..11
+
+    video_r  = active_p2 ? {r5, r5[2,3]} : 0;
+    video_g  = active_p2 ? {g6, g6[4,2]} : 0;
+    video_b  = active_p2 ? {b5, b5[2,3]} : 0;
+    video_de = active_p2;
+
+    leds = vm.leds;
+
+    // ---- controls, registered (upstream does this in always_after; this unit
+    //      has a single always block, which Silice requires be the only one)
+    jstick_delay ::= jstick;
+
+    // ---- advance the display position last (see the note above): y reads x, so
+    //      the order here is upstream's, reversed on purpose.
+    y = (x == $H_TOTAL$-1) ? ((y == $V_TOTAL$-1) ? 0 : (y + 1)) : y;
+    x = (x == $H_TOTAL$-1) ? 0 : (x + 1);
+
+$$if SIMULATION then
+    if (rast.busy & blit.busy) {
+      __display("**** conflict 1 ****");
+      __finish();
+    }
+    if (rast.pix_wenable & blit.dst_wenable) {
+      __display("**** conflict 2 ****");
+      __finish();
+    }
+    if (rast.pix_wenable & vm.pix_wenable) {
+      __display("**** conflict 3 ****");
+      __finish();
+    }
+    if (blit.dst_wenable & vm.pix_wenable) {
+      __display("**** conflict 4 **** (blitter busy:%b)",blit.busy);
+      __finish();
+    }
+$$end
+  }
+}
+
+// -------------------------

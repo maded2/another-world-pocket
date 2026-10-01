@@ -1,0 +1,64 @@
+// probe: how many cycles, and which signals are registers, for the pattern
+//   counter -> page.addr -> page.rdata -> palette.addr0 -> palette.rdata0 -> out
+// used by cores/aw/src/si/aw_pocket.si. Read the generated Verilog, do not guess.
+
+unit page(
+  input     uint16 addr,
+  output(!) uint4  rdata,
+  input     uint1  wenable,
+  input     uint4  wdata,
+) {
+  bram uint4 pixels[64] = { pad(0) };
+  always {
+    rdata       = pixels.rdata;
+    pixels.addr = addr;
+    pixels.wenable = wenable;
+    pixels.wdata = wdata;
+  }
+}
+
+unit rst_src(output uint1 out(1)) {
+  uint4 trigger = 15;
+  always { out = trigger[0,1]; trigger = trigger >> 1; }
+}
+
+unit main(
+  output uint8  out_v,
+  output uint1  out_de,
+  output uint1  out_hs,
+  input  uint1  in_x_out_of_range
+)
+<@clock,!rst>
+{
+  uint1 rst(1);
+  rst_src _<@clock,!reset>(out :> rst);
+
+  simple_dualport_bram uint16 palette[32] = uninitialized;
+
+  uint16 x(0);
+  uint16 y(0);
+  uint1  active(0);
+  uint1  active_d1(0);
+  uint1  active_d2(0);
+
+  page pg;
+
+  always {
+    x = (x == 15) ? 0 : (x + 1);
+    y = (x == 15) ? (y + 1) : y;
+
+    // combinational decode of the *current* position
+    active    = (x >= 2) & (x < 10) & (y >= 1) & (y < 5);
+    active_d1 = active;
+    active_d2 = active_d1;
+
+    pg.addr    = x + (y<<4);
+    pg.wenable = 0;
+
+    palette.addr0 = pg.rdata;
+
+    out_v   = palette.rdata0[ 0,8];
+    out_de  = active_d2;
+    out_hs  = (x == 3);
+  }
+}

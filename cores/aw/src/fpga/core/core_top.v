@@ -260,18 +260,9 @@ assign port_tran_sck_dir = 1'b0;    // clock direction can change
 assign port_tran_sd = 1'bz;
 assign port_tran_sd_dir = 1'b0;     // SD is input and not used
 
-// tie off the rest of the pins we are not using
-assign cram0_a = 'h0;
-assign cram0_dq = {16{1'bZ}};
-assign cram0_clk = 0;
-assign cram0_adv_n = 1;
-assign cram0_cre = 0;
-assign cram0_ce0_n = 1;
-assign cram0_ce1_n = 1;
-assign cram0_oe_n = 1;
-assign cram0_we_n = 1;
-assign cram0_ub_n = 1;
-assign cram0_lb_n = 1;
+// cram0 is the program ROM: the host bridge writes the pack into it and the VM
+// reads its program back out; the pins are driven by aw_rom below.
+
 
 assign cram1_a = 'h0;
 assign cram1_dq = {16{1'bZ}};
@@ -336,8 +327,12 @@ end
     
 // bridge host commands
 // synchronous to clk_74a
-    wire            status_boot_done = pll_core_locked_s; 
-    wire            status_setup_done = pll_core_locked_s; // rising edge triggers a target command
+    // driven from the clocking block below, where the PLL signal they follow is
+    // declared. Note they say "the clocks are up", not "the game is running": the
+    // host waits for these before it sends the pack, and the core cannot have a
+    // pack until the host has sent one.
+    wire            status_boot_done;
+    wire            status_setup_done;   // rising edge triggers a target command
     wire            status_running = reset_n; // we are running as soon as reset_n goes high
 
     wire            dataslot_requestread;
@@ -492,116 +487,248 @@ core_bridge_cmd icb (
 
 
 
-////////////////////////////////////////////////////////////////////////////////////////
-
-
-
-// video generation
-// ~12,288,000 hz pixel clock
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// we want our video mode of 320x240 @ 60hz, this results in 204800 clocks per frame
-// we need to add hblank and vblank times to this, so there will be a nondisplay area. 
-// it can be thought of as a border around the visible area.
-// to make numbers simple, we can have 400 total clocks per line, and 320 visible.
-// dividing 204800 by 400 results in 512 total lines per frame, and 240 visible.
-// this pixel clock is fairly high for the relatively low resolution, but that's fine.
-// PLL output has a minimum output frequency anyway.
+// Clocking and reset.
+//
+// clk_74a is the only clock a core is given. From it: 24.75 MHz for the design and
+// the pixels, its quadrature twin for the scaler, 49.5 MHz for the cellular PSRAM.
+// See aw_pll.v for the ratios and for why this clock and not upstream's 25 MHz.
+//
+// Reset is staged on purpose. The bridge and the PSRAM come out first - the pack
+// has to be loadable while the game is held still - and the design itself only
+// leaves reset once rom_ready says a pack is there and its trailer made sense.
+// Starting the interpreter on an empty PSRAM would not only show garbage: it would
+// run the VM off whatever the chip happened to contain, with the read path it uses
+// for everything else untested.
+//
+// rom_ready / rom_error come from aw_rom in the design clock and are only read
+// here, in that same clock.
 
+wire clk_core, clk_core90, clk_psram, pll_locked;
+wire rom_ready;
+wire [1:0] rom_error;
 
-assign video_rgb_clock = clk_core_12288;
-assign video_rgb_clock_90 = clk_core_12288_90deg;
-assign video_rgb = vidout_rgb;
-assign video_de = vidout_de;
-assign video_skip = vidout_skip;
-assign video_vs = vidout_vs;
-assign video_hs = vidout_hs;
+aw_pll u_pll (
+    .reset_n    ( 1'b1     ),   // no dynamic reconfiguration in this core
+    .refclk     ( clk_74a  ),
+    .clk_core   ( clk_core ),
+    .clk_core90 ( clk_core90 ),
+    .clk_psram  ( clk_psram ),
+    .locked     ( pll_locked )
+);
 
-    localparam  VID_V_BPORCH = 'd10;
-    localparam  VID_V_ACTIVE = 'd240;
-    localparam  VID_V_TOTAL = 'd512;
-    localparam  VID_H_BPORCH = 'd10;
-    localparam  VID_H_ACTIVE = 'd320;
-    localparam  VID_H_TOTAL = 'd400;
+// the bridge is told "clocks up" through a synchroniser, as the template did; that
+// is what gates the host sending us the pack
+wire pll_locked_s;
+synch_3 s_pll_locked (pll_locked, pll_locked_s, clk_74a);
+assign status_boot_done  = pll_locked_s;
+assign status_setup_done = pll_locked_s;
 
-    reg [15:0]  frame_count;
-    
-    reg [9:0]   x_count;
-    reg [9:0]   y_count;
-    
-    wire [9:0]  visible_x = x_count - VID_H_BPORCH;
-    wire [9:0]  visible_y = y_count - VID_V_BPORCH;
+// bridge-domain reset: the host's, or the PLL not being up yet
+wire rst_bridge = ~reset_n | ~pll_locked;
 
-    reg [23:0]  vidout_rgb;
-    reg         vidout_de, vidout_de_1;
-    reg         vidout_skip;
-    reg         vidout_vs;
-    reg         vidout_hs, vidout_hs_1;
-    
-    reg [9:0]   square_x = 'd135;
-    reg [9:0]   square_y = 'd95;
+// synchronous, stretched releases into each design clock, so nothing comes out of
+// reset on the same edge the PLL lock pin happens to tick
+reg [3:0] cnt_core, cnt_psram;
+reg       rst_core, rst_psram;
 
-always @(posedge clk_core_12288 or negedge reset_n) begin
-
-    if(~reset_n) begin
-    
-        x_count <= 0;
-        y_count <= 0;
-        
-    end else begin
-        vidout_de <= 0;
-        vidout_skip <= 0;
-        vidout_vs <= 0;
-        vidout_hs <= 0;
-        
-        vidout_hs_1 <= vidout_hs;
-        vidout_de_1 <= vidout_de;
-        
-        // x and y counters
-        x_count <= x_count + 1'b1;
-        if(x_count == VID_H_TOTAL-1) begin
-            x_count <= 0;
-            
-            y_count <= y_count + 1'b1;
-            if(y_count == VID_V_TOTAL-1) begin
-                y_count <= 0;
-            end
-        end
-        
-        // generate sync 
-        if(x_count == 0 && y_count == 0) begin
-            // sync signal in back porch
-            // new frame
-            vidout_vs <= 1;
-            frame_count <= frame_count + 1'b1;
-        end
-        
-        // we want HS to occur a bit after VS, not on the same cycle
-        if(x_count == 3) begin
-            // sync signal in back porch
-            // new line
-            vidout_hs <= 1;
-        end
-
-        // inactive screen areas are black
-        vidout_rgb <= 24'h0;
-        // generate active video
-        if(x_count >= VID_H_BPORCH && x_count < VID_H_ACTIVE+VID_H_BPORCH) begin
-
-            if(y_count >= VID_V_BPORCH && y_count < VID_V_ACTIVE+VID_V_BPORCH) begin
-                // data enable. this is the active region of the line
-                vidout_de <= 1;
-                
-                vidout_rgb[23:16] <= 8'd60;
-                vidout_rgb[15:8]  <= 8'd60;
-                vidout_rgb[7:0]   <= 8'd60;
-                
-            end 
-        end
-    end
+always @(posedge clk_core) begin
+    cnt_core <= rst_bridge ? 4'd0 : ((cnt_core == 4'd15) ? cnt_core : cnt_core + 4'd1);
+    rst_core <= rst_bridge || (cnt_core != 4'd15);
 end
 
+always @(posedge clk_psram) begin
+    cnt_psram <= rst_bridge ? 4'd0 : ((cnt_psram == 4'd15) ? cnt_psram : cnt_psram + 4'd1);
+    rst_psram <= rst_bridge || (cnt_psram != 4'd15);
+end
 
+// the game: clocks up, host happy, and a pack it can read
+wire design_reset_n = ~rst_core && rom_ready;
 
+////////////////////////////////////////////////////////////////////////////////////////
+//
+// The game.
+//
+// u_soc is the Silice design - VM, framebuffers, rasterizer, blitter and display -
+// translated from src/si/aw_pocket.si by scripts/pocket_translate.sh into
+// aw_pocket_build.v. u_rom is its program memory: the pack the host bridge drops
+// into cellular PSRAM, offered to the VM with the same byte-stream handshake
+// upstream's Quad-SPI reader used, so nothing in the VM knows the difference.
+//
+// Signalling to the scaler is the template's own convention: pixel clock out on
+// video_rgb_clock with its 90 degree twin, hs and vs one-clock pulses in the back
+// porch, de high over the active pixels, all of them registered. 825 x 500 at
+// 24.75 MHz is exactly 60 Hz with 320 x 200 active - see the display section of
+// src/si/aw_pocket.si for why those numbers rather than upstream's VGA pad.
+//
+// video_skip stays 0: it asks the scaler to drop every other pixel, which is for
+// cores that pixel-double inside the FPGA. This one pushes one pixel per clock.
+//
+
+assign video_rgb_clock    = clk_core;
+assign video_rgb_clock_90 = clk_core90;
+assign video_skip         = 1'b0;
+
+// ---- controls ----------------------------------------------------------------
+// Upstream's jstick packing, which is what vm.si reads bit by bit:
+//   [0] right  [1] left  [2] up  [3] down  [4] fire  [5] unused
+// The Pocket hands the pad over asynchronously to the design clock, so it goes
+// through the usual 3FF array before being repacked. Both face buttons are fire:
+// Another World has one action verb. The analog stick is ignored on purpose, this
+// is a d-pad game and half-pressed diagonals would only make the hero wander.
+
+reg  [4:0] key_s1, key_s2, key_s3;
+always @(posedge clk_core) begin
+    key_s1 <= {cont1_key[0], cont1_key[1], cont1_key[2], cont1_key[3],
+               cont1_key[4] | cont1_key[5]};
+    key_s2 <= key_s1;
+    key_s3 <= key_s2;
+end
+
+wire [5:0] jstick = {1'b0, key_s3[4], key_s3[1], key_s3[2], key_s3[3], key_s3[0]};
+//                          fire     down     up      left    right
+
+// ---- the screen to show until a pack is loaded -------------------------------
+// The scaler needs something to lock to from the first moment, so this runs the
+// same 825 x 500 timing as the game and is simply swapped out when rom_ready goes
+// up. What it shows is deliberately blunt: there are three distinct reasons a core
+// can sit here and they should not all look the same.
+
+localparam VID_H_TOTAL   = 825,
+           VID_V_TOTAL   = 500,
+           VID_H_ACTIVE  = 320,
+           VID_V_ACTIVE  = 200,
+           VID_H_BPORCH  = 218,
+           VID_V_BPORCH  = 150;
+
+// aw_rom's rom_error codes (its localparams, repeated here rather than exported)
+localparam ERR_TRAILER  = 2'd1,   // the offsets are there but are not a pack
+           ERR_OVERFLOW = 2'd2,   // the bridge wrote faster than the chip took it
+           ERR_WAIT    = 2'd3;    // the chip has not accepted anything: see aw_psram
+
+reg  [9:0]  idle_x, idle_y;
+reg  [24:0] idle_blink;
+reg  [23:0] idle_rgb;
+reg         idle_de, idle_hs, idle_vs;
+
+wire idle_active = (idle_x >= VID_H_BPORCH) && (idle_x <  VID_H_BPORCH + VID_H_ACTIVE)
+                && (idle_y >= VID_V_BPORCH) && (idle_y <  VID_V_BPORCH + VID_V_ACTIVE);
+
+// a slow pulse in the middle of the screen means waiting; anything else is an error
+wire blinking = idle_blink[24];
+wire in_block = (idle_x >= (VID_H_BPORCH + VID_H_ACTIVE/2 - 20))
+             && (idle_x <  (VID_H_BPORCH + VID_H_ACTIVE/2 + 20))
+             && (idle_y >= (VID_V_BPORCH + VID_V_ACTIVE/2 - 20))
+             && (idle_y <  (VID_V_BPORCH + VID_V_ACTIVE/2 + 20));
+
+always @(posedge clk_core) begin
+
+    idle_de  <= 1'b0;
+    idle_hs  <= 1'b0;
+    idle_vs  <= 1'b0;
+    idle_rgb <= 24'h0;
+
+    idle_blink <= idle_blink + 25'd1;
+
+    if (idle_active) begin
+        idle_de <= 1'b1;
+        case (rom_error)
+            ERR_TRAILER:  idle_rgb <= 24'hc01010;   // red:    not a pack
+            ERR_OVERFLOW: idle_rgb <= 24'hc010c0;   // purple: bridge outran the chip
+            ERR_WAIT:     idle_rgb <= 24'hc08010;   // amber:  WAIT held, nothing moves
+            default:
+                if (blinking && in_block) idle_rgb <= 24'hffffff;
+        endcase
+    end
+
+    idle_x <= idle_x + 10'd1;
+    if (idle_x == VID_H_TOTAL - 1) begin
+        idle_x <= 10'd0;
+        idle_y <= idle_y + 10'd1;
+        if (idle_y == VID_V_TOTAL - 1) idle_y <= 10'd0;
+    end
+    if (idle_x == 3) idle_hs <= 1'b1;
+    if (idle_x == 10'd0 && idle_y == 10'd0) idle_vs <= 1'b1;
+end
+
+// ---- the design --------------------------------------------------------------
+wire [7:0]  game_r, game_g, game_b;
+wire        game_de, game_hs, game_vs;
+
+wire        mem_in_ready;
+wire [23:0] mem_addr;
+wire [7:0]  rom_data;
+wire        rom_data_available, rom_busy;
+
+assign video_rgb = rom_ready ? {game_r, game_g, game_b} : idle_rgb;
+assign video_de  = rom_ready ? game_de : idle_de;
+assign video_hs  = rom_ready ? game_hs : idle_hs;
+assign video_vs  = rom_ready ? game_vs : idle_vs;
+
+M_main u_soc (
+    .in_mem_data          ( rom_data           ),
+    .in_mem_data_available( rom_data_available ),
+    .in_mem_busy          ( rom_busy           ),
+    .in_jstick            ( jstick             ),
+
+    .out_mem_in_ready     ( mem_in_ready       ),
+    .out_mem_addr         ( mem_addr           ),
+
+    .out_video_r          ( game_r             ),
+    .out_video_g          ( game_g             ),
+    .out_video_b          ( game_b             ),
+    .out_video_de         ( game_de            ),
+    .out_video_hs         ( game_hs            ),
+    .out_video_vs         ( game_vs            ),
+    .out_leds             (                    ),   // no LEDs on the Pocket
+    .out_vblank           (                    ),
+
+    .in_run               ( 1'b1               ),
+    .out_done             (                    ),
+    .reset                ( design_reset_n     ),
+    .out_clock            (                    ),
+    .clock                ( clk_core           )
+);
+
+aw_rom u_rom (
+    .clk_core             ( clk_core             ),
+    .rst_core             ( rst_core             ),
+    .mem_in_ready         ( mem_in_ready         ),
+    .vm_running           ( design_reset_n       ),   // the VM's request is meaningless
+                                                       // until it is out of reset
+    .mem_addr             ( mem_addr             ),
+    .mem_data             ( rom_data             ),
+    .mem_data_available   ( rom_data_available   ),
+    .mem_busy             ( rom_busy             ),
+
+    .clk_psram            ( clk_psram            ),
+    .rst_psram            ( rst_psram            ),
+
+    .clk_bridge           ( clk_74a              ),
+    .rst_bridge           ( rst_bridge           ),
+    .bridge_wr            ( bridge_wr            ),
+    .bridge_addr          ( bridge_addr          ),
+    .bridge_wr_data       ( bridge_wr_data       ),
+    .dataslot_allcomplete ( dataslot_allcomplete ),
+
+    .rom_ready            ( rom_ready            ),
+    .rom_error            ( rom_error            ),
+    .rom_loading          (                      ),
+
+    .cram0_a              ( cram0_a              ),
+    .cram0_dq             ( cram0_dq             ),
+    .cram0_wait           ( cram0_wait           ),
+    .cram0_clk            ( cram0_clk            ),
+    .cram0_adv_n          ( cram0_adv_n          ),
+    .cram0_cre            ( cram0_cre            ),
+    .cram0_ce0_n          ( cram0_ce0_n          ),
+    .cram0_ce1_n          ( cram0_ce1_n          ),
+    .cram0_oe_n           ( cram0_oe_n           ),
+    .cram0_we_n           ( cram0_we_n           ),
+    .cram0_ub_n           ( cram0_ub_n           ),
+    .cram0_lb_n           ( cram0_lb_n           )
+);
 
 //
 // audio i2s silence generator
@@ -653,23 +780,4 @@ end
 ///////////////////////////////////////////////
 
 
-    wire    clk_core_12288;
-    wire    clk_core_12288_90deg;
-    
-    wire    pll_core_locked;
-    wire    pll_core_locked_s;
-synch_3 s01(pll_core_locked, pll_core_locked_s, clk_74a);
-
-mf_pllbase mp1 (
-    .refclk         ( clk_74a ),
-    .rst            ( 0 ),
-    
-    .outclk_0       ( clk_core_12288 ),
-    .outclk_1       ( clk_core_12288_90deg ),
-    
-    .locked         ( pll_core_locked )
-);
-
-
-    
 endmodule

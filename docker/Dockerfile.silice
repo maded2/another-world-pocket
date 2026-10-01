@@ -42,6 +42,13 @@ RUN git clone --depth 1 --branch ${SILICE_REF} https://github.com/sylefeb/Silice
  && make install \
  && (command -v silice || ls -l /usr/local/bin | grep -i silice)
 
+# Simulators, for the design-side checks in scripts/sim_*.sh: iverilog to lint and
+# smoke-test the glue RTL quickly (Quartus takes minutes to report a typo), and
+# verilator to run the translated design against a model of the Pocket side.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iverilog verilator \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV SILICE_ROOT=/opt/Silice \
     PYTHONPATH=/opt/Silice/python
 
