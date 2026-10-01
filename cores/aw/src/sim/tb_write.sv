@@ -212,6 +212,59 @@ module tb_write;
                                           248+j, sbuf[j], j < 8 ? want[248+j] : 8'h5a);
             end
 
+        // ---- cram0_wait has to be survivable, and has to be reported ----------------
+        // Until this line nothing in the tree had ever asserted that pin: the model declared
+        // wait_hi and never drove it, the design saw x, and `if (psram_wait)` reads x as
+        // false. So both the counter in aw_psram and the ERR_WAIT report in aw_rom were
+        // dead code in an assumed-polarity signal - see aw_psram_model.v.
+        $display("tb_write: forcing cram0_wait high, expecting ERR_WAIT rather than a hang");
+        u_mem.force_wait = 1'b1;
+        begin : waitstall
+            integer g2; g2 = 0;
+            while (!u_rom.u_psram.stall_wait && g2 < 300000) begin
+                @(posedge clk_core); g2 = g2 + 1;
+            end
+            if (!u_rom.u_psram.stall_wait) begin
+                errors = errors + 1;
+                $display("  WAIT never escalated: stall_wait stayed low after %0d cycles", g2);
+            end else begin
+                // rom_error follows stall_wait through aw_rom's status block, so it is one
+                // clock behind the observation that woke this loop up. Polling it on the same
+                // edge reported 0 and the test blamed the design; that was the test.
+                repeat (8) @(posedge clk_core);
+                $display("  stall_wait after %0d cycles, rom_error=%0d (want 3 = ERR_WAIT)",
+                         g2, rom_error);
+                if (rom_error != 2'd3) begin
+                    errors = errors + 1;
+                    $display("  rom_error is %0d, want 3", rom_error);
+                end
+            end
+            // A held chip must not hand out a byte. Busy staying up is the correct answer;
+            // dropping it would let the VM run on the previous byte and draw something
+            // plausible-looking but wrong, which is worse than a freeze.
+            @(negedge clk_core); mem_addr <= 24'h0; mem_in_ready <= 1;
+            @(negedge clk_core); mem_in_ready <= 0;
+            repeat (60) @(posedge clk_core);
+            if (!mem_busy) begin
+                errors = errors + 1;
+                $display("  busy fell while the chip was still being held");
+            end
+        end
+        u_mem.force_wait = 1'b0;
+        repeat (300) @(posedge clk_core);
+        // ERR_WAIT outlives rom_ready by design - a part that did this is not something to
+        // hand the game - so what is checked here is that the bus came back, not that the
+        // error cleared.
+        rd1(24'h0, got);
+        if (got !== want[0]) begin
+            errors = errors + 1;
+            $display("  after releasing WAIT, byte 0 reads %02h want %02h: bus did not recover",
+                     got, want[0]);
+        end else begin
+            $display("  bus recovered after WAIT; rom_error left at %0d (ERR_WAIT is sticky)",
+                     rom_error);
+        end
+
         $display("tb_write: rom_error=%0d rom_ready=%b, %0d errors -> %s",
                  rom_error, rom_ready, errors, (errors == 0) ? "PASS" : "FAIL");
         $fflush;

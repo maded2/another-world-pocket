@@ -544,7 +544,22 @@ always @(posedge clk_psram) begin
 end
 
 // the game: clocks up, host happy, and a pack it can read
-wire design_reset_n = ~rst_core && rom_ready;
+//
+// M_main.reset is ACTIVE HIGH. The generated code says `q <= (reset) ? 0 : d`, and
+// clean_reset() stretches this into the rasterizer and the blitter. Getting this backwards
+// cost the whole intro: with an active-low-looking signal here, the two drawing engines sat
+// in reset from the moment rom_ready went up while the VM kept running - upstream ties the
+// VM's own reset to constant 0 (vm_reset(0)), because upstream's ROM is SPI flash and is
+// readable from the first clock after configuration. A VM that runs with the blitter frozen
+// stops asking for bytes at the first `while (rasterizer_busy | blitter_busy) { }` (vm.si:267)
+// and the screen is black with a byte-accurate ROM, which is not where anyone looks first.
+//
+// The VM still cannot be reset here even though it is nominally in reset: its reset pin is
+// wired to 0 inside the generated netlist. It is held off instead by aw_rom's vm_running
+// gate, which declines its requests until the pack is loaded - without that, the ROM streams
+// to a VM that has nothing to do with the data and the pack load reports ERR_OVERFLOW.
+wire design_run   = ~rst_core && rom_ready;
+wire design_reset = ~design_run;
 
 ////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -578,10 +593,32 @@ assign video_skip         = 1'b0;
 // Another World has one action verb. The analog stick is ignored on purpose, this
 // is a d-pad game and half-pressed diagonals would only make the hero wander.
 
+// Which bits of cont1_key hold the d-pad and the action button. This is the ONE place to
+// change it, and it is a define rather than literals for a reason: the bit positions come
+// from Analogue's controller-word spec, which is not documented anywhere in this tree and
+// could not be fetched while porting, so what follows is a belief - the numbering used in
+// the cores that derive from the APF template (d-pad in the high nibble, B at 0, A at 8).
+// The previous code here used upstream's Lattice button indices, which are certainly wrong
+// for the Pocket and would have made the pad dead in a way no simulation could show: tb_soc
+// drives jstick itself and never goes through this block.
+//
+// Symptom if this is wrong: the game runs, the intro plays, no button does anything. Fix by
+// changing these five numbers, not by touching the packing below (that one matches vm.si:
+// [0] right [1] left [2] up [3] down [4] fire, verified against a5k.si's MCH2022 mapping).
+`ifndef AW_KEY_RIGHT
+  `define AW_KEY_RIGHT 12
+  `define AW_KEY_LEFT  13
+  `define AW_KEY_DOWN  14
+  `define AW_KEY_UP    15
+  `define AW_KEY_B     0
+  `define AW_KEY_A     8
+`endif
+
 reg  [4:0] key_s1, key_s2, key_s3;
 always @(posedge clk_core) begin
-    key_s1 <= {cont1_key[0], cont1_key[1], cont1_key[2], cont1_key[3],
-               cont1_key[4] | cont1_key[5]};
+    key_s1 <= {cont1_key[`AW_KEY_RIGHT], cont1_key[`AW_KEY_LEFT], cont1_key[`AW_KEY_UP],
+               cont1_key[`AW_KEY_DOWN],
+               cont1_key[`AW_KEY_B] | cont1_key[`AW_KEY_A]};
     key_s2 <= key_s1;
     key_s3 <= key_s2;
 end
@@ -686,7 +723,7 @@ M_main u_soc (
 
     .in_run               ( 1'b1               ),
     .out_done             (                    ),
-    .reset                ( design_reset_n     ),
+    .reset                ( design_reset       ),   // ACTIVE HIGH
     .out_clock            (                    ),
     .clock                ( clk_core           )
 );
@@ -695,8 +732,8 @@ aw_rom u_rom (
     .clk_core             ( clk_core             ),
     .rst_core             ( rst_core             ),
     .mem_in_ready         ( mem_in_ready         ),
-    .vm_running           ( design_reset_n       ),   // the VM's request is meaningless
-                                                       // until it is out of reset
+    .vm_running           ( design_run           ),   // the VM's request is meaningless
+                                                       // until the pack is loaded
     .mem_addr             ( mem_addr             ),
     .mem_data             ( rom_data             ),
     .mem_data_available   ( rom_data_available   ),

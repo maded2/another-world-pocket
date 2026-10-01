@@ -90,6 +90,17 @@ module aw_psram_model (
         end
     end
 
+    // ---- test hook ---------------------------------------------------------------
+    // Hold this high from the testbench and the part refuses to answer, forever. It exists
+    // because wait_hi used to be declared and never driven: the design saw x, and
+    // `if (psram_wait)` reads x as false, so aw_psram's WAIT counter and aw_rom's ERR_WAIT
+    // had never run in any test - in the one part of the interface whose polarity is an
+    // assumption (the Pocket calls it cram0_wait, no bar, and this APF revision never uses
+    // it). An untested failure path in an assumed-polarity signal is exactly the kind of
+    // thing that comes back as a purple screen with no diagnostics.
+    reg force_wait = 1'b0;
+    always @(*) wait_hi = force_wait;
+
     // start in a known-but-clearly-not-a-pack state, so that a core which reads
     // before loading shows up as a trailer failure rather than looking correct
     initial begin : fill

@@ -110,6 +110,27 @@ def find_bitstream(core_dir, out_dir):
 SKIP_NAMES = {".keep", ".gitkeep", ".DS_Store"}
 
 
+def design_resolution(core_dir):
+    """The pixel size the design itself generates, read from the Silice source
+    ($$H_ACTIVE / $$V_ACTIVE). video.json is a claim about the video pins; nothing else in
+    the tree checks that claim, and a core that ships 320x200 while declaring 320x240 gets
+    silently rescaled by Analogue OS. Returns [(w, h, source_path), ...]."""
+    out = []
+    si_dir = Path(core_dir) / "src" / "si"
+    if not si_dir.is_dir():
+        return out
+    for path in sorted(si_dir.glob("*.si")):
+        try:
+            txt = path.read_text(errors="replace")
+        except OSError:
+            continue
+        hw = re.search(r"^\s*\$\$H_ACTIVE\s*=\s*(\d+)", txt, re.M)
+        vh = re.search(r"^\s*\$\$V_ACTIVE\s*=\s*(\d+)", txt, re.M)
+        if hw and vh:
+            out.append((int(hw.group(1)), int(vh.group(1)), path))
+    return out
+
+
 def merge_tree(src, dst):
     """copytree with merge semantics (dirs_exist_ok is Python 3.8+)."""
     dst.mkdir(parents=True, exist_ok=True)
@@ -214,6 +235,46 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
         if m.get("rotation") not in (0, 90, 180, 270, None):
             report.warn("video scaler_modes[{}].rotation={} (expected 0/90/180/270)"
                         .format(i, m.get("rotation")))
+
+    # video.json describes the pixels on the wire. If none of the declared modes is the size
+    # the design actually generates, Analogue OS rescales something it was not told about.
+    for w, h, where in design_resolution(core_dir):
+        if modes and not any(m.get("width") == w and m.get("height") == h for m in modes):
+            declared = ", ".join("{}x{}".format(m.get("width"), m.get("height"))
+                                 for m in modes)
+            report.error("video.json declares {} but the design generates {}x{} "
+                         "($$H_ACTIVE/$$V_ACTIVE in {})".format(declared, w, h, where))
+
+    # ------------------------------------------------------------------- data
+    # A core whose data_slots is empty has nothing for Analogue OS to load: the OSD offers no
+    # file picker, nothing is written to the dataslot window, and the core sits waiting for a
+    # ROM that will never arrive. Every other symptom of that looks like a hardware bug.
+    data = subs.get("data.json") or {}
+    slots = data.get("data", {}).get("data_slots")
+    if isinstance(slots, list) and not slots:
+        msg = ('data.json has data_slots [] - the OSD cannot offer a file, so nothing '
+               'is ever loaded into the dataslot window')
+        if release:
+            report.error(msg)
+        else:
+            report.warn(msg)
+    elif isinstance(slots, list):
+        for i, s in enumerate(slots):
+            if not isinstance(s, dict):
+                report.error("data_slots[{}] must be an object".format(i)); continue
+            for key in ("name", "filename", "extensions", "address", "size"):
+                if key not in s:
+                    report.warn("data_slots[{}]: no '{}' - verify against the Analogue "
+                                "data slot spec on hardware".format(i, key))
+            exts = s.get("extensions")
+            if isinstance(exts, list) and not exts:
+                report.error("data_slots[{}]: extensions is empty - no file would match"
+                             .format(i))
+            for key in ("address", "size"):
+                val = s.get(key)
+                if isinstance(val, str) and not re.match(r"^[0-9a-fA-F]+$", val):
+                    report.error("data_slots[{}].{!r} is {!r}; expected a hex string "
+                                 "without 0x".format(i, key, val))
 
     # variants.json: the list the OSD offers the user. core.cores[] above is the
     # *bitstream* list; these are different lists and both need unique ids.
@@ -361,19 +422,34 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
         zpath = out_dir / "{}-{}.zip".format(cid, version)
         if zpath.exists():
             zpath.unlink()
+        # Zip what *this* core owns, not whatever is in the output folder. The out dir is a
+        # merged SD tree and is allowed to hold other cores; walking it shipped another
+        # core's bitstream and another platform's JSON inside this core's release zip.
+        own = [dest]                                        # Cores/<cid>
+        own += [out_dir / "Platforms" / "{}.json".format(p) for p in platform_ids]
+        own += [out_dir / "Platforms" / "_images" / "{}.bin".format(p) for p in platform_ids]
+        own += [out_dir / "Assets" / p for p in platform_ids]
+        written = 0
         with zipfile.ZipFile(str(zpath), "w", zipfile.ZIP_DEFLATED) as z:
-            for folder in ("Cores", "Platforms", "Assets"):
-                base = out_dir / folder
-                if not base.is_dir():
-                    continue
-                for p in sorted(base.rglob("*")):
-                    if p.is_file():
-                        z.write(str(p), str(p.relative_to(out_dir)))
-                    elif p.is_dir() and not any(p.iterdir()):
-                        zi = zipfile.ZipInfo(str(p.relative_to(out_dir)) + "/")
-                        zi.external_attr = 0o40755 << 16
-                        z.writestr(zi, b"")
-        report.ok("zip: {} ({:,} bytes)".format(zpath, zpath.stat().st_size))
+            for base in own:
+                if base.is_file():
+                    z.write(str(base), str(base.relative_to(out_dir)))
+                    written += 1
+                elif base.is_dir():
+                    for p in sorted(base.rglob("*")):
+                        if p.is_file():
+                            z.write(str(p), str(p.relative_to(out_dir)))
+                            written += 1
+                        elif p.is_dir() and not any(p.iterdir()):
+                            zi = zipfile.ZipInfo(str(p.relative_to(out_dir)) + "/")
+                            zi.external_attr = 0o40755 << 16
+                            z.writestr(zi, b"")
+                else:
+                    report.warn("zip: expected {} and it is not there".format(base))
+        if written == 0:
+            report.error("zip would be empty - nothing was packaged")
+        report.ok("zip: {} ({:,} bytes, {} file(s), this core only)".format(
+            zpath, zpath.stat().st_size, written))
 
     print(":: {} - {} error(s), {} warning(s)".format(
         "FAILED" if report.errors else "OK", len(report.errors), len(report.warnings)))

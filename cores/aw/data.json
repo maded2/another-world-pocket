@@ -1,6 +1,23 @@
 {
     "data": {
         "magic": "APF_VER_1",
-        "data_slots": []
+        "data_slots": [
+            {
+                "name": "Another World pack",
+                "filename": "{osd_origin}/{osd_filename}",
+                "extensions": [
+                    "bin"
+                ],
+                "address": "10000000",
+                "size": "00200000",
+                "ways": 1,
+                "onlaunch": {
+                    "priority": 1,
+                    "address": "10000000",
+                    "timeout_ms": 30000
+                },
+                "savestate_supported": false
+            }
+        ]
     }
 }

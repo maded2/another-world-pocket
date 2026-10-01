@@ -411,6 +411,21 @@ module tb_rom;
         check_one(TRAILER    , "readByte first trailer byte");
         peek_one(24'h1fffff, "past the end of the pack");
 
+        // ---- the region at and above 1 MB -------------------------------------------
+        // op_drawString reads the pre-rendered string table at (1<<20), and the intro draws
+        // text before it draws anything else, yet until now every address this test used was
+        // below 0x1FFFFF by way of a window that started at 0. The bug this catches is the
+        // one that can only exist here: a 20-bit address tag makes 0x100000 look like 0, so a
+        // reader that wants a string byte is handed byte 0 of the pack and nothing below 1 MB
+        // can see it.
+        check_one(24'h100000, "string ROM: index base");
+        check_one(24'h100001, "string ROM: index base + 1");
+        check_stream(24'h100000, 64, "string ROM preload");
+        check_one(24'h0fffff, "the byte before the string ROM");
+        check_one(24'h180000, "string ROM: deep");
+        check_one(24'h1fffd0, "string ROM: near the trailer");
+        check_stream(24'h1fffd0, 32, "string ROM up to the trailer");
+
         // 4. a preload immediately followed by a single-byte read at an unrelated
         //    address: the point of the flush, and the case that would silently
         //    return a stale over-fetched byte if the flush were wrong

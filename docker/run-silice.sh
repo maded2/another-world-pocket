@@ -54,6 +54,15 @@ elif [ -t 1 ]; then
     docker_args+=(-t)
 fi
 
+# Simulation knobs, forwarded only when set. A bare `docker run` does not inherit the
+# caller's environment, which meant `TRACE=1 ... scripts/sim_soc.sh` silently came back
+# with no trace and `FRAMES=8` still captured forty - the design then looks like it is
+# misbehaving when it is the wrapper ignoring the request. Anything documented by the
+# scripts under scripts/ goes through here.
+for _v in TRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS; do
+    [ -n "${!_v:-}" ] && docker_args+=(-e "$_v")
+done
+
 if [ -n "${AP_EXTRA_MOUNT:-}" ]; then
     IFS=: read -ra extras <<< "$AP_EXTRA_MOUNT"
     for m in "${extras[@]}"; do

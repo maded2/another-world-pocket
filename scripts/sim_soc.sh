@@ -23,6 +23,10 @@ SIM="$ROOT/cores/aw/src/sim"
 CORE="$ROOT/cores/aw/src/fpga/core"
 WORK="${TMPDIR:-/tmp}/aw-sim-soc"
 FRAMES="${FRAMES:-40}"
+# The frames have to land somewhere the host can see. This script runs inside a container
+# whose /tmp is its own, so writing pictures there meant every "look at a frame" instruction
+# pointed at files that did not exist once the container exited.
+FRAMEDIR="${FRAMEDIR:-$ROOT/build/sim/soc-frames}"
 
 [ -f "$PACK" ] || { echo "error: no pack at $PACK" >&2
                     echo "       build them with: ./docker/run-extract.sh scripts/extract_packs.sh" >&2
@@ -31,7 +35,7 @@ FRAMES="${FRAMES:-40}"
                     echo "       run: ./docker/run-silice.sh scripts/pocket_translate.sh" >&2
                     exit 2; }
 
-mkdir -p "$WORK" "$WORK/frames"
+mkdir -p "$WORK" "$FRAMEDIR"
 
 python3 - "$PACK" "$WORK/pack.hex" <<'PY'
 import sys
@@ -42,22 +46,30 @@ with open(sys.argv[2], 'w') as fh:
 print("wrote %s (%d bytes)" % (sys.argv[2], len(data)))
 PY
 
+# TRACE=1 wires the design's own rasterizer/busy/paging nets out of the generated netlist
+# and prints every change. A black screen with a byte-accurate ROM is either 'the VM stopped
+# asking' or 'the VM is waiting on a busy that never falls' and these two bits say which.
+DEFINES=()
+# verilator takes defines as -D<name>; `--define` is not an option it knows.
+[ -n "${TRACE:-}" ] && DEFINES+=(-DSOC_TRACE)
+
 cd "$WORK"
 verilator --binary -j 4 --timing --top-module tb_soc \
     -Wno-fatal -Wno-lint --Mdir obj \
+    "${DEFINES[@]}" \
     "$CORE/aw_rom.v" "$CORE/aw_fifo.v" "$CORE/aw_psram.v" \
     "$SIM/aw_psram_model.v" \
     "$CORE/aw_pocket_build.v" "$SIM/tb_soc.sv" \
     -o tb_soc 2>&1 | tail -25
 
 echo "=== run: load, boot, capture $FRAMES frames ==="
-./obj/tb_soc "+PACK=$WORK/pack.hex" "+PACE=${PACE:-8}" "+FRAMES=$FRAMES" \
-             "+FRAMEDIR=$WORK/frames"
+./obj/tb_soc "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" "+FRAMES=$FRAMES" \
+             "+FRAMEDIR=$FRAMEDIR"
 rc=$?
 
 echo "=== frames ==="
-ls -l "$WORK/frames" 2>/dev/null | head -8
+ls -l "$FRAMEDIR" 2>/dev/null | head -8
 if [ "$rc" -eq 0 ]; then
-    echo "frames are in $WORK/frames - look at one before believing the summary"
+    echo "frames are in $FRAMEDIR - look at one before believing the summary"
 fi
 exit $rc

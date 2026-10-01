@@ -67,6 +67,13 @@ elif [ -t 1 ]; then
     docker_args+=(-t)
 fi
 
+# Knobs the scripts under scripts/ document, forwarded only when set: a container does
+# not inherit the caller's environment, so `JOBS=8 ./docker/run.sh scripts/build.sh ...`
+# or `TRACE=1 ./docker/run.sh scripts/sim_soc.sh` silently does nothing without this.
+for _v in TRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS; do
+    [ -n "${!_v:-}" ] && docker_args+=(-e "$_v")
+done
+
 # extra mounts: AP_EXTRA_MOUNT="/path/a:/path/a:/other:/other"
 if [ -n "${AP_EXTRA_MOUNT:-}" ]; then
     IFS=: read -ra extras <<< "$AP_EXTRA_MOUNT"

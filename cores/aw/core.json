@@ -5,12 +5,12 @@
             "platform_ids": [
                 "anotherworld"
             ],
-            "shortname": "aw",
-            "description": "aw - openFPGA core for Analogue Pocket",
-            "author": "author",
-            "url": "https://github.com/open-fpga/core-template",
+            "shortname": "Another World",
+            "description": "Another World (Out of This World, Delphine Software 1991). Runs the original engine: a Silice virtual machine over game data loaded through the dataslot. No audio yet.",
+            "author": "Eddie Chan",
+            "url": "https://github.com/sylefeb/a5k",
             "version": "0.1.0",
-            "date_release": "0000-00-00"
+            "date_release": "2026-10-01"
         },
         "framework": {
             "target_product": "Analogue Pocket",

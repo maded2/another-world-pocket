@@ -32,7 +32,10 @@ module tb_soc;
     always #6.73400 clk_bridge = ~clk_bridge;  // 74.250 MHz
 
     reg rst_core = 1'b1, rst_psram = 1'b1, rst_bridge = 1'b1;
-    reg design_reset_n = 1'b0;
+    // design_run mirrors core_top: the generated M_main.reset is ACTIVE HIGH, so it is
+// ~design_run that goes to the design. Mirroring the polarity wrongly here is what
+// hid the frozen-blitter bug for as long as it was hidden.
+reg design_run = 1'b0;
 
     // ---- ROM <-> VM ----
     wire        mem_in_ready;
@@ -64,7 +67,7 @@ module tb_soc;
         .clk_core            (clk_core),
         .rst_core            (rst_core),
         .mem_in_ready        (mem_in_ready),
-        .vm_running            (design_reset_n),
+        .vm_running            (design_run),
         .mem_addr            (mem_addr),
         .mem_data            (mem_data),
         .mem_data_available  (mem_data_available),
@@ -110,11 +113,30 @@ module tb_soc;
         .wait_hi (cram0_wait)
     );
 
+    // ---- scripted input -------------------------------------------------------------
+    // Upstream's simulation block does exactly this (a5k.si:870): up until cycle 70217342,
+    // then right. Not because the intro needs a combination of buttons, but because a
+    // testbench that never presses anything cannot tell 'nothing renders' from 'nobody
+    // pressed a button' - and the opening scene does wait for the player. Bit order is the
+    // VM's, from vm.si: [0] right [1] left [2] up [3] down [4] fire [5] unused.
+    // +NOINPUT=1 pins it to zero instead (that is what the run that found the frozen
+    // blitter used).
+    reg [5:0] js = 6'b000000;
+    integer noinput = 0;
+    longint cyc_run = 0;
+    always @(posedge clk_core) begin
+        if (design_run) cyc_run = cyc_run + 1;
+        if (!noinput && design_run)
+            js = (cyc_run < 70_217_342) ? 6'b000100 : 6'b000001;  // up, then right
+        else if (design_run)
+            js = 6'b000000;
+    end
+
     M_main u_soc (
         .in_mem_data          (mem_data),
         .in_mem_data_available(mem_data_available),
         .in_mem_busy          (mem_busy),
-        .in_jstick            (6'b000000),
+        .in_jstick            (js),
         .out_mem_in_ready     (mem_in_ready),
         .out_mem_addr         (mem_addr),
         .out_video_r          (game_r),
@@ -127,7 +149,7 @@ module tb_soc;
         .out_vblank           (),
         .in_run               (1'b1),
         .out_done             (),
-        .reset                (design_reset_n),
+        .reset                (~design_run),
         .out_clock            (),
         .clock                (clk_core)
     );
@@ -219,6 +241,144 @@ module tb_soc;
         else if (mem_data_available) starving = 0;
     end
 
+`ifdef SOC_TRACE
+    // ---- where the VM is stuck, if it is -------------------------------------------
+    // vm.si has five copies of `while (rasterizer_busy | blitter_busy) { }`; the polygon op
+    // hits it right after reading numPoints (vm.si:267), which is where the byte count stops.
+    // A busy that never falls is indistinguishable from a ROM that stopped answering by
+    // looking at the ROM alone, so take the two bits straight out of the generated netlist.
+    wire       tr_rast_busy  = u_soc._w_rast_busy;
+    wire       tr_blit_busy  = u_soc._w_blit_busy;
+    wire       tr_rast_start = u_soc._w_vm_rasterizer_start;
+    wire       tr_blit_start = u_soc._w_vm_blitter_start;
+    wire       tr_page_swap  = u_soc._w_vm_page_swap;
+    wire       tr_pal_swap   = u_soc._w_vm_pal_swap;
+    wire [5:0] tr_numv       = u_soc._w_vm_polygon_numv;
+    wire [9:0] tr_bbw        = u_soc._w_vm_polygon_bbw;
+    wire [9:0] tr_bbh        = u_soc._w_vm_polygon_bbh;
+
+    reg  tr_p_rast, tr_p_blit, tr_p_rstart, tr_p_bstart, tr_p_swap, tr_p_pal, tr_p_leds_seen;
+    reg [7:0] tr_p_leds;
+    integer tr_rast_high = 0, tr_blit_high = 0, tr_events = 0;
+    // Total pixel write pulses reaching the pages. 'nothing on screen' with a blitter that
+    // completed 64000 writes is either writes going to a page nobody displays, or writes that
+    // never reach a page at all; this counter is the difference, and which of p0..p3 fills up
+    // says the rest.
+    integer tr_wpulse = 0;
+    // Split by source, because 'writes are issued but the pages stay empty' means either the
+    // blitter is copying an empty source (its src selector picks a page nobody has painted,
+    // or a selector value the read mux has no case for, which reads as 0) or the write
+    // enable never reaches the memory. A single OR cannot tell those apart.
+    integer tr_w_vm = 0, tr_w_rast = 0, tr_w_blit = 0, tr_blitsrc_hist [0:7];
+    integer tr_pagen_w [0:3];
+    integer tr_mem_wen1 = 0;
+    reg [3:0] tr_mem_wdata_or = 4'h0;
+    reg [3:0] tr_rast_pal_or = 4'h0, tr_blit_data_or = 4'h0;
+    integer tr_rast_oob = 0, tr_blit_oob = 0;
+    reg [15:0] tr_addr_max = 0;
+    always @(posedge clk_core) begin
+        if (u_soc._w_vm_pix_wenable)     tr_w_vm   = tr_w_vm   + 1;
+        if (u_soc._w_rast_pix_wenable)   tr_w_rast = tr_w_rast + 1;
+        if (u_soc._w_blit_dst_wenable)   tr_w_blit = tr_w_blit + 1;
+        tr_blitsrc_hist[u_soc._w_vm_blitter_src] = tr_blitsrc_hist[u_soc._w_vm_blitter_src] + 1;
+        if (u_soc._t__page0_wenable) tr_pagen_w[0] = tr_pagen_w[0] + 1;
+        if (u_soc._t__page1_wenable) tr_pagen_w[1] = tr_pagen_w[1] + 1;
+        if (u_soc._t__page2_wenable) tr_pagen_w[2] = tr_pagen_w[2] + 1;
+        if (u_soc._t__page3_wenable) tr_pagen_w[3] = tr_pagen_w[3] + 1;
+        if (u_soc._w_vm_pix_wenable | u_soc._w_rast_pix_wenable
+            | u_soc._w_blit_dst_wenable) tr_wpulse = tr_wpulse + 1;
+        // The memory's OWN port, and every data value it has ever been given. 'wen pulses at
+        // the page module but the buffer is empty' has one remaining innocent explanation -
+        // my probe is not reading the array that is being written - and one very guilty one -
+        // the write data is constant 0, which is what a blitter copying an empty page and a
+        // VM clearing to colour 0 both look like. These settle it.
+        if (u_soc.page1.__mem__pixels.in_wenable) begin
+            tr_mem_wen1 = tr_mem_wen1 + 1;
+            tr_mem_wdata_or = tr_mem_wdata_or | u_soc.page1.__mem__pixels.in_wdata;
+        end
+        tr_mem_wdata_or = tr_mem_wdata_or | (u_soc._t__page1_wenable ? u_soc._d__page1_wdata : 4'h0);
+        // Every write so far has carried the value 0, which moves the question from the write
+        // path to the content: either the game really is asking for colour 0 (a screen clear
+        // and blits of an empty page do exactly that), or its pixel address is out of range
+        // and the tool drops the write silently - buffer[] is 64,000 entries but the address
+        // is 16 bits, so anything >= 64,000 vanishes without an error. These say which.
+        if (u_soc._w_rast_pix_wenable) begin
+            tr_rast_pal_or = tr_rast_pal_or | u_soc._w_rast_pix_palid;
+            if (u_soc._w_rast_pix_waddr > 16'd63999) tr_rast_oob = tr_rast_oob + 1;
+            if (u_soc._w_rast_pix_waddr > tr_addr_max) tr_addr_max = u_soc._w_rast_pix_waddr;
+        end
+        if (u_soc._w_blit_dst_wenable) begin
+            tr_blit_data_or = tr_blit_data_or | u_soc._w_blit_dst_data;
+            if (u_soc._w_blit_dst_addr > 16'd63999) tr_blit_oob = tr_blit_oob + 1;
+        end
+    end
+    reg tr_p_blen = 1'bx;
+
+    // enabled is (~display_conflict)|vblank; watch it and the counter once a blit is in flight
+    always @(posedge clk_core) begin
+        if (tr_blit_busy && (tr_blit_high % 20000) == 19999)
+            $display("  TRACE blit busy %0d: enabled=%b count=%0d prev=%0d src_addr=%0d dst_wenable=%b",
+                     tr_blit_high, u_soc.blit.in_enabled, u_soc.blit._q_count,
+                     u_soc.blit._q_prev_count, u_soc.blit.out_src_addr, u_soc.blit.out_dst_wenable);
+    end
+
+    always @(posedge clk_core) begin
+        if (tr_rast_busy !== tr_p_rast) begin
+            $display("  TRACE t=%0t rast_busy %b -> %b (was %0d cycles) bytes=%0d addr=%h",
+                     $time, tr_p_rast, tr_rast_busy, tr_rast_high, bytes_to_vm, mem_addr);
+            tr_rast_high = 0; tr_p_rast = tr_rast_busy; tr_events = tr_events + 1;
+        end else if (tr_rast_busy) tr_rast_high = tr_rast_high + 1;
+
+        if (tr_blit_busy !== tr_p_blit) begin
+            $display("  TRACE t=%0t blit_busy %b -> %b (was %0d cycles) bytes=%0d addr=%h",
+                     $time, tr_p_blit, tr_blit_busy, tr_blit_high, bytes_to_vm, mem_addr);
+            tr_blit_high = 0; tr_p_blit = tr_blit_busy; tr_events = tr_events + 1;
+        end else if (tr_blit_busy) tr_blit_high = tr_blit_high + 1;
+
+        if (tr_rast_start && !tr_p_rstart)
+            $display("  TRACE t=%0t RASTERIZER_START numv=%0d bbw=%0d bbh=%0d bytes=%0d",
+                     $time, tr_numv, tr_bbw, tr_bbh, bytes_to_vm);
+        if (tr_blit_start && !tr_p_bstart)
+            $display("  TRACE t=%0t BLITTER_START bytes=%0d", $time, bytes_to_vm);
+        // The blitter is a counter 0..63999 gated by 'enabled' (a5k.si:122): busy can only
+        // fall when prev_count reaches 63999, so a busy that never falls means either enabled
+        // never goes true or the counter is not running. These two say which, and they are
+        // the difference between a port bug in aw_pocket.si and something deeper.
+        if (u_soc.blit.in_enabled !== tr_p_blen) begin
+            $display("  TRACE t=%0t blitter enabled %b -> %b  count=%0d prev=%0d",
+                     $time, tr_p_blen, u_soc.blit.in_enabled,
+                     u_soc.blit._q_count, u_soc.blit._q_prev_count);
+            tr_p_blen = u_soc.blit.in_enabled;
+        end
+        if (tr_page_swap && !tr_p_swap)
+            $display("  TRACE t=%0t PAGE_SWAP bytes=%0d frames=%0d", $time, bytes_to_vm, frames);
+        if (tr_pal_swap && !tr_p_pal)
+            $display("  TRACE t=%0t PAL_SWAP bytes=%0d frames=%0d", $time, bytes_to_vm, frames);
+        if (leds !== tr_p_leds) begin
+            $display("  TRACE t=%0t leds %b -> %b bytes=%0d", $time, tr_p_leds, leds, bytes_to_vm);
+            tr_p_leds = leds;
+        end
+        tr_p_rstart = tr_rast_start; tr_p_bstart = tr_blit_start;
+        tr_p_swap   = tr_page_swap;   tr_p_pal    = tr_pal_swap;
+    end
+
+    // The interesting state is the last one, so say it once when the VM has stopped asking.
+    always @(posedge clk_core) begin
+        if (rom_ready && bytes_to_vm > 0 && tr_events >= 0) begin
+            tr_idle = tr_idle + 1;
+            if (tr_idle == 200000) begin
+                $display("  TRACE idle for 200k cycles: rast_busy=%b (%0d) blit_busy=%b (%0d) rast_start=%b blit_start=%b page_swap=%b leds=%b",
+                         tr_rast_busy, tr_rast_high, tr_blit_busy, tr_blit_high,
+                         tr_rast_start, tr_blit_start, tr_page_swap, leds);
+                $display("  TRACE blitter: enabled=%b count=%0d prev=%0d busy=%b",
+                         u_soc.blit.in_enabled, u_soc.blit._q_count,
+                         u_soc.blit._q_prev_count, u_soc.blit._q_busy); $fflush;
+            end
+        end
+    end
+    integer tr_idle = 0;
+`endif
+
     always @(posedge clk_core) begin
         if (game_de) begin
             if (fbp < MAXPIX) begin
@@ -270,6 +430,34 @@ module tb_soc;
         served_prev = mem_data_available;
         if (game_vs) begin
             if (fbp > 0) begin
+`ifdef SOC_TRACE
+                // 'colours=1, nonblack=0' has three causes and the frame cannot tell them
+                // apart: nothing was ever drawn, something was drawn into a page that is not
+                // being displayed, or pixels exist but the palette maps them to black. These
+                // three numbers do.
+                begin : pagehunt
+                    integer i, nz1, nz2, nzpal, nz0, nz3;
+                    nz1 = 0; nz2 = 0; nzpal = 0; nz0 = 0; nz3 = 0;
+                    for (i = 0; i < 64000; i = i + 1) begin
+                        if (u_soc.page0.__mem__pixels.buffer[i] !== 4'h0) nz0 = nz0 + 1;
+                        if (u_soc.page1.__mem__pixels.buffer[i] !== 4'h0) nz1 = nz1 + 1;
+                        if (u_soc.page2.__mem__pixels.buffer[i] !== 4'h0) nz2 = nz2 + 1;
+                        if (u_soc.page3.__mem__pixels.buffer[i] !== 4'h0) nz3 = nz3 + 1;
+                    end
+                    for (i = 0; i < 32; i = i + 1)
+                        if (u_soc.__mem__palette.buffer[i] !== 16'h0) nzpal = nzpal + 1;
+                    $display("  TRACE f%0d: nz p0=%0d p1=%0d p2=%0d p3=%0d | wen p0=%0d p1=%0d p2=%0d p3=%0d | src vm=%0d rast=%0d blit=%0d memwen1=%0d wdata_or=%h | rpal_or=%h roob=%d amax=%h bdata_or=%h boob=%d | dst=%0d show1=%b pal=%0d",
+                             frames, nz0, nz1, nz2, nz3,
+                             tr_pagen_w[0], tr_pagen_w[1], tr_pagen_w[2], tr_pagen_w[3],
+                             tr_w_vm, tr_w_rast, tr_w_blit, tr_mem_wen1, tr_mem_wdata_or,
+                             tr_blitsrc_hist[5], tr_blitsrc_hist[6], tr_blitsrc_hist[7],
+                             u_soc._w_vm_blitter_dst,
+                             tr_rast_pal_or, tr_rast_oob, tr_addr_max,
+                             tr_blit_data_or, tr_blit_oob,
+                             u_soc._w_vm_blitter_dst, u_soc._w_show_page1, nzpal);
+                    $fflush;
+                end
+`endif
                 dump_frame;
                 if (nonzero == 0) black_frames = black_frames + 1;
                 frames = frames + 1;
@@ -285,8 +473,18 @@ module tb_soc;
             $fatal(1, "tb_soc: +PACK=<pack.hex> is required");
         void'($value$plusargs("PACE=%d", pace));
         void'($value$plusargs("FRAMES=%d", max_frames));
+        void'($value$plusargs("NOINPUT=%d", noinput));
         if (!$value$plusargs("FRAMEDIR=%s", framedir)) framedir = "/tmp/awframes";
 
+        // Probe sanity check. Everything the diagnosis below rests on is a hierarchical read
+        // of a memory inside the generated design; if that read is not looking at the array
+        // being written, every conclusion drawn from it is worthless. So write a sentinel and
+        // read it back before anything else happens.
+        u_soc.page1.__mem__pixels.buffer[123] = 4'hE;
+        if (u_soc.page1.__mem__pixels.buffer[123] !== 4'hE)
+            $display("tb_soc: PROBE IS BROKEN - cannot round-trip page1's pixel array");
+        else
+            $display("tb_soc: probe ok (sentinel in page1.buffer[123] reads back)");
         $readmemh(pack_hex, ref_mem);
         $display("tb_soc: pack %s, bridge pace %0d, frames %0d -> %s",
                  pack_hex, pace, max_frames, framedir); $fflush;
@@ -325,7 +523,7 @@ module tb_soc;
 
         // the screen shows the ROM's state until the pack checks out; from here the VM's
         // own video takes over, exactly as core_top muxes it
-        @(posedge clk_core); design_reset_n = 1;
+        @(posedge clk_core); design_run = 1;
         $display("tb_soc: VM reset released at t=%0t", $time); $fflush;
 
         begin : run_until_frames

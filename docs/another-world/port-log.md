@@ -542,3 +542,157 @@ there first. `scripts/worst_path.tcl` prints the paths the plain `.sta.rpt` only
 ```
 ./docker/run.sh sh -c "cd cores/aw/src/fpga && quartus_sta -t /work/scripts/worst_path.tcl"
 ```
+
+---
+
+# 2026-10-01: the design reset was backwards, and that was the whole intro
+
+The black screen had nothing to do with the ROM. `M_main.reset` is **active high** — the
+generated code says `_q_count <= (reset) ? 0 : _d_count` — and `core_top` drove it with a
+signal called `design_reset_n`, which is active **low**. So from the moment `rom_ready` went
+up, the rasterizer and the blitter were held in permanent reset, and the only reason the core
+did not look completely dead is that upstream ties the VM's own reset to constant 0
+(`uint1 vm_reset(0)`), because upstream's ROM is SPI flash and is readable from the first
+clock after configuration. A VM running against a frozen blitter stops asking for bytes at the
+first `while (rasterizer_busy | blitter_busy) { }` (`vm.si:267`, and four more copies), which
+is how "the ROM stopped answering" looked from outside.
+
+The fingerprint, from tracing the generated netlist: inside `M_blitter_M_main_blit`, `count`
+and `prev_count` sat at 0 while `busy` sat at 1 and `src_addr` (which is `_d_count`, the
+*next* value, not gated by reset) sat at 1. Reset held, combinational logic alive, one
+register with no reset term (`_q_busy <= _d_busy`) stuck set.
+
+| | before | after |
+|---|---|---|
+| bytes to the VM in 120 frames | 224 | 124,205 |
+| blitter | busy forever, never counted | completes at exactly 64,000 cycles |
+| palette | — | 30 of 32 entries loaded, RGB565 values match the pack |
+| page swap | none | 60 swaps, `show_page1` toggling |
+| screen | black | still black |
+
+**The lesson is not "check your polarity".** It is that a name ending `_n` connected to an
+active-high pin is invisible to every test that does not instantiate the design. `tb_write`
+and `tb_rom` passed throughout, honestly, because neither contains `M_main`. The bug was only
+reachable with the VM, the design reset sequencing and the video pins in one simulation —
+which is the entire justification for `scripts/sim_soc.sh`.
+
+`aw_rom`'s `vm_running` gate stays, and is now correctly understood: the VM cannot be held in
+reset by `M_main.reset` (its reset pin is wired to 0 inside the generated netlist), so
+declining its memory requests until the pack is loaded is the only way to keep it off the
+ZBT during the load. The earlier "M_main drives mem_in_ready high while in reset" note was
+this same bug seen from the other end: it was not in reset.
+
+## Tracing a generated netlist, and validating the probe first
+
+Verilator resolves hierarchical references, so a testbench can read the generated design
+directly: `_w_*` wires at `M_main` level (`_w_rast_busy`, `_w_blit_busy`, `_w_vm_blitter_src`,
+`_t__page1_wenable`), `_q_`/`_d_` registers inside submodules, and the RAM arrays themselves
+(`u_soc.page1.__mem__pixels.buffer[i]`). Before believing a single number read that way,
+**round-trip a sentinel** — `tb_soc` now writes `4'hE` into `page1.buffer[123]` at start-up and
+says so. A diagnosis built on a hierarchical read that silently reads a copy is worse than no
+diagnosis.
+
+What the probes established, in order:
+
+1. `blit_busy` rises at byte 156 and never falls; `rast_busy` never rises. (pre-fix)
+2. After the reset fix: blit completes, VM runs, palette loads, but `page0..3` contain **zero
+   non-zero pixels** after 240 frames.
+3. Not a missing write: `wen p1=1.9M, p2=2.0M` — millions of write enables reach the page
+   modules, and `in_wenable` at the memory instance itself pulses 896,014 times.
+4. `wdata_or = 0`: **every one of those writes carries the value 0.**
+
+So the write path is sound and the content is the question. `src vm=64000` is one full-screen
+write from the VM's own pixel port (a screen clear), and each blit is exactly 64,000 writes —
+copies of a page that is itself empty. The intro is clearing and copying and drawing one
+polygon in four seconds; the probe now running separates the two remaining explanations:
+the game asking for colour index 0 (nothing in the pipeline is wrong, the game is in a state
+where it has nothing to draw), or pixel addresses at or above 64,000 being dropped silently —
+`buffer` has 64,000 entries but the address is 16 bits, so an out-of-range write disappears
+without an error. `roob`/`boob`/`amax` are those counters.
+
+## My own harness was lying three times
+
+Each of these looked like a design bug first. All three were the test infrastructure.
+
+* `docker/run.sh` and `docker/run-silice.sh` forwarded no environment, so `TRACE=1` and
+  `FRAMES=8` were silently dropped: a trace run came back with no trace lines and still
+  captured forty frames. Both wrappers now forward a documented set (`TRACE FRAMES PACE JOBS
+  SIGTAP QUARTUS_ARGS`) when set.
+* `sim_soc.sh` wrote its frames into `${TMPDIR:-/tmp}`, which inside the container is the
+  container's own `/tmp` — every "go and look at a frame" instruction pointed at files that
+  vanished when the container exited. Frames now default to `build/sim/soc-frames`, which is
+  on the mount and gitignored.
+* `tb_write`'s new WAIT test reported a design failure that was its own: it read `rom_error`
+  on the same clock edge that observed `stall_wait`, and `rom_error` follows it through
+  `aw_rom`'s status block one cycle later. Eight cycles of patience, and the design is correct.
+
+## Two failure paths that had never run
+
+* **`cram0_wait`.** `aw_psram_model` declared `wait_hi` and never drove it, so the design saw
+  `x`, and `if (psram_wait)` reads `x` as false: `aw_psram`'s WAIT counter, its `stall_wait`
+  output and `aw_rom`'s `ERR_WAIT` were dead code — in the one signal whose *polarity* is an
+  assumption (the Pocket calls it `cram0_wait`, no bar, and this APF revision never uses it).
+  The model now has a `force_wait` hook and `tb_write` holds it: `stall_wait` after 65,536
+  psram cycles, `rom_error = 3`, `busy` correctly stays high instead of handing out a stale
+  byte, and the bus recovers afterwards while the error stays painted (by design: a part that
+  did this is not something to hand the game).
+* **Everything at and above 1 MB.** `op_drawString` reads the pre-rendered string table at
+  `1<<20`, and the intro draws text before anything else, yet every address `tb_rom` used sat
+  below the window start. That is exactly where the 20-bit-tag bug lived (`0x100000` aliasing
+  onto `0`), so it is now covered: index base, base+1, a 64-byte preload there, the byte
+  before it, 0x180000, and a run up to the trailer. `tb_rom`: **484 checks, 0 errors**.
+
+## Controls: believed, named, and one place to change
+
+`cont1_key`'s bit positions come from Analogue's controller-word spec, which is documented
+nowhere in this tree and could not be fetched. The code previously used upstream's *Lattice*
+button indices, which are certainly wrong for the Pocket, and no simulation could ever show it
+because `tb_soc` drives `jstick` itself and never goes through `core_top`'s packing. The five
+bits are now `` `AW_KEY_RIGHT/LEFT/DOWN/UP/B `` (12/13/14/15/0, A as a second fire at 8),
+overridable with `-D`, with the packing left alone because *that* is verified against
+`a5k.si`'s MCH2022 mapping: `[0] right [1] left [2] up [3] down [4] fire`.
+
+Symptom if the belief is wrong: the game runs, the intro plays, no button does anything, and
+these five defines are the whole fix. `tb_soc` now also drives the stick the way upstream's
+simulation does (`a5k.si:870`: up until cycle 70,217,342, then right) so that "nothing
+renders" and "nobody pressed a button" are no longer the same test. `+NOINPUT=1` pins it low.
+
+## Packaging content, and what is still believed
+
+The metadata was template stubs; it is now real, and the packager checks it.
+
+* `video.json`: **320x200**, matching `$$H_ACTIVE`/`$$V_ACTIVE`. It said 320x240, which makes
+  Analogue OS rescale pixels it was never told about.
+* `data.json`: one data slot — `{osd_origin}/{osd_filename}`, `.bin`, address `10000000`, size
+  `00200000`, loaded on launch, `savestate_supported` false (a savestate cannot capture PSRAM
+  contents in this architecture). The core only uses `bridge_addr[20:0]`, so any 2 MB-aligned
+  window address works; `size` is the whole window rather than the pack's `0x1FFFF0` so a
+  user's 2 MiB dump is not rejected.
+* `core.json`: real shortname/description/author/date. `url` points at the upstream Silice
+  design this is a port of, for attribution — point it at your own repository when there is
+  one.
+* `input.json` deliberately still declares no controllers: on the Pocket the mapping lives in
+  the platform file and a plain gamepad works from the OS defaults. Inventing a `controllers`
+  block in an unverified schema would be more likely to break input than to enable it.
+
+`make package` is fixed in two ways that both matter. Each core now packages into
+`build/sd/<core>` instead of a shared `build/sd`, and the zip is built from the manifest of
+what this core owns instead of walking the output tree — previously `author.aw-0.1.0.zip`
+contained twelve foreign files, including `Developer.CoreTemplate` *with its bitstream* and
+`Platforms/ex_platform.json*. It is now 11 files, this core only. The packager also gained the
+checks that would have flagged the stubs: a data slot list that is empty is an error in
+`--release` (`the OSD cannot offer a file, so nothing is ever loaded`), and `video.json` is
+cross-checked against the design's own `$$H_ACTIVE`/`$$V_ACTIVE`, which is the check that
+turned the resolution mismatch from a review comment into a build error.
+
+Still believed rather than verified: the data-slot field names (the Analogue developer docs
+were unreachable all port; the first hardware load is the test), and the `cont1_key` bit map
+above. Everything else in this file is backed by a simulation, a fit report, or a Quartus log.
+
+## Make targets added
+
+`make check-build`, `make worst-path`, `make sim`, `make sim-write`, `make sim-rom`,
+`make sim-soc`, `make pocket-translate`. `scripts/sim_rom.sh` had been advertising
+`make sim-rom` for weeks; it now exists. `scripts/build.sh` also gained a pre-flight check of
+every source file named in the qsf, because Quartus answers a missing generated file with
+"Can't resolve module name M_main" several minutes later, which points nowhere near the cause.
