@@ -277,6 +277,8 @@ reg design_run = 1'b0;
     integer tr_rast_oob = 0, tr_blit_oob = 0;
     reg [15:0] tr_addr_max = 0;
     integer tr_poly_wen = 0;
+    integer tr_acc = 0;
+    reg [23:0] tr_addr_lo = 24'hffffff, tr_addr_hi = 0;
     always @(posedge clk_core) begin
         if (u_soc._w_vm_pix_wenable)     tr_w_vm   = tr_w_vm   + 1;
         if (u_soc._w_rast_pix_wenable)   tr_w_rast = tr_w_rast + 1;
@@ -441,6 +443,14 @@ reg design_run = 1'b0;
         if (mem_in_ready && !served_prev) begin
             stream_base = mem_addr;           // acceptance: this is where the run starts
             served_k    = 0;
+            // What the interpreter is really doing. If the game runs its frame loop, the
+            // addresses it asks for sweep the bytecode segment and the per-frame acceptance
+            // count is roughly steady; if it is stuck on one script entry the range collapses
+            // to a handful of addresses. 'Drawing nothing' has to be separated from 'running
+            // a script that says draw nothing', and this is the cheapest way to do it.
+            tr_acc = tr_acc + 1;
+            if (mem_addr < tr_addr_lo) tr_addr_lo = mem_addr;
+            if (mem_addr > tr_addr_hi) tr_addr_hi = mem_addr;
         end
         served_prev = mem_data_available;
         if (game_vs) begin
@@ -461,13 +471,15 @@ reg design_run = 1'b0;
                     end
                     for (i = 0; i < 32; i = i + 1)
                         if (u_soc.__mem__palette.buffer[i] !== 16'h0) nzpal = nzpal + 1;
-                    $display("  TRACE f%0d: nz p0=%0d p1=%0d p2=%0d p3=%0d | wen p0=%0d p1=%0d p2=%0d p3=%0d | src vm=%0d rast=%0d blit=%0d memwen1=%0d wdata_or=%h | rpal_or=%h roob=%d amax=%h bdata_or=%h boob=%d | dst=%0d show1=%b pal=%0d",
+                    $display("  TRACE f%0d: nz p0=%0d p1=%0d p2=%0d p3=%0d | wen p0=%0d p1=%0d p2=%0d p3=%0d | src vm=%0d rast=%0d blit=%0d memwen1=%0d wdata_or=%h | rpal_or=%h roob=%d amax=%h bdata_or=%h boob=%d | dst=%0d show1=%b pal=%0d | acc=%0d range=%h..%h",
                              frames, nz0, nz1, nz2, nz3,
                              tr_pagen_w[0], tr_pagen_w[1], tr_pagen_w[2], tr_pagen_w[3],
                              tr_w_vm, tr_w_rast, tr_w_blit, tr_mem_wen1, tr_mem_wdata_or,
                              tr_rast_pal_or, tr_rast_oob, tr_addr_max,
                              tr_blit_data_or, tr_blit_oob,
-                             u_soc._w_vm_blitter_dst, u_soc._w_show_page1, nzpal);
+                             u_soc._w_vm_blitter_dst, u_soc._w_show_page1, nzpal,
+                             tr_acc, tr_addr_lo, tr_addr_hi);
+                    tr_acc = 0; tr_addr_lo = 24'hffffff; tr_addr_hi = 0;
                     $fflush;
                 end
 `endif

@@ -732,3 +732,39 @@ there within a few seconds, the difference is in `aw_pocket.si` - and the first 
 that upstream's main SoC block is `always_before` while mine is plain `always`, which in Silice
 changes the evaluation order of exactly these muxes. If it stays black there too, the question
 moves to the pack layout and the intro's own waiting conditions.
+
+## The addresses the game asks for are above the pack window, and my mask hides it
+
+Per-frame acceptance probe (25 specifiers, 25 arguments, checked): every **second** frame the
+VM performs exactly **1152** acceptances over the range **0x20009e..0x2010cd**, identical
+forever. That is a hard loop, and it is not the engine's frame housekeeping - because **no
+address construction in vm.si can produce a value ≥ 0x200000 for this image**:
+
+    mem.addr = segBytecode + threadsData.rdata      segBytecode is hard-wired 0 (vm.si:132)
+    mem.addr = (1<<20) | (stringId<<1)              ≤ 0x12FFFE
+    mem.addr = (1<<20) | (start<<8)+(start<<6)      string/pixel region
+    mem.addr = (1<<21) - 32                         the trailer, 0x1FFFE0
+
+But the observed range is exactly `(1<<21)-32` **plus the part1 segment offsets**:
+
+    0x20009e - 0x1fffe0 = 0x9e    (trailer offset word 0 = bytecode, value 0, + the read walk)
+    0x2010cd - 0x1fffe0 = 0x10ed = 4333  ≈ 4321 = part1's segCinematic
+
+So the engine is reading at `trailer_address + segment_offset` - addresses past the end of the
+2 MB window - and `aw_rom` answers them by **folding `mem_addr[20:0]`**, so `0x20009e` is served
+from pack offset `0x9e`. The bytes are real, the oracle is satisfied, and the game is reading the
+wrong place. "Byte-exact against the image" was never the same as "answers the question asked",
+and a silent fold is exactly the mechanism that makes the two look identical.
+
+This is now the prime suspect for the black screen, and it reframes it: not "nothing draws", but
+"the engine is pointed at the wrong window, and the fold makes it look plausible". Two things
+follow:
+
+1. Find out which is true - the pack's base is 0 and these are out-of-range reads that upstream
+   satisfies from a bigger/second flash region, or the pack is meant to be mapped at `1<<21` and
+   the trailer walk in vm.si starts from there. Dump `segOffsets` as the VM actually loaded them
+   and compare with the trailer bytes; the answer decides whether the fix is in the pack layout
+   or in the address map.
+2. **A fold must not be silent.** `aw_rom` should treat `mem_addr[23:21] != 0` the way it treats
+   an overflow - report it (`ERR_RANGE`) rather than alias it. This bug would have been a status
+   code on the first frame instead of four days of black-screen archaeology.
