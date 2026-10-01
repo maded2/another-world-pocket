@@ -696,3 +696,39 @@ above. Everything else in this file is backed by a simulation, a fit report, or 
 `make sim-rom` for weeks; it now exists. `scripts/build.sh` also gained a pre-flight check of
 every source file named in the qsf, because Quartus answers a missing generated file with
 "Can't resolve module name M_main" several minutes later, which points nowhere near the cause.
+
+## Frame 230: the game is in a black-screen loop, and my probe had a bug too
+
+Corrected probe (the trace line had 26 arguments against 22 format specifiers, so every field
+after `wdata_or` was reading the wrong value — including the "rasterizer emits address 0" claim
+in the section above, which was never actually measured). With the arguments fixed, at frame
+230 (~4 s of game time):
+
+```
+nz p0=0 p1=0 p2=0 p3=0 | wen p0=66297 p1=3.6M p2=3.9M p3=0
+src vm=64000 rast=2296 blit=7.5M | rpal_or=0 roob=0 amax=1d1f bdata_or=0 boob=0
+```
+
+What that says, and what it rules out:
+
+* Addresses are fine: the rasterizer's pixel addresses run up to `0x1d1f`, and nothing goes out
+  of range (`roob=boob=0`), so no write is being dropped for want of a valid address.
+* The write path is fine (established earlier): enables pulse at the memory port itself.
+* **The content is colour 0**: `rpal_or=0` and `bdata_or=0` - every pixel the rasterizer and the
+  blitter has ever emitted carries palette index 0.
+* The counters that matter are *frozen*: `vm=64000` and `rast=2296` have not moved since roughly
+  frame 1 and frame 30 respectively, while `blit` keeps growing by 64,000 every frame or two.
+  `wen p0=66297` is also frozen - page 0 was written once (a clear) and never again.
+
+So the picture is: page 0 was cleared to index 0, and every frame the game blits page 0 onto the
+displayed page. That is not a broken draw - it is a game in a black-screen state, running its
+frame loop at real 60 Hz pace (about 1,000 ROM bytes and one blit per frame, which is the main
+loop's housekeeping). The single polygon it did draw asked for `color=0`.
+
+Next experiment, and it is the one that separates "my SoC top differs" from "the data pipeline
+differs": run **upstream's own** simulation with the same pack (its README: `make simul1`, "no
+need for an actual FPGA, this will run the intro in simulation"). If the same bytes draw content
+there within a few seconds, the difference is in `aw_pocket.si` - and the first thing to test is
+that upstream's main SoC block is `always_before` while mine is plain `always`, which in Silice
+changes the evaluation order of exactly these muxes. If it stays black there too, the question
+moves to the pack layout and the intro's own waiting conditions.

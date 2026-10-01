@@ -276,6 +276,7 @@ reg design_run = 1'b0;
     reg [3:0] tr_rast_pal_or = 4'h0, tr_blit_data_or = 4'h0;
     integer tr_rast_oob = 0, tr_blit_oob = 0;
     reg [15:0] tr_addr_max = 0;
+    integer tr_poly_wen = 0;
     always @(posedge clk_core) begin
         if (u_soc._w_vm_pix_wenable)     tr_w_vm   = tr_w_vm   + 1;
         if (u_soc._w_rast_pix_wenable)   tr_w_rast = tr_w_rast + 1;
@@ -307,6 +308,7 @@ reg design_run = 1'b0;
             if (u_soc._w_rast_pix_waddr > 16'd63999) tr_rast_oob = tr_rast_oob + 1;
             if (u_soc._w_rast_pix_waddr > tr_addr_max) tr_addr_max = u_soc._w_rast_pix_waddr;
         end
+        if (u_soc.__mem__polygon.in_wenable1) tr_poly_wen = tr_poly_wen + 1;
         if (u_soc._w_blit_dst_wenable) begin
             tr_blit_data_or = tr_blit_data_or | u_soc._w_blit_dst_data;
             if (u_soc._w_blit_dst_addr > 16'd63999) tr_blit_oob = tr_blit_oob + 1;
@@ -335,9 +337,22 @@ reg design_run = 1'b0;
             tr_blit_high = 0; tr_p_blit = tr_blit_busy; tr_events = tr_events + 1;
         end else if (tr_blit_busy) tr_blit_high = tr_blit_high + 1;
 
-        if (tr_rast_start && !tr_p_rstart)
-            $display("  TRACE t=%0t RASTERIZER_START numv=%0d bbw=%0d bbh=%0d bytes=%0d",
-                     $time, tr_numv, tr_bbw, tr_bbh, bytes_to_vm);
+        if (tr_rast_start && !tr_p_rstart) begin
+            // The rasterizer traces whatever is in the polygon RAM; a degenerate draw at
+            // address 0 with colour 0 is what an EMPTY polygon RAM looks like from the pixel
+            // port, so dump the RAM and the VM's own vertex parameters at the moment it is
+            // told to start. If the RAM is zero and polygon_wenable1 never pulsed, the VM's
+            // writes are the bug and the rasterizer is innocent.
+            $display("  TRACE t=%0t RASTERIZER_START numv=%0d bbw=%0d bbh=%0d zoom=%0d color=%0d px=%0d py=%0d bytes=%0d polywen=%0d",
+                     $time, tr_numv, tr_bbw, tr_bbh,
+                     u_soc._w_vm_polygon_zoom, u_soc._w_vm_polygon_color,
+                     u_soc._w_vm_polygon_px, u_soc._w_vm_polygon_py, bytes_to_vm, tr_poly_wen);
+            $display("        polygon[0..7] = %h %h %h %h %h %h %h %h",
+                     u_soc.__mem__polygon.buffer[0], u_soc.__mem__polygon.buffer[1],
+                     u_soc.__mem__polygon.buffer[2], u_soc.__mem__polygon.buffer[3],
+                     u_soc.__mem__polygon.buffer[4], u_soc.__mem__polygon.buffer[5],
+                     u_soc.__mem__polygon.buffer[6], u_soc.__mem__polygon.buffer[7]);
+        end
         if (tr_blit_start && !tr_p_bstart)
             $display("  TRACE t=%0t BLITTER_START bytes=%0d", $time, bytes_to_vm);
         // The blitter is a counter 0..63999 gated by 'enabled' (a5k.si:122): busy can only
@@ -450,8 +465,6 @@ reg design_run = 1'b0;
                              frames, nz0, nz1, nz2, nz3,
                              tr_pagen_w[0], tr_pagen_w[1], tr_pagen_w[2], tr_pagen_w[3],
                              tr_w_vm, tr_w_rast, tr_w_blit, tr_mem_wen1, tr_mem_wdata_or,
-                             tr_blitsrc_hist[5], tr_blitsrc_hist[6], tr_blitsrc_hist[7],
-                             u_soc._w_vm_blitter_dst,
                              tr_rast_pal_or, tr_rast_oob, tr_addr_max,
                              tr_blit_data_or, tr_blit_oob,
                              u_soc._w_vm_blitter_dst, u_soc._w_show_page1, nzpal);
