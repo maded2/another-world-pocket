@@ -33,6 +33,15 @@ docker_args=(
     --label ap-tool=1
 )
 
+# Forward the knobs extract_packs.sh reads, when set. Without this an override is
+# silently ignored and the script does the default thing - which for PACKS_OUT
+# meant a re-extraction straight over the packs in the tree. Same class of bug as
+# run.sh / run-silice.sh forwarding none of TRACE/FRAMES: a wrapper that drops
+# the environment turns a mistake into surprise writes.
+for var in GAMEDATA PACKS_OUT; do
+    if [ -n "${!var:-}" ]; then docker_args+=( -e "$var" ); fi
+done
+
 if [ "$RUN_AS" != "root" ] && [ "$(id -u)" != "0" ]; then
     docker_args+=(--user "$(id -u):$(id -g)")
 fi

@@ -803,3 +803,57 @@ the boot check is already gated with `!rom_ready`, so a check in flight is not t
 The ordering lesson is the one worth keeping: fixing a handoff bug can make a system visibly
 worse, because the bug was load-bearing. `0 bytes` is a better place to be than `garbage
 bytes`, but it does not look like it from the screen.
+
+## Task 12: the packs are correct - verified against the program that makes them
+
+The oracle for the game data is `Resource::dumpDataPack()` in the vendored forked
+interpreter (`upstream/BUILD/Another-World-Bytecode-Interpreter/src/resource.cpp`), which is
+what upstream's `ROMs/%.raw` rule runs. It writes:
+
+1. the loaded RAM segments **reordered**: bytecode, cinematic, palettes, video2;
+2. zero pad to `1<<20`;
+3. `stringtable.raw` appended (so the pre-rendered strings live at >= 1 MiB);
+4. zero pad to `(2<<20) - 32`;
+5. 16 bytes of little-endian offsets: `bytecode=0`, `palettes`, `cinematic`, `video2`.
+
+That is `2 MiB - 16 = 2,097,136` bytes, which is exactly the size of our packs, and the offset
+block starts at `len - 16 = 0x1FFFFE0 = (1<<21) - 32` - exactly the address `vm.si` reads at
+boot. The whole convention is the producer's, not ours.
+
+Checks run:
+
+* **Reproducibility**: two independent extractions (one into the tree, one into
+  `build/packs-recheck` via `PACKS_OUT`) are **byte-identical to the packs already in the
+  tree, 8/8 parts**. The packs are the tool's output, unmodified.
+* **Trailer formula**: recomputed from the source and matched. `part1`: `data.si` gives
+  `segBytecode=5124, segPalettes=9445`; the trailer holds `bytecode=0, palettes=9445,
+  cinematic=4321, video2=11493`, and `9445-5124 = 4321` is `byteCode_size` in exactly the
+  position the formula says.
+
+So **the black screen is not bad packs**. This replaces my earlier praise of the pipeline,
+which rested on a self-consistency rule; now it rests on the producer's own output.
+
+### The part numbering has been off by one
+
+`extract_packs.sh` loops `for n in 0..9` and writes `part$((n+1)).bin`, so
+**`partN.bin = --extract=(N-1)`**. Upstream's rule is `ROMs/%.raw: ./raw --extract=$*`, so
+`make simul1` runs `--extract=1` = our `part2.bin`. With the README's "the famous intro
+section is the second part (the first is the protection screen)", the intro is
+**`part2.bin`**, and every simulation run so far has been the **protection screen**.
+
+### And the address map is pack-relative
+
+The trailer sits at `len - 16` and the strings at `(1<<20) | x`, i.e. both are **pack
+offsets**. The `iceprog -o 2M` / `send.py 2097152` in upstream's flow is the board's SPI
+layout, not the design's address map. So the design's window is `0x000000..0x1FFFFF`
+pack-relative; `aw_rom`'s 21-bit fold is accidentally right, and the `0x3fffe0` reading was
+the poisoned segment base, not a second region. Task 17 makes that explicit and replaces the
+silent fold with a reported error.
+
+### Harness bug fixed
+
+`docker/run-extract.sh` forwarded **no** environment, so `PACKS_OUT=...` was silently ignored
+and a re-extraction wrote straight over the packs in the tree. Harmless here (packs are
+regenerable and gitignored), but it is the same class as `run.sh` dropping `TRACE`/`FRAMES`:
+a wrapper that drops the environment turns an override into surprise writes. It now forwards
+`GAMEDATA` and `PACKS_OUT`.
