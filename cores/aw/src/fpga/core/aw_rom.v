@@ -657,7 +657,20 @@ module aw_rom (
     // busy has a combinational term in the request itself: the caller tests it one cycle
     // after raising in_ready (vm.si:58), sooner than any memory can have answered, so
     // without it readByte() would leave its wait and take a stale byte.
-    assign mem_busy = busy_q | inr[0] | inr[1] | req | chk_active;
+    //
+    // And busy has to stay HIGH while the VM is not allowed to run. vm.si opens its boot
+    // sequence with `while (mem.busy) {}` and then loads the segment table straight out of
+    // mem.data:
+    //     while (mem.busy) {}
+    //     mem.addr = (1<<21) - 32;  ...  segOffsets = {mem.data, segOffsets[8+:120]};
+    // Gating only `req` on vm_running made busy fall to 0 during the pack load, so the wait
+    // passed and the VM latched whatever happened to be on the byte bus as its four segment
+    // offsets - and then ran forever computing addresses from them. This is what the
+    // `in_ready=1 addr=3fffe0 busy=0` line in tb_soc has been reporting since the day it was
+    // added, printed and not read: a held-off slave that answers "not busy" is a slave
+    // handing out garbage. Holding the reset line does not help either - the VM's reset is
+    // wired to 0 inside the generated netlist, which is the whole reason vm_running exists.
+    assign mem_busy = busy_q | inr[0] | inr[1] | req | chk_active | ~vm_running;
 
     // ============================================================ boot check ===
     // Nothing says reliably that an upload has finished: this APF revision does have

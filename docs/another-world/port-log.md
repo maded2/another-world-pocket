@@ -768,3 +768,38 @@ follow:
 2. **A fold must not be silent.** `aw_rom` should treat `mem_addr[23:21] != 0` the way it treats
    an overflow - report it (`ERR_RANGE`) rather than alias it. This bug would have been a status
    code on the first frame instead of four days of black-screen archaeology.
+
+## A held-off slave must answer "busy" - and answering it exposed the next bug
+
+`vm.si` opens with `while (mem.busy) {}` and then loads the segment table straight off the
+byte bus:
+
+    while (mem.busy) {}
+    mem.addr = (1<<21) - 32;   ...   segOffsets = {mem.data, segOffsets[8+:120]};
+
+`aw_rom` gated only `req` on `vm_running`, so during the pack load `busy` **fell to 0**. The
+VM's wait passed and it latched whatever was on the bus as its four segment offsets, then ran
+its whole life computing addresses from them - which is where the `0x20009e..0x2010cd` loop
+and the `addr=3fffe0` readings come from: `0x3fffe0` is `(1<<21)-32` **with the garbage base
+already folded in**. `tb_soc` has printed `in_ready=1 addr=3fffe0 busy=0` since the day that
+line was added; it was the evidence, printed and not read.
+
+`mem_busy` now includes `~vm_running`. Two things came out of it:
+
+* The line changed to `in_ready=0 addr=200000 busy=1`: the VM waits, as it should, and no
+  longer poisons itself. `data_available` pulses while the VM is held off: **0**, now a
+  permanent check in tb_soc - the boot check does not leak bytes.
+* **And the core then delivers nothing at all: 0 bytes.** With `busy` correct, the very first
+  request after release is never served. So the garbage-boot was the only thing that had ever
+  made the reader serve in the assembled design, and a second bug sits behind it.
+
+That second bug is the next thing, and it is now precisely framed: with `busy` held high
+during the load and released with `vm_running`, trace the first request - does `in_ready`
+rise, is the consumer FSM still in `C_IDLE`, does `take` fire? The existing benches cannot
+see this: `tb_write` and `tb_rom` tie `vm_running` high before the pack is loaded, so the
+busy-held-during-load state has never been exercised anywhere but `tb_soc`. Note also that
+the boot check is already gated with `!rom_ready`, so a check in flight is not the cause.
+
+The ordering lesson is the one worth keeping: fixing a handoff bug can make a system visibly
+worse, because the bug was load-bearing. `0 bytes` is a better place to be than `garbage
+bytes`, but it does not look like it from the screen.

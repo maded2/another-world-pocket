@@ -236,6 +236,21 @@ reg design_run = 1'b0;
     // Is the VM asking and not being served? Distinguishes 'the ROM is not answering' from
     // 'the VM stopped asking', which is the first question a black screen poses.
     integer starving = 0;
+    // Was the VM's byte stream clean before it was allowed to run? aw_rom serves its own
+    // trailer check while vm_running is low; if any of those bytes reach mem_data_available,
+    // the VM's preload latches them and its address walk moves before the first real
+    // instruction - which is exactly how a boot sequence ends up reading from
+    // trailer_address + segment_offset, as measured. Count it, do not reason about it.
+    integer tr_da_before_run = 0, tr_acc_logged = 0;
+    always @(posedge clk_core) begin
+        if (mem_data_available && !design_run) tr_da_before_run = tr_da_before_run + 1;
+        if (design_run && mem_in_ready && !served_prev && tr_acc_logged < 12) begin
+            $display("  TRACE first acceptance %0d: addr=%h (vm_running just rose, bytes=%0d)",
+                     tr_acc_logged, mem_addr, bytes_to_vm);
+            tr_acc_logged = tr_acc_logged + 1;
+        end
+    end
+
     always @(posedge clk_core) begin
         if (mem_in_ready && !mem_data_available) starving = starving + 1;
         else if (mem_data_available) starving = 0;
@@ -564,6 +579,10 @@ reg design_run = 1'b0;
                 end
             end
         end
+
+        $display("tb_soc: data_available pulses while the VM was held off: %0d (must be 0)",
+                 tr_da_before_run);
+        if (tr_da_before_run != 0) errors = errors + 1;
 
         // A run that produced only black frames is not a pass, whatever else went right.
         if (frames < 4)
