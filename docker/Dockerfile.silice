@@ -45,8 +45,17 @@ RUN git clone --depth 1 --branch ${SILICE_REF} https://github.com/sylefeb/Silice
 # Simulators, for the design-side checks in scripts/sim_*.sh: iverilog to lint and
 # smoke-test the glue RTL quickly (Quartus takes minutes to report a typo), and
 # verilator to run the translated design against a model of the Pocket side.
+# libgl/libglu/libsdl2 are not needed to translate Silice to Verilog, but they are
+# needed to build Silice's *verilator simulator framework* (frameworks/verilator/
+# display.cpp includes GL/gl.h). Without them the upstream golden reference sim
+# cannot be built here at all - and that reference sim is how this port validates
+# behaviour instead of guessing from rendered frames. Note silice-make.py exits 0
+# even when the make it launches fails, so a missing header here looks like a
+# successful build that produces no executable.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         iverilog verilator \
+        libgl1-mesa-dev libglu1-mesa-dev libsdl2-dev libglfw3-dev \
+        xvfb x11-apps netpbm \
     && rm -rf /var/lib/apt/lists/*
 
 ENV SILICE_ROOT=/opt/Silice \

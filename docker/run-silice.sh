@@ -59,7 +59,8 @@ fi
 # with no trace and `FRAMES=8` still captured forty - the design then looks like it is
 # misbehaving when it is the wrapper ignoring the request. Anything documented by the
 # scripts under scripts/ goes through here.
-for _v in TRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS; do
+# PART/SECS/SHOTS/REF_DIR belong to scripts/ref_sim.sh (the golden reference run).
+for _v in TRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS; do
     [ -n "${!_v:-}" ] && docker_args+=(-e "$_v")
 done
 

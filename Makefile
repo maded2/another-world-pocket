@@ -158,6 +158,15 @@ sim-rom:
 sim-soc:
 	@$(SILICE) scripts/sim_soc.sh $(if $(PACK),$(PACK),)
 
+# Golden reference: the *upstream* a5k design, unmodified, simulated with one of our
+# packs. This is what tells us what a pack is supposed to look like; without it every
+# black screen is a mystery instead of an answer. PART=... SECS=... SHOTS=...
+ref-setup:
+	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh scripts/setup_ref.sh
+
+ref-sim:
+	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh scripts/ref_sim.sh
+
 sim: sim-write sim-rom
 
 # ------------------------------------------------------------------- package --

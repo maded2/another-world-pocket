@@ -857,3 +857,50 @@ and a re-extraction wrote straight over the packs in the tree. Harmless here (pa
 regenerable and gitignored), but it is the same class as `run.sh` dropping `TRACE`/`FRAMES`:
 a wrapper that drops the environment turns an override into surprise writes. It now forwards
 `GAMEDATA` and `PACKS_OUT`.
+
+## Task 13: the golden reference runs - and it says part2 is the intro
+
+`scripts/setup_ref.sh` copies the pinned design to `build/ref/` (the pinned tree stays
+untouched, `build/` is gitignored), translates `a5k.si` and builds Silice's Verilator
+simulator. `scripts/ref_sim.sh PART=<pack>` runs it with one of our packs, captures the sim's
+stdout and screenshots the VGA window, and reports colour statistics per frame. Also as
+`make ref-setup` / `make ref-sim`.
+
+    ./docker/run-silice.sh scripts/setup_ref.sh
+    PART=/work/ports/another-world/packs/part2.bin SECS=24 SHOTS=3 \
+      ./docker/run-silice.sh scripts/ref_sim.sh
+
+Same design, same build, only the pack changes:
+
+| pack | offsets the **design** reports | screen |
+|---|---|---|
+| `part1.bin` (`--extract=0`) | `0, 9445, 4321, 11493` | 0.0-0.2 % non-black, 3-4 colours |
+| `part2.bin` (`--extract=1`) | `0, 75101, 9871, 110291` | 47-61 % non-black, 20-27 colours, changing frame to frame |
+
+So **`part2.bin` is the intro and `part1.bin` is nearly black in the reference too**. Our port
+has been staring at the protection screen and calling it a rendering bug. The S1 bar is now
+`part2.bin`.
+
+Two more things the reference gave up immediately:
+
+* **The boot trace prints the segment offsets the design actually loaded.** That is the single
+  best oracle for task 15: run the same pack through both and compare the printed line before
+  anything else. `part1` matches our trailer exactly, all four words.
+* **`segVideo2` is a 17-bit field and `part2` overflows it.** Our trailer holds
+  `video2 = 241363`; the design reports `110291`, and `241363 - 65536*2 = 110291` - i.e.
+  `mod 131072`, exactly the producer's own `offs_max = 1<<17` limit, which it checks and
+  bypasses when `_segVideo2` is NULL. Task 17 should record that as an upstream limitation,
+  not a bug of ours.
+
+Harness notes found on the way:
+
+* `silice-make.py` **exits 0 even when the make it launches fails**: a missing `GL/gl.h`
+  produced `rc=0` and no executable. `setup_ref.sh` therefore tests for the binary instead of
+  trusting the status code.
+* The Silice Verilator framework needs `GL/gl.h` and `GLFW/glfw3.h`, and GLFW needs an X
+  server: the image now carries `libgl1-mesa-dev libglu1-mesa-dev libsdl2-dev libglfw3-dev`
+  and `xvfb x11-apps netpbm`, and frames are grabbed with `xwd | xwdtopnm`.
+* `xwdtopnm` emits **PAM (P7) with 16-bit samples**, not PPM. A P6-only parser produced
+  garbage statistics until fixed - a stats bug that would have made every frame look alike.
+* The sim reads `../data.raw` relative to its cwd (`verilator_data.cpp`), so the pack goes one
+  level above `obj_dir`.
