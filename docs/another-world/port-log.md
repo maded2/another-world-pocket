@@ -1063,3 +1063,18 @@ either source for intent. The follow-up task carries the exact change (base addr
 then a display override that clears `wenable`) and the verification it needs - matched-frame
 comparison against the reference, benches green - because a page-arbitration change can regress
 the render, and a regressed render plus a faithful rule is worse than faithful-and-aware.
+
+### Follow-up landed (task 21): the arbitration is now upstream's
+
+Implemented as specified and measured. Netlist shape matches (three `page1_addr` assignments with
+the display last; `page1_wenable` 0/1/0 with the display last). Effect at frame 13, same pack and
+run length: **page2 write-enable pulses 129,813 -> 65,812** - the fraction of time page2 is under
+scan - while `nz`, colour count and mean brightness are unchanged and `tb_soc` still PASSes with
+30 rich frames. So the game really was writing the page under display, and we really were
+honouring writes upstream drops. Synthesis: rc=0, min setup slack +2.537 ns, ALMs down 26 (the
+address mux is gone). Commit `04d188c`.
+
+The picture did not change in these 44 frames, which is worth saying plainly rather than as a
+disappointment: it narrows what can still differ from the reference to **frame parity** (task 20),
+and it removes a class of divergence that would otherwise have surfaced later, in content the
+intro's first second does not exercise.
