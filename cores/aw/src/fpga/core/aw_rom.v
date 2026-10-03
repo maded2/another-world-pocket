@@ -131,7 +131,21 @@ module aw_rom (
     // the first thing checked here. It holds four little-endian uint32 offsets,
     // which the VM reads one byte at a time, shifting each into the top of a 128-bit
     // word, so the first byte read ends up in [7:0].
-    localparam [23:0] TRAILER_ADDR = 24'h1fffe0;
+    // ---- address map: stated, not assumed ------------------------------------------
+    // Upstream flashes the image at 2 MB (`iceprog -o 2M ROMs/$*.raw`; send.py takes
+    // 2097152 as the offset) and the SoC presents flash-absolute addresses: the first
+    // acceptance after reset release asks for 24'h3fffe0, which is exactly
+    // TRAILER_ADDR + PACK_BASE. So mem_addr[23:21] name a 2 MB bank *of the device* and
+    // are not part of the image; the pack offset is mem_addr[20:0].
+    //
+    // There is one image, so aliasing between banks is the specified behaviour rather than
+    // a fold that happens to work. Saying so matters: nothing here used to state which
+    // bits mean what, and a plausible-looking "fix" that widened the window to 22 bits -
+    // or that reported mem_addr[23:21] != 0 as out-of-range, which is what an earlier
+    // version of this plan proposed - would move every read by 2 MB, or reject the boot
+    // read itself. tb_rom's bank-aliasing checks pin it.
+    localparam [23:0] PACK_BASE    = 24'h200000;  // where the image sits in the device
+    localparam [23:0] TRAILER_ADDR = 24'h1fffe0;  // pack offset of the 16 offset words
 
     // The VM's preload wants an unbroken run of 63 data_available cycles. 32 words
     // covers that run with a byte to spare.
@@ -496,7 +510,9 @@ module aw_rom (
     // the VM with busy held high.
     wire accept_vm = inr[0] & ~inr[1];
     wire accept    = accept_vm | chk_kick;
-    wire [20:0] acc_addr = chk_kick ? TRAILER_ADDR[20:0] : mem_addr[20:0];
+    // See the address map above: [23:21] are the device bank, [20:0] is the pack offset.
+    wire [20:0] mem_pack_addr = mem_addr[20:0];
+    wire [20:0] acc_addr = chk_kick ? TRAILER_ADDR[20:0] : mem_pack_addr;
 
     wire host_rdy = chk_active ? (chk_cnt != 5'd0) : inr[0];
 

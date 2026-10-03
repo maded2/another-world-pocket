@@ -233,6 +233,34 @@ module tb_rom;
 
     // readByte(): in_ready for one cycle, then the caller waits for busy to drop
     // and takes mem.data - so data has to still be that byte when busy falls.
+    // Same handshake as check_one, but the expected byte is taken from an explicitly named
+    // pack offset. Needed to state the address map as a test rather than as a coincidence:
+    // the image is flashed at 2 MB and the SoC asks in flash-absolute addresses, so a read
+    // at {bank, offset} has to return the byte at `offset` of the one image loaded. check_one
+    // cannot express that - it indexes ref_mem with the address it was handed.
+    task automatic check_one_at(input [23:0] a, input [20:0] ea, input string what);
+        integer guard = 0;
+        begin
+            @(negedge clk_core);
+            mem_addr     <= a;
+            mem_in_ready <= 1'b1;
+            @(negedge clk_core);
+            mem_in_ready <= 1'b0;
+            while (mem_busy && guard < 20000) begin
+                @(negedge clk_core); guard = guard + 1;
+            end
+            checks = checks + 1;
+            if (mem_busy) begin
+                errors = errors + 1;
+                $display("  STALL %s @%06h: busy never dropped", what, a);
+            end else if (mem_data !== ref_mem[ea]) begin
+                errors = errors + 1;
+                $display("  MISMATCH %s @%06h: got %02h want %02h (pack[%06h])",
+                         what, a, mem_data, ref_mem[ea], ea);
+            end
+        end
+    endtask
+
      task automatic check_one(input [23:0] a, input string what);
         integer guard = 0;
         begin
@@ -410,6 +438,17 @@ module tb_rom;
         check_one(TRAILER - 1, "readByte last pack byte");
         check_one(TRAILER    , "readByte first trailer byte");
         peek_one(24'h1fffff, "past the end of the pack");
+
+        // 3b. Bank aliasing is the specified map, not a fold that happens to work: one image,
+        // flashed at 2 MB, and the SoC's own boot read lives at 0x3fffe0 - bank bits are not
+        // hypothetical. Pinning this here is what stops a future "widening to 22 bits" or
+        // "reject addr[23:21] != 0 as out of range" change from moving every read, or from
+        // rejecting the boot read itself, with nothing failing.
+        for (i = 1; i < 8; i = i + 1) begin
+            check_one_at({i[2:0], 21'h1fffe0}, 21'h1fffe0, "bank alias trailer");
+            check_one_at({i[2:0], 21'h000100}, 21'h000100, "bank alias body");
+            check_one_at({i[2:0], 21'h100010}, 21'h100010, "bank alias strings");
+        end
 
         // ---- the region at and above 1 MB -------------------------------------------
         // op_drawString reads the pre-rendered string table at (1<<20), and the intro draws
