@@ -463,9 +463,11 @@ reg design_run = 1'b0;
             // count is roughly steady; if it is stuck on one script entry the range collapses
             // to a handful of addresses. 'Drawing nothing' has to be separated from 'running
             // a script that says draw nothing', and this is the cheapest way to do it.
+`ifdef SOC_TRACE
             tr_acc = tr_acc + 1;
             if (mem_addr < tr_addr_lo) tr_addr_lo = mem_addr;
             if (mem_addr > tr_addr_hi) tr_addr_hi = mem_addr;
+`endif
         end
         served_prev = mem_data_available;
         if (game_vs) begin
@@ -565,6 +567,22 @@ reg design_run = 1'b0;
         // own video takes over, exactly as core_top muxes it
         @(posedge clk_core); design_run = 1;
         $display("tb_soc: VM reset released at t=%0t", $time); $fflush;
+
+        // The busy terms, one at a time, right after the release. mem_busy is an OR of six
+        // things and the VM sits in `while (mem.busy) {}` until it is low, so "the VM never
+        // asks for a byte" is answered completely by naming which term is high. Guessing at
+        // this cost two wrong hypotheses; reading it costs one run.
+        begin : busy_terms
+            integer k;
+            for (k = 0; k < 3; k = k + 1) begin
+                repeat (100 + k * 1000) @(posedge clk_core);
+                $display("  tb_soc busy[%0d]: busy=%b = busy_q=%b inr=%b%b req=%b chk_active=%b chk_cnt=%0d (vm_running=%b rom_ready=%b c_state=%0d in_ready=%b)",
+                         k, u_rom.mem_busy, u_rom.busy_q, u_rom.inr[0], u_rom.inr[1],
+                         u_rom.req, u_rom.chk_active, u_rom.chk_cnt,
+                         u_rom.vm_running, u_rom.rom_ready, u_rom.c_state, mem_in_ready);
+                $fflush;
+            end
+        end
 
         begin : run_until_frames
             integer c;

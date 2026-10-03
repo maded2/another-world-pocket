@@ -54,13 +54,23 @@ DEFINES=()
 [ -n "${TRACE:-}" ] && DEFINES+=(-DSOC_TRACE)
 
 cd "$WORK"
-verilator --binary -j 4 --timing --top-module tb_soc \
+# A stale frame directory is worse than no frame directory: the run below fails, the
+# listing underneath still shows frames from an earlier run, and the transcript looks
+# like a result. Clear it, and check the build's own status (piping verilator to tail
+# made $? belong to tail, so a compile error walked straight into the run step and
+# reported 'No such file or directory' instead of the error).
+rm -rf "$FRAMEDIR"; mkdir -p "$FRAMEDIR"
+if ! verilator --binary -j 4 --timing --top-module tb_soc \
     -Wno-fatal -Wno-lint --Mdir obj \
     "${DEFINES[@]}" \
     "$CORE/aw_rom.v" "$CORE/aw_fifo.v" "$CORE/aw_psram.v" \
     "$SIM/aw_psram_model.v" \
     "$CORE/aw_pocket_build.v" "$SIM/tb_soc.sv" \
-    -o tb_soc 2>&1 | tail -25
+    -o tb_soc > build.log 2>&1; then
+    echo "error: tb_soc build failed - first errors:" >&2
+    grep -E "%Error" build.log | head -10 >&2
+    exit 1
+fi
 
 echo "=== run: load, boot, capture $FRAMES frames ==="
 ./obj/tb_soc "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" "+FRAMES=$FRAMES" \
@@ -69,6 +79,10 @@ rc=$?
 
 echo "=== frames ==="
 ls -l "$FRAMEDIR" 2>/dev/null | head -8
+if [ "$rc" -ne 0 ]; then
+    echo "run FAILED (rc=$rc) - any frames above are not from this run" >&2
+    exit "$rc"
+fi
 if [ "$rc" -eq 0 ]; then
     echo "frames are in $FRAMEDIR - look at one before believing the summary"
 fi

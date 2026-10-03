@@ -570,7 +570,16 @@ module aw_rom (
                 c_served     <= 1'b0;
                 c_state      <= C_GAP;
                 gap          <= 2'd2;
-                busy_q       <= 1'b1;
+                // busy_q is the VM-facing "a transaction is in flight" flag, so only a VM
+                // acceptance may set it. `accept` is also the boot check's own kick (accept =
+                // accept_vm | chk_kick), and setting busy_q for that left busy asserted when
+                // the check finished: the consumer parks in C_IDLE, the only clear lives on
+                // the running path (busy_q <= host_rdy), and host_rdy needs inr[0], which
+                // needs the VM to leave `while (mem.busy) {}` - which busy_q was holding it
+                // inside. Deadlock, measured: busy_q=1 chk_active=0 c_state=0 in_ready=0.
+                // It went unnoticed because the VM used to be running during the load (the
+                // garbage boot), so a real acceptance always came along to clear it.
+                busy_q       <= accept_vm;
             end else if (rewind) begin
                 c_addr       <= c_start;
                 start_addr_r <= {2'b0, c_start[20:1]};
@@ -635,6 +644,14 @@ module aw_rom (
                 // sees it fall with the byte it was waiting for
                 busy_q <= host_rdy;
             end
+
+            // busy_q means "a VM transaction is in flight", so it cannot survive the
+            // consumer parking. It used to: on the boot check's sixteenth byte, host_rdy is
+            // still (chk_cnt != 0) = 1, so busy_q latched high, and busy_q is only ever
+            // updated on `take` - with the check over and the VM held off by that same busy,
+            // no further take could arrive. The VM waits in `while (mem.busy) {}`, so the
+            // design booted nothing at all: 0 bytes, forever, at 60 Hz.
+            if ((c_state == C_IDLE) && !req) busy_q <= 1'b0;
 
             // driven from here, and only from here, along with chk_data: the check counts
             // its sixteen bytes as the consumer delivers them
