@@ -947,3 +947,45 @@ Also confirmed by measurement, for task 17: the first acceptance after release i
 the 2 MB base included - matching `iceprog -o 2M` - and `aw_rom`'s fold to `[20:0]` lands exactly
 on the trailer. The fold happens to be right; it still needs to become an explicit, reported
 address map rather than a coincidence.
+
+## The intro renders: palette bank was tied to the page select
+
+The 4-frame flicker was a porting error, found by reading upstream rather than by more
+probing. `a5k.si:793`:
+
+    palette.addr0 = {vm.pal_swap,4b000} | (vm.page_swap ? page1.rdata : page2.rdata);
+
+which **page** to read is `page_swap`; which 16-entry **palette bank** to use is `pal_swap`.
+`aw_pocket.si` used `swap_p1` for both, so the bank tracked the page - and only one bank is
+live at a time, because `vm.si:759` writes an incoming palette to `{~pal_swap,...}` (double
+buffered). Every frame displaying the other page looked up an empty palette. Fix: register
+`pal_swap_p1` alongside `swap_p1` and take the bank from it.
+
+`busy_q` needed a second, narrower fix. Clearing it when the consumer parks was wrong twice,
+and both times a bench caught it rather than reasoning: without `c_served` it cleared between
+acceptance and byte landing (`tb_rom` read `5a`, the unloaded-fill value, then drifted a byte
+per read, 22 errors); with `c_served` it never fired at all, because the check exits through
+`rewind`, which clears `c_served` on the way to `C_IDLE` (back to total deadlock, 0 bytes). The
+claim that actually needs holding is that the **check's last byte lowers busy**:
+
+    busy_q <= chk_active ? (chk_cnt != 5'd1) : host_rdy;
+
+Bench results after the change, all three green:
+
+| bench | result |
+|---|---|
+| `tb_soc` (part2 / intro) | 44 frames, **34 non-black**, 20,176 bytes to the VM -> **PASS** |
+| `tb_rom` | **484 checks, 0 errors**, 0.40 B/cycle preload |
+| `tb_write` | 0 errors, `rom_error=3` WAIT path covered |
+
+Synthesis gate after the netlist change: build rc=0, `check_build.py` rc=0, minimum setup slack
+across all reports **+2.541 ns**, hold +0.354 ns, 3,561 ALMs (19 %), 1,101,888 RAM bits (35 %),
+`make package CORE=aw` -> 11 files, this core only, 0 errors / 0 warnings.
+
+**What "renders" does not yet mean.** Our frame 40 is 7 colours dominated by greens
+(`#088221` 36 %, `#10c342` 30 %); the reference screenshots show dark blue/grey tones. That is
+*not* a colour comparison: the reference frames were grabbed at 8-24 s of wall-clock, far later
+in the intro than our 44 frames (0.7 s). The next check should be oracle-based, not visual -
+dump the 32 palette entries from the simulation and compare against the pack's palette region
+decoded from RGB565 in python, at a matched game frame - and the reference should then be run to
+the same frame count for an actual image diff.
