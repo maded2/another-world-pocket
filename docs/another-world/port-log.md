@@ -904,3 +904,46 @@ Harness notes found on the way:
   garbage statistics until fixed - a stats bug that would have made every frame look alike.
 * The sim reads `../data.raw` relative to its cwd (`verilator_data.cpp`), so the pack goes one
   level above `obj_dir`.
+
+## The VM boots and the pages fill: what the black frames turned out to be
+
+With the `busy_q` deadlock gone (previous entry), running the intro pack through our own
+testbench:
+
+```
+TRACE f6 : nz p0=59071 ... blit=251076 memwen1=128002 bdata_or=2
+TRACE f9 : nz p0=58037 p1=0 p2=58037 ... rpal_or=7 amax=f8ea bdata_or=7
+TRACE f13: nz p0=58037 p1=58037 p2=58037 ... wdata_or=7
+frame 14: 320x200 colours=7 nonblack=64000 mean=13.3/145.4/51.7
+```
+
+So: pages are written with real data, the rasterizer draws at valid addresses (`amax=f8ea`),
+the palette is live (`rpal_or=7`), and **pixels reach the screen**. The first non-black frame
+is frame 14, roughly a quarter second after boot - which is why 20-frame runs looked hopeless
+and 40-frame runs did not.
+
+What is left is not a black screen. It is an alternating one:
+
+| frames | `show1` | screen |
+|---|---|---|
+| 22-25, 30-33, 38-41 | 1 | colours=7, 64000/64000 non-black |
+| 26-29, 34-37 | 0 | colours=1, fully black |
+
+Every four frames the display select flips: three of the four frames show an empty page, one
+shows the drawn one. The same four-frame period shows `acc=0 range=ffffff..000000` on three of
+its frames - the VM makes no memory requests at all on those - which is the game's 15 fps
+pacing (60 Hz / 4) showing up as it should. So the design is drawing once per game tick and the
+**display mux is showing an empty page during the three idle frames of each tick**, instead of
+holding the frame that was just drawn.
+
+That is a much smaller claim than "black screen", and it is testable against the reference: the
+question is what `_w_show_page1` does during the idle frames in upstream's build, and which page
+module it selects there. Our probe counts `nz p0..p3` by module name, and the module name and the
+display index are not obviously the same thing - that correspondence is the first thing to
+nail down, with a sentinel, before any further reasoning about which page is blank.
+
+Also confirmed by measurement, for task 17: the first acceptance after release is
+`addr=3fffe0`, i.e. `(1<<21)-32 + 0x200000`. The SoC presents **flash-absolute** addresses with
+the 2 MB base included - matching `iceprog -o 2M` - and `aw_rom`'s fold to `[20:0]` lands exactly
+on the trailer. The fold happens to be right; it still needs to become an explicit, reported
+address map rather than a coincidence.
