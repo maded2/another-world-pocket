@@ -18,7 +18,10 @@ set -euo pipefail
 set +e   # the run reports its own status
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PACK="${1:-$ROOT/ports/another-world/packs/part1.bin}"
+# Default is part2, NOT part1. extract_packs.sh writes part$((n+1)).bin from --extract=$n,
+# and part 0 is the protection screen, which is nearly black in the *reference* simulator too.
+# Defaulting to part1 made a working design look broken; see docs/another-world/port-log.md.
+PACK="${1:-$ROOT/ports/another-world/packs/part2.bin}"
 SIM="$ROOT/cores/aw/src/sim"
 CORE="$ROOT/cores/aw/src/fpga/core"
 WORK="${TMPDIR:-/tmp}/aw-sim-soc"
@@ -72,6 +75,13 @@ if ! verilator --binary -j 4 --timing --top-module tb_soc \
     exit 1
 fi
 
+case "$PACK" in
+    *part1.bin) role="protection screen (nearly black by design)" ;;
+    *part2.bin) role="intro - the S1 target" ;;
+    *)          role="unknown part; see ports/another-world/packs/packs.txt" ;;
+esac
+echo "pack  : $PACK"
+echo "role  : $role"
 echo "=== run: load, boot, capture $FRAMES frames ==="
 ./obj/tb_soc "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" "+FRAMES=$FRAMES" \
              "+FRAMEDIR=$FRAMEDIR"

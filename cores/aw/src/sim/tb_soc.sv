@@ -200,6 +200,13 @@ reg design_run = 1'b0;
     integer   served_k = 0;
     bit       served_prev = 0;
     integer   black_frames = 0;
+    // "Not black" is not "the game is drawing". Frames 10-13 of the intro are a uniform
+    // fill: nonblack=64000 with colours=1. Counting those as success is how a design passes
+    // while showing a single flat colour, so the S1 bar is a *rich* frame: several distinct
+    // colours over a filled screen.
+    integer   rich_frames = 0;
+    integer   max_colours = 0;
+    localparam integer MIN_COLOURS = 3;
     real      sum_r, sum_g, sum_b;
     integer   nonzero;
     // The game uses at most 16 colours per palette, so the distinct-colour tally is a
@@ -228,6 +235,8 @@ reg design_run = 1'b0;
                      frames, frame_w, frame_h, nseen, nonzero,
                      sum_r / (fbp == 0 ? 1 : fbp), sum_g / (fbp == 0 ? 1 : fbp),
                      sum_b / (fbp == 0 ? 1 : fbp));
+            if (nseen >= MIN_COLOURS && nonzero > 0) rich_frames = rich_frames + 1;
+            if (nseen > max_colours) max_colours = nseen;
             $fflush;
         end
     endtask
@@ -605,14 +614,17 @@ reg design_run = 1'b0;
         // A run that produced only black frames is not a pass, whatever else went right.
         if (frames < 4)
             $display("tb_soc: FAIL - only %0d frames; the video never framed anything", frames);
+        else if (rich_frames == 0)
+            $display("tb_soc: FAIL - %0d frames, no rich frame (best %0d colours, %0d non-black, %0d bytes to the VM); a uniform fill is not a rendering",
+                     frames, max_colours, frames - black_frames, bytes_to_vm);
         else if (black_frames == frames)
             $display("tb_soc: FAIL - %0d frames, every one of them black (%0d bytes reached the VM)",
                      frames, bytes_to_vm);
         else if (errors != 0)
             $display("tb_soc: FAIL - %0d errors", errors);
         else
-            $display("tb_soc: %0d frames, %0d non-black, %0d bytes to the VM -> PASS",
-                     frames, frames - black_frames, bytes_to_vm);
+            $display("tb_soc: %0d frames, %0d non-black, %0d rich (best %0d colours), %0d bytes to the VM -> PASS",
+                     frames, frames - black_frames, rich_frames, max_colours, bytes_to_vm);
         $fflush;
         $finish;
     end
