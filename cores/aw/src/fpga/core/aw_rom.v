@@ -640,18 +640,24 @@ module aw_rom (
                     chk_data <= {c_byte, chk_data[127:8]};
                     chk_cnt  <= chk_cnt - 5'd1;
                 end
-                // busy follows the caller: a held acceptance keeps it high, a pulsed one
-                // sees it fall with the byte it was waiting for
-                busy_q <= host_rdy;
+                // busy follows the caller: a held acceptance keeps it high, a pulsed one sees
+                // it fall with the byte it was waiting for. During the boot check it follows
+                // the bytes that remain instead, because host_rdy is (chk_cnt != 0) and on the
+                // sixteenth byte that is still 1: the check latched busy_q high, busy_q is only
+                // ever updated on `take`, and with the VM held off by that same busy no further
+                // take could arrive - the VM waits in `while (mem.busy) {}`, so the design
+                // booted nothing at all: 0 bytes, forever, at 60 Hz.
+                //
+                // Clearing busy_q when the consumer parks was tried and is wrong twice over:
+                // without c_served it cleared between an acceptance and the byte landing, so
+                // tb_rom's readByte latch took the bus early (first byte 5a, the model's
+                // unloaded-fill value, then a one-byte-per-read drift, 22 errors); with
+                // c_served it never fired in the assembled design at all, because the check
+                // leaves through `rewind`, which clears c_served on the way to C_IDLE. This
+                // fixes the actual claim - the check's last byte lowers busy - and does not
+                // touch the VM's own path, where chk_active is 0 by definition.
+                busy_q <= chk_active ? (chk_cnt != 5'd1) : host_rdy;
             end
-
-            // busy_q means "a VM transaction is in flight", so it cannot survive the
-            // consumer parking. It used to: on the boot check's sixteenth byte, host_rdy is
-            // still (chk_cnt != 0) = 1, so busy_q latched high, and busy_q is only ever
-            // updated on `take` - with the check over and the VM held off by that same busy,
-            // no further take could arrive. The VM waits in `while (mem.busy) {}`, so the
-            // design booted nothing at all: 0 bytes, forever, at 60 Hz.
-            if ((c_state == C_IDLE) && !req) busy_q <= 1'b0;
 
             // driven from here, and only from here, along with chk_data: the check counts
             // its sixteen bytes as the consumer delivers them

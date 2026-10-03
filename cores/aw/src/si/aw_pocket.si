@@ -464,6 +464,7 @@ unit main(
   uint1  active_p1(0);
   uint1  active_p2(0);
   uint1  swap_p1(0);
+  uint1  pal_swap_p1(0);   // palette bank delayed into the pixel pipeline, see below
 
   // ---- rasterizer
   rasterizer rast(
@@ -515,6 +516,13 @@ unit main(
     active_p1 ::= active;
     active_p2 ::= active_p1;
     swap_p1   ::= show_page1;
+    // The palette bank is a separate signal from the page select. Upstream (a5k.si:793)
+    // writes `palette.addr0 = {vm.pal_swap,4b000} | (vm.page_swap ? page1.rdata : page2.rdata)`:
+    // which PAGE to read is page_swap, which 16-entry PALETTE BANK to use is pal_swap. Using
+    // swap_p1 for both makes the bank track the page, and only one bank is loaded (the probe
+    // reports 16 of 32 entries non-zero), so every frame that displays the other page looks up
+    // an empty palette and comes out black - the 4-frame flicker measured on the intro.
+    pal_swap_p1 ::= vm.pal_swap;
 
     video_hs = (x == 3);
     video_vs = (x == 0) & (y == 0);
@@ -600,7 +608,7 @@ unit main(
     //      selected now, or the two would disagree on the frame boundary.
     uint4  pixel = swap_p1 ? page1.rdata : page2.rdata;
 
-    palette.addr0  = {swap_p1,4b000} | pixel;
+    palette.addr0  = {pal_swap_p1,4b000} | pixel;
 
     // palette entries are RGB565, like the game's own palette data:
     //   bits 4..0 R, bits 10..5 G, bits 15..11 B
