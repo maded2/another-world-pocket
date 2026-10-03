@@ -625,6 +625,34 @@ reg design_run = 1'b0;
         else
             $display("tb_soc: %0d frames, %0d non-black, %0d rich (best %0d colours), %0d bytes to the VM -> PASS",
                      frames, frames - black_frames, rich_frames, max_colours, bytes_to_vm);
+
+        // The palette, byte-exact, as the oracle for colour. vm.si loads a palette with
+        //     mem.addr = segPalettes + (paletteId << 5);   // 32 bytes = 16 RGB565 colours
+        //     palette.addr1 = {~pal_swap,4b000} | (n>>1);  // into the bank not on screen
+        // so every entry here has to equal a 2-byte little-endian word at a known offset in
+        // the pack - a check that needs no opinion about what the intro is supposed to look
+        // like. "Pixels appear" and "the pixels are the right pixels" are different claims,
+        // and the greens on our frame 40 are only the first of those so far.
+        begin : pal_dump
+            integer pi;
+            // The segment table the VM loaded, in the same words the reference design prints
+            // as "Hello Another World (offsets: ...)". Note each field is 17 bits
+            // (_w_segPalettes is [16:0]), which is why the reference reports video2=110291 for
+            // part2 where our trailer holds 241363: 241363 mod 131072 = 110291.
+            // Probe validated against the reference: the golden sim prints
+            // "Hello Another World (offsets: 0, 75101, 9871, 110291)" for part2, so reading
+            // those four numbers back here is the sentinel - if they agree, the hierarchical
+            // path and the word order are both right.
+            $display("SEGOFFSETS %h %h %h %h  (want 0,1255d,268f,1aed3 for part2)",
+                     u_soc.vm._q_segOffsets[31:0], u_soc.vm._q_segOffsets[63:32],
+                     u_soc.vm._q_segOffsets[95:64], u_soc.vm._q_segOffsets[127:96]);
+            $write("PALETTE32");
+            for (pi = 0; pi < 32; pi = pi + 1) begin
+                if (u_soc.__mem__palette.buffer[pi] === 16'hxxxx) $write(" xxxx");
+                else $write(" %04h", u_soc.__mem__palette.buffer[pi]);
+            end
+            $display;
+        end
         $fflush;
         $finish;
     end

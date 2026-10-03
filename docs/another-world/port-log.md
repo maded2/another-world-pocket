@@ -989,3 +989,38 @@ in the intro than our 44 frames (0.7 s). The next check should be oracle-based, 
 dump the 32 palette entries from the simulation and compare against the pack's palette region
 decoded from RGB565 in python, at a matched game frame - and the reference should then be run to
 the same frame count for an actual image diff.
+
+## Task 20, part 1: the segment table is right, the palette is not verified
+
+`tb_soc` now prints both, at the end of every run:
+
+    SEGOFFSETS 00000000 0001255d 0000268f 0003aed3   (want 0,1255d,268f,1aed3 for part2)
+    PALETTE32 1101 0008 2401 3501 4602 5703 7905 ab07 800b 000f 900c a00d c00e e00f f70f fa0f
+            0000 ... (bank 1 all zero)
+
+* **The segment table matches the reference exactly.** The golden sim prints
+  `Hello Another World (offsets: 0, 75101, 9871, 110291)` for `part2`; `0x1255d = 75101`,
+  `0x268f = 9871`, and the fourth field is the known 17-bit case (`241363 mod 131072 = 110291`) -
+  our register keeps the full word, the reference's `__display` reads the 17-bit wire. That is
+  also the sentinel for the probe itself: `u_soc.vm._q_segOffsets` is only trusted because it
+  returns four numbers the reference agrees with. (`u_soc._q_segOffsets` does not exist; the VM
+  instance is `u_soc.vm`.)
+* **The palette does not match the pack, and cannot have come from it.** `vm.si` loads a palette
+  as `mem.addr = segPalettes + (paletteId<<5)`, 32 bytes = 16 little-endian RGB565 words, into
+  `{~pal_swap,...}`. The pack at `segPalettes = 75101` is **sixteen zero words**. Our palette RAM
+  is not zero: it is a smooth ramp (`2401, 3501, 4602, 5703, 7905, ab07`, steps of ~`0x1101`).
+  Reading zeros could not produce that, so the palette load is being served from *somewhere
+  other than the address it asked for*.
+
+That is the first concrete evidence against the colour path, and it is consistent with the thing
+that started this check: our frame 40 is green-dominated where the reference is dark blue/grey.
+It does not yet say *which* read is wrong - the trailer read, the bytecode sweep and 484 checks
+in `tb_rom` all pass - but it makes the next test obvious and cheap: replay the palette load
+exactly (32 sequential bytes at `segPalettes + paletteId*32`, a mid-pack address, 32 bytes long,
+spanning the preload boundary) through the ROM interface and diff against the pack. If it comes
+back as the ramp, the fault is in the reader's seek/preload path for that shape of request, not
+in the VM and not in the palette decode.
+
+Also landed while here: `tb_soc`'s S1 bar now requires a *rich* frame and defaults to the intro
+pack, both validated in each direction (`part2` PASS with 30 rich frames; `part1` FAIL "no rich
+frame" despite running 90,721 bytes). A gate that cannot fail is not a gate.
