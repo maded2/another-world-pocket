@@ -1078,3 +1078,27 @@ The picture did not change in these 44 frames, which is worth saying plainly rat
 disappointment: it narrows what can still differ from the reference to **frame parity** (task 20),
 and it removes a class of divergence that would otherwise have surfaced later, in content the
 intro's first second does not exercise.
+
+## The packaged core was shipping a stale bitstream
+
+Auditing the artifact rather than the code found it: `build/aw/bitstream.rbf_r` (the design with
+the page-arbitration fix) is 1,339,248 bytes from 21:29, while the bitstream inside
+`EddieChan.AnotherWorld-0.1.0.zip` was 1,338,484 bytes from 13:18. `make package` does not build,
+and every check in the packager validates *what* it copies - file presence, JSON magic, resolution
+against the design, this-core-only contents - never *how old it is*. So a core packaged before a
+rebuild keeps shipping the old design with a clean report, indefinitely. Re-packaged and verified:
+packed `sha256` now equals `build/aw/bitstream.rbf_r` (`3f5bf2d5…`), 11 files, 0 errors.
+
+`package_core.py` now compares the bitstream's mtime against the newest file under `src/si` and
+`src/fpga` and warns when the bitstream is older. `src/sim` is deliberately excluded: a
+testbench cannot make a bitstream stale, and a freshness check that cries wolf on every edit gets
+ignored, which is how such checks die. Verified in both directions - clean run 0 warnings; after
+touching `aw_pocket.si` the warning fires (`1 warning(s)`); mtime restored to its recorded value
+and the run is clean again.
+
+Also corrected `date_release` (2026-10-01 -> 2026-10-03): the field describes the bitstream being
+shipped, not the day the metadata was first written. `core.json` itself is otherwise sound - my
+first audit pass reported it missing its identity fields, which was my check looking for
+`core_id`/`core_name` at top level when Pocket nests them under `core.metadata` and
+`core.cores[]`. Wrong check, not wrong artifact; noted here because the two look identical from
+the output.

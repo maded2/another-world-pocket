@@ -110,6 +110,29 @@ def find_bitstream(core_dir, out_dir):
 SKIP_NAMES = {".keep", ".gitkeep", ".DS_Store"}
 
 
+def newest_design_source(core_dir):
+    """(mtime, path) of the newest file that actually feeds the bitstream.
+
+    Only src/si and src/fpga: a testbench under src/sim is not part of the build, so
+    including it would warn on edits that cannot possibly make a bitstream stale, and a
+    check that cries wolf gets ignored - which is how a freshness check dies.
+    """
+    newest = None
+    picked = None
+    base = Path(core_dir) / "src"
+    if not base.is_dir():
+        return None, None
+    for pat in ("si/*.si", "fpga/**/*.v", "fpga/**/*.sv", "fpga/**/*.qsf", "fpga/**/*.sdc"):
+        for p in base.glob(pat):
+            try:
+                m = p.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or m > newest:
+                newest, picked = m, p
+    return newest, picked
+
+
 def design_resolution(core_dir):
     """The pixel size the design itself generates, read from the Silice source
     ($$H_ACTIVE / $$V_ACTIVE). video.json is a claim about the video pins; nothing else in
@@ -326,6 +349,18 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
         report.error("no bitstream found; build it first (make build) or pass "
                      "--bitstream path/to/x.rbf[_r]")
         return 2
+
+    # Staleness. `make package` does not build, and every other check here validates *what*
+    # it copies, never *how old it is* - so packaging after an edit ships the previous
+    # bitstream with a clean report. This happened for real: a core packaged at 13:18 was
+    # still on the SD-card tree after the 21:29 rebuild that carried the page-arbitration
+    # fix, and the only reason it was noticed is that someone compared the two file sizes.
+    if bitstream is not None:
+        src_mtime, src_path = newest_design_source(core_dir)
+        if src_mtime is not None and bitstream.stat().st_mtime < src_mtime:
+            report.warn("bitstream {} is older than {} - the packed core may predate the last "
+                        "design change; rebuild (make build) before packaging"
+                        .format(bitstream, src_path))
 
     cid = core_id or derive_core_id(core_dir, cfg, report)
     dest = out_dir / "Cores" / cid
