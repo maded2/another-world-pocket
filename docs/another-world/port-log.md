@@ -990,7 +990,7 @@ dump the 32 palette entries from the simulation and compare against the pack's p
 decoded from RGB565 in python, at a matched game frame - and the reference should then be run to
 the same frame count for an actual image diff.
 
-## Task 20, part 1: the segment table is right, the palette is not verified
+## Task 20, part 1: segment table and palette both verified against the pack (and one false alarm of mine)
 
 `tb_soc` now prints both, at the end of every run:
 
@@ -1005,21 +1005,26 @@ the same frame count for an actual image diff.
   also the sentinel for the probe itself: `u_soc.vm._q_segOffsets` is only trusted because it
   returns four numbers the reference agrees with. (`u_soc._q_segOffsets` does not exist; the VM
   instance is `u_soc.vm`.)
-* **The palette does not match the pack, and cannot have come from it.** `vm.si` loads a palette
-  as `mem.addr = segPalettes + (paletteId<<5)`, 32 bytes = 16 little-endian RGB565 words, into
-  `{~pal_swap,...}`. The pack at `segPalettes = 75101` is **sixteen zero words**. Our palette RAM
-  is not zero: it is a smooth ramp (`2401, 3501, 4602, 5703, 7905, ab07`, steps of ~`0x1101`).
-  Reading zeros could not produce that, so the palette load is being served from *somewhere
-  other than the address it asked for*.
+* **The palette is byte-exact correct - and my first check about it was wrong.** I wrote the
+  entry below claiming the palette "cannot have come from the pack". It had. `vm.si` loads
+  `mem.addr = segPalettes + (paletteId[8,8]<<5)`, 32 bytes = 16 little-endian RGB565 words into
+  `{~pal_swap,...}`, and `paletteId[8,8]` is the **high byte**: the design loads a *numbered*
+  palette block, not necessarily block 0. My check compared bank 0 of the palette RAM against
+  `pack[segPalettes + 0*32]`, found 0/16, and reported a colour-path bug. The bytes were at
+  `0x1257d`, which is `segPalettes + 32` - **palette #1**, and it matches **16/16 words**.
+  Palette #0 is all zeros, which is exactly what an intro that fades up from black needs.
 
-That is the first concrete evidence against the colour path, and it is consistent with the thing
-that started this check: our frame 40 is green-dominated where the reference is dark blue/grey.
-It does not yet say *which* read is wrong - the trailer read, the bytecode sweep and 484 checks
-in `tb_rom` all pass - but it makes the next test obvious and cheap: replay the palette load
-exactly (32 sequential bytes at `segPalettes + paletteId*32`, a mid-pack address, 32 bytes long,
-spanning the preload boundary) through the ROM interface and diff against the pack. If it comes
-back as the ramp, the fault is in the reader's seek/preload path for that shape of request, not
-in the VM and not in the palette decode.
+  The forensics that settled it cost no simulation at all: take the 32 bytes of our palette RAM,
+  search for them in the pack, and read the displacement. `0x1257d - 0x1255d = 32 = one block`.
+  When a value looks impossible, find where it actually is before concluding the producer is
+  broken - the third time this effort produced a confident bug report against correct code, and
+  the second time it was my own comparison that assumed an index.
+
+So the memory path, the segment table and the palette are all verified against the pack, and the
+only thing still unverified about colour is **frame parity**: our greens come from palette #1 of
+`part2`, the reference's dark blues come from a screenshot taken seconds later in the intro. The
+remaining check is to run both to the same game tick and compare, not to compare a frame at 0.7 s
+with one at 8 s and call the difference a bug.
 
 Also landed while here: `tb_soc`'s S1 bar now requires a *rich* frame and defaults to the intro
 pack, both validated in each direction (`part2` PASS with 30 rich frames; `part1` FAIL "no rich
