@@ -577,8 +577,8 @@ unit main(
     if (vm.polygon_color[0,5] > 16) {rast.src_data = page0.rdata;} // drawLineP
 
     page0.addr = src_addr;
-    page1.addr = read_page1 ? fb_addr : src_addr;
-    page2.addr = read_page2 ? fb_addr : src_addr;
+    page1.addr = src_addr;
+    page2.addr = src_addr;
     page3.addr = src_addr;
 
     // ---- outputs ---- (only one of blitter, rasterizer, vm writes at once)
@@ -600,6 +600,29 @@ unit main(
         case 3:  {page3.wenable = 1; page3.addr = waddr; page3.wdata = wdata;}
       }
     }
+    // ---- display read, and it has to be LAST -------------------------------------------
+    // Upstream's display stage (a5k.si:782-787) is emitted after the write block in the
+    // generated chain, so for the page under scan it overrides BOTH signals: build.v assigns
+    // _t__page1_addr three times (base, waddr, display) and _t__page1_wenable 0, 1, 0. That is
+    // the designed semantic - a write aimed at the page being scanned out is DROPPED - and our
+    // port had it backwards (write last, no wenable override), so we kept writes upstream
+    // discards and steered one display pixel to the write address instead. Counting assignments
+    // in the two generated netlists is what showed it; see port-log task 16.
+    //
+    // Matching upstream exactly here, including two details that look like oversights: the gate
+    // is vm.page_swap (via show_page1) with NO `active` qualification, so writes to the
+    // displayed page are dropped during blanking too; and it is the current value, not the
+    // delayed swap_p1 used to pick rdata. read_page1/read_page2 above are now only used for
+    // that rdata-side timing... they are not: pixel selection uses swap_p1, so they stand as
+    // documentation of which page is under scan.
+    if (show_page1) {
+      page1.addr = fb_addr;
+      page1.wenable = 0;
+    } else {
+      page2.addr = fb_addr;
+      page2.wenable = 0;
+    }
+
     display_conflict = (vm.blitter_src[0,1] ^ vm.blitter_src[1,1])  // reading from page 1/2
                      & (vm.page_swap        ^ vm.blitter_src[1,1]); // from displayed page
 
