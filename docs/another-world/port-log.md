@@ -1029,3 +1029,37 @@ with one at 8 s and call the difference a bug.
 Also landed while here: `tb_soc`'s S1 bar now requires a *rich* frame and defaults to the intro
 pack, both validated in each direction (`part2` PASS with 30 rich frames; `part1` FAIL "no rich
 frame" despite running 90,721 bytes). A gate that cannot fail is not a gate.
+
+## Task 16 answered, and it was not inert: the display overrides writes, mine does not
+
+Asked whether upstream's `always_before` on its top block matters against my plain `always`.
+The cheapest honest answer was to compare the two **generated** netlists - both builds already
+exist - by counting the assignments to one shared signal, because Silice emits sequential
+assignments and *last one wins*.
+
+    upstream build.v                          mine aw_pocket_build.v
+    _t__page1_addr = rast/blit src        (1)  _t__page1_addr = read_page1 ? fb_addr : src_addr
+    _t__page1_addr = waddr        (write) (2)  _t__page1_addr = waddr          (write)
+    _t__page1_addr = display addr     (3)      (no third assignment)
+
+    _t__page1_wenable = 0   (default)
+    _t__page1_wenable = 1   (write)
+    _t__page1_wenable = 0   (display, LAST)    <-- absent in mine
+
+Upstream's display stage is emitted last, so for the page under display it overrides **both**
+the address (to the scan address) **and the write enable (to 0)**. That is the designed semantic:
+*writes aimed at the page currently being scanned out are dropped.* Mine has no such override -
+the write is emitted last, so the write wins, the address port goes to the write, and the display
+gets a wrong pixel for that cycle while the write lands.
+
+Both pages the display can show (`page1`, `page2`) receive writes in our runs - `tb_soc` measured
+`wen p1=193814`, `wen p2=129813` - so this is not a corner case on our path. It is a credible
+contributor to the remaining picture difference against the reference, and it is exactly the
+class of thing that "the design renders something, so the port is fine" hides.
+
+Note the shape of the finding: the question was "does block ordering matter", the answer is
+"ordering *is* the semantics here", and it came from diffing generated output rather than reading
+either source for intent. The follow-up task carries the exact change (base address, then write,
+then a display override that clears `wenable`) and the verification it needs - matched-frame
+comparison against the reference, benches green - because a page-arbitration change can regress
+the render, and a regressed render plus a faithful rule is worse than faithful-and-aware.
