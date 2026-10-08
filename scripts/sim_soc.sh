@@ -8,8 +8,13 @@
 #   ./docker/run-silice.sh scripts/sim_soc.sh ports/another-world/packs/part6.bin
 #   FRAMES=200 ./docker/run-silice.sh scripts/sim_soc.sh
 #
-# Frames land in ${TMPDIR:-/tmp}/awframes/frameNN.ppm - plain enough to open in anything,
-# and `python3 -c ...` or an image viewer will show what the design drew.
+# Frames land in build/sim/soc-frames/<pack>-<pid>/frameNN.ppm - plain enough to open in
+# anything, and `python3 -c ...` or an image viewer will show what the design drew. The dir is
+# per run: see the FRAMEDIR note below for why that is not cosmetic.
+#
+# Long runs: start them detached or they die with the shell that started them.
+#   DETACH=1 RUN_NAME=aw-soc FRAMES=600 ./docker/run-silice.sh scripts/sim_soc.sh
+#   docker ps; docker logs -f aw-soc
 #
 # Requires scripts/pocket_translate.sh to have produced cores/aw/src/fpga/core/
 # aw_pocket_build.v. Exit status: 0 = frames captured and no mismatch | 1 = see output |
@@ -24,12 +29,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACK="${1:-$ROOT/ports/another-world/packs/part2.bin}"
 SIM="$ROOT/cores/aw/src/sim"
 CORE="$ROOT/cores/aw/src/fpga/core"
-WORK="${TMPDIR:-/tmp}/aw-sim-soc"
 FRAMES="${FRAMES:-40}"
+# WORK is keyed by the pack. Be precise about what this fixes, because I got it wrong the first
+# time: WORK is /tmp, which is container-local, so two separate `docker run` invocations never
+# shared it. What actually collided was FRAMEDIR below, on the shared mount. WORK still matters
+# for the case that does exist - two sims in one container, e.g. `bash -c "a.sh & b.sh & wait"`
+# or an interactive shell - where a fixed dir meant one run rebuilt obj/ and overwrote pack.hex
+# underneath the other, so the first reported on bytes it never asked for. Keying by pack makes
+# different packs independent; the lock below handles the same-pack case.
+SLUG="$(basename "$PACK" .bin)"
+WORK="${WORK:-${TMPDIR:-/tmp}/aw-sim-soc-$SLUG}"
+LOCK="$WORK.lock"
 # The frames have to land somewhere the host can see. This script runs inside a container
 # whose /tmp is its own, so writing pictures there meant every "look at a frame" instruction
-# pointed at files that did not exist once the container exited.
-FRAMEDIR="${FRAMEDIR:-$ROOT/build/sim/soc-frames}"
+# pointed at files that did not exist once the container exited. Unique per run for the same
+# reason as WORK: with a fixed dir, a run that failed its build is still judged against the
+# previous run's frames sitting in it.
+FRAMEDIR="${FRAMEDIR:-$ROOT/build/sim/soc-frames/$SLUG-$$}"
 
 [ -f "$PACK" ] || { echo "error: no pack at $PACK" >&2
                     echo "       build them with: ./docker/run-extract.sh scripts/extract_packs.sh" >&2
@@ -39,6 +55,15 @@ FRAMEDIR="${FRAMEDIR:-$ROOT/build/sim/soc-frames}"
                     exit 2; }
 
 mkdir -p "$WORK" "$FRAMEDIR"
+
+# obj/tb_soc is rebuilt in place, so two runs of the same pack must not build at once: one
+# would rebuild underneath the other's running binary. Lock, and say so while waiting, because
+# a silent wait is indistinguishable from a design that has stopped producing frames.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "note: another $SLUG run holds $LOCK - waiting for it (this is not the design stalling)"
+    flock 9
+fi
 
 python3 - "$PACK" "$WORK/pack.hex" <<'PY'
 import sys

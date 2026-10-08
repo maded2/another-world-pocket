@@ -18,7 +18,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACK="${1:-$ROOT/ports/another-world/packs/part1.bin}"
 SIM="$ROOT/cores/aw/src/sim"
 CORE="$ROOT/cores/aw/src/fpga/core"
-WORK="${TMPDIR:-/tmp}/aw-sim-rom"
+# Keyed by pack (see scripts/sim_soc.sh for the reasoning): one fixed dir meant a second run
+# overwrote the first run's pack.hex while it was still reading it.
+WORK="${WORK:-${TMPDIR:-/tmp}/aw-sim-rom-$(basename "$PACK" .bin)}"
+LOCK="$WORK.lock"
 
 [ -f "$PACK" ] || { echo "error: no pack at $PACK" >&2
                     echo "       build them with: ./docker/run-extract.sh scripts/extract_packs.sh" >&2
@@ -37,11 +40,28 @@ print("wrote %s (%d bytes)" % (sys.argv[2], len(data)))
 PY
 
 cd "$WORK"
-verilator --binary -j 4 --timing --top-module tb_rom \
+
+# Lock before building: obj/tb_rom is rebuilt in place.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "note: another tb_rom run holds $LOCK - waiting for it"
+    flock 9
+fi
+
+# This used to be `verilator ... 2>&1 | tail -20`, and the script runs with `set +e`, so a
+# compile error did not stop anything: the run step went ahead and executed obj/tb_rom, which
+# was the binary from the previous run, and reported its result as if it were this one's. A
+# broken tb_rom could therefore print "505 checks / 0 errors" off a stale binary. Check the
+# build's own status and fail before anything gets to run.
+if ! verilator --binary -j 4 --timing --top-module tb_rom \
     -Wno-fatal -Wno-lint --Mdir obj ${TRACE:++define+TRACE_LEFT=16} \
     "$CORE/aw_rom.v" "$CORE/aw_fifo.v" "$CORE/aw_psram.v" \
     "$SIM/aw_psram_model.v" "$SIM/tb_rom.sv" \
-    -o tb_rom 2>&1 | tail -20
+    -o tb_rom > build.log 2>&1; then
+    echo "error: tb_rom build failed - first errors:" >&2
+    grep -E "%Error" build.log | head -10 >&2
+    exit 1
+fi
 
 echo "=== tripwire: a bridge writing every cycle must be reported, not played back ==="
 ./obj/tb_rom "+PACK=$WORK/pack.hex" +TRIPWIRE

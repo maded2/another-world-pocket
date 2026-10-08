@@ -25,7 +25,10 @@ REF="${REF_DIR:-$ROOT/build/ref/upstream/hardware}"
 PACK="${PART:-$ROOT/ports/another-world/packs/part2.bin}"
 SECS="${SECS:-90}"
 SHOTS="${SHOTS:-6}"
-OUT="${REF_OUT:-$ROOT/build/ref/run}"
+# Per-run by default: screenshots from an earlier reference run sitting in a fixed directory get
+# read as results from the run you just did, which is the exact failure mode sim_soc.sh warns
+# about. Pass REF_OUT explicitly when you want a stable path.
+OUT="${REF_OUT:-$ROOT/build/ref/run-$$}"
 DISPLAY_NUM="${DISPLAY_NUM:-97}"
 
 if [ ! -x "$REF/BUILD_verilator/obj_dir/Vtop" ]; then

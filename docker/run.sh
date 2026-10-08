@@ -16,6 +16,8 @@
 #   AP_RUN_AS      root | user             (default user)
 #   AP_EXTRA_MOUNT extra "-v src:dst" mounts, colon separated
 #   AP_DEVICE      device the doctor sanity-checks (default 5CEBA4F23C8)
+#   DETACH=1       run detached and keep the container (long builds survive the caller)
+#   RUN_NAME=name  name for the detached container (docker ps / docker logs <name>)
 #   QUARTUS_ARGS   extra args for quartus_sh --flow compile (used by build.sh)
 set -euo pipefail
 
@@ -36,8 +38,12 @@ fi
 mkdir -p "$ROOT/.home" "$ROOT/build"
 chmod 777 "$ROOT/.home" 2>/dev/null || true
 
+# DETACH=1 keeps the container instead of --rm'ing it, so a long Quartus run survives the shell
+# that started it and `docker logs <RUN_NAME>` still works afterwards. See docker/run-silice.sh.
+DETACH="${DETACH:-}"
+RUN_NAME="${RUN_NAME:-}"
+
 docker_args=(
-    --rm
     -v "$ROOT:/work"
     -w /work
     -e HOME=/work/.home
@@ -61,10 +67,16 @@ if [ "${AP_WITH_USB:-0}" = "1" ]; then
 fi
 
 # interactive only when we have a tty and were asked for a bare shell
-if [ $# -eq 0 ] && [ -t 1 ]; then
-    docker_args+=(-it)
-elif [ -t 1 ]; then
-    docker_args+=(-t)
+if [ -n "$DETACH" ]; then
+    docker_args+=(-d)
+    if [ -n "$RUN_NAME" ]; then docker_args+=(--name "$RUN_NAME"); fi
+else
+    docker_args+=(--rm)
+    if [ $# -eq 0 ] && [ -t 1 ]; then
+        docker_args+=(-it)
+    elif [ -t 1 ]; then
+        docker_args+=(-t)
+    fi
 fi
 
 # Knobs the scripts under scripts/ document, forwarded only when set: a container does

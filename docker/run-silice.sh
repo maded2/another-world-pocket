@@ -15,6 +15,8 @@
 # Recognised environment:
 #   SILICE_IMAGE   image to run   (default local/ap-silice:latest)
 #   AP_RUN_AS      root | user    (default user; root only for tool debugging)
+#   DETACH=1       run detached, and keep the container so its log survives
+#   RUN_NAME=name  name for the detached container (poll with: docker ps / docker logs name)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,8 +36,14 @@ fi
 mkdir -p "$ROOT/.home"
 chmod 777 "$ROOT/.home" 2>/dev/null || true
 
+# Long runs must outlive the call that starts them. `nohup docker run ... &` dies with the
+# invoking shell's process group - a 420-frame run vanished this way and left no log at all, so
+# there was nothing to report except an intention - and `--rm` deletes the container the moment
+# it exits, which leaves `docker logs` with nothing either. So DETACH=1 drops --rm and adds -d.
+DETACH="${DETACH:-}"
+RUN_NAME="${RUN_NAME:-}"
+
 docker_args=(
-    --rm
     -v "$ROOT:/work"
     -w /work
     -e HOME=/work/.home
@@ -48,10 +56,16 @@ if [ "$RUN_AS" != "root" ] && [ "$(id -u)" != "0" ]; then
     docker_args+=(--user "$(id -u):$(id -g)")
 fi
 
-if [ $# -eq 0 ] && [ -t 1 ]; then
-    docker_args+=(-it)
-elif [ -t 1 ]; then
-    docker_args+=(-t)
+if [ -n "$DETACH" ]; then
+    docker_args+=(-d)
+    if [ -n "$RUN_NAME" ]; then docker_args+=(--name "$RUN_NAME"); fi
+else
+    docker_args+=(--rm)
+    if [ $# -eq 0 ] && [ -t 1 ]; then
+        docker_args+=(-it)
+    elif [ -t 1 ]; then
+        docker_args+=(-t)
+    fi
 fi
 
 # Simulation knobs, forwarded only when set. A bare `docker run` does not inherit the
