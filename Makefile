@@ -158,6 +158,12 @@ sim-write:
 sim-rom:
 	@$(SILICE) scripts/sim_rom.sh $(if $(PACK),$(PACK),)
 
+# The Pocket controller word -> vm.si jstick mapping, on its own. tb_soc drives the SoC's jstick
+# port directly, so without this the whole cont1_key mapping had no coverage - which is how it
+# stayed wrong (wrong Analogue bit numbers, fire/right swapped) while every sim was green.
+sim-keys:
+	@$(SILICE) scripts/sim_keys.sh
+
 sim-soc:
 	@$(SILICE) scripts/sim_soc.sh $(if $(PACK),$(PACK),)
 
@@ -170,7 +176,7 @@ ref-setup:
 ref-sim:
 	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh scripts/ref_sim.sh
 
-sim: sim-write sim-rom
+sim: sim-write sim-keys sim-rom
 
 # ------------------------------------------------------------------- package --
 package:

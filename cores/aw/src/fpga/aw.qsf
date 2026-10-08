@@ -753,6 +753,7 @@ set_global_assignment -name SIGNALTAP_FILE core/stp1.stp
 # rejects. It goes last: it sets `default_nettype none and never restores it.
 set_global_assignment -name VERILOG_FILE core/aw_pll.v
 set_global_assignment -name VERILOG_FILE core/aw_fifo.v
+set_global_assignment -name VERILOG_FILE core/aw_keys.v
 set_global_assignment -name VERILOG_FILE core/aw_psram.v
 set_global_assignment -name VERILOG_FILE core/aw_rom.v
 set_global_assignment -name SYSTEMVERILOG_FILE core/aw_pocket_build.v

@@ -593,38 +593,21 @@ assign video_skip         = 1'b0;
 // Another World has one action verb. The analog stick is ignored on purpose, this
 // is a d-pad game and half-pressed diagonals would only make the hero wander.
 
-// Which bits of cont1_key hold the d-pad and the action button. This is the ONE place to
-// change it, and it is a define rather than literals for a reason: the bit positions come
-// from Analogue's controller-word spec, which is not documented anywhere in this tree and
-// could not be fetched while porting, so what follows is a belief - the numbering used in
-// the cores that derive from the APF template (d-pad in the high nibble, B at 0, A at 8).
-// The previous code here used upstream's Lattice button indices, which are certainly wrong
-// for the Pocket and would have made the pad dead in a way no simulation could show: tb_soc
-// drives jstick itself and never goes through this block.
-//
-// Symptom if this is wrong: the game runs, the intro plays, no button does anything. Fix by
-// changing these five numbers, not by touching the packing below (that one matches vm.si:
-// [0] right [1] left [2] up [3] down [4] fire, verified against a5k.si's MCH2022 mapping).
-`ifndef AW_KEY_RIGHT
-  `define AW_KEY_RIGHT 12
-  `define AW_KEY_LEFT  13
-  `define AW_KEY_DOWN  14
-  `define AW_KEY_UP    15
-  `define AW_KEY_B     0
-  `define AW_KEY_A     8
-`endif
+// The mapping lives in core/aw_keys.v with the bit numbers from Analogue's own bus-communication
+// docs, and it has a testbench of its own (src/sim/tb_keys.sv via scripts/sim_keys.sh). Both the
+// bit numbers here and the packing below were wrong, and nothing in the tree could see it:
+// tb_soc drives the SoC's jstick port directly, so the one untested link in the input chain was
+// precisely the link that decides whether a button does anything. See core/aw_keys.v for the
+// old values and what they actually meant.
+// Driven by aw_keys, consumed by the SoC's in_jstick below. vm.si order:
+// [0] right [1] left [2] up [3] down [4] fire [5] unused.
+wire [5:0] jstick;
 
-reg  [4:0] key_s1, key_s2, key_s3;
-always @(posedge clk_core) begin
-    key_s1 <= {cont1_key[`AW_KEY_RIGHT], cont1_key[`AW_KEY_LEFT], cont1_key[`AW_KEY_UP],
-               cont1_key[`AW_KEY_DOWN],
-               cont1_key[`AW_KEY_B] | cont1_key[`AW_KEY_A]};
-    key_s2 <= key_s1;
-    key_s3 <= key_s2;
-end
-
-wire [5:0] jstick = {1'b0, key_s3[4], key_s3[1], key_s3[2], key_s3[3], key_s3[0]};
-//                          fire     down     up      left    right
+aw_keys u_keys (
+    .clk        (clk_core),
+    .cont1_key  (cont1_key),
+    .jstick     (jstick)
+);
 
 // ---- the screen to show until a pack is loaded -------------------------------
 // The scaler needs something to lock to from the first moment, so this runs the

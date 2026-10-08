@@ -1196,3 +1196,43 @@ the protection screen is still a failure by the S1 bar, now with an exit code th
 **What a first-time user should load: `part1.bin`.** They will see the intro sequence; the pad is
 proven to reach the VM's own hero variables in simulation, but the Pocket's `cont1_key` bit numbers
 are still unverified, so a real device may need `AW_KEY_*` corrected before buttons do anything.
+
+## The controller mapping was wrong, and it was checkable the whole time
+
+`cont1_key`'s bit positions had been left as a belief because they were assumed unfetchable. They
+are on Analogue's own developer docs (Bus Communication page, fetched 2026-10-04):
+
+```
+[0] dpad_up   [1] dpad_down  [2] dpad_left   [3] dpad_right  [4] face_a  [5] face_b
+[8..13] triggers   [14] face_select   [15] face_start
+```
+
+`core_top.v` had `RIGHT=12 LEFT=13 DOWN=14 UP=15 B=0 A=8` — APF-era community numbering, which
+predates this word. Those bits are `trig_l3`, `trig_r3`, `face_select`, `face_start`, `dpad_up` and
+`trig_l1`. On a real Pocket: the **d-pad does nothing**, **START walks the hero** (read as
+`AW_KEY_UP`), SELECT reads as down, and d-pad-up fires. A second, independent bug sat in the same
+expression: the packing put RIGHT in bit 4 and FIRE in bit 0, while vm.si reads bit 4 as fire and
+bit 0 as right.
+
+Both were invisible for the entire port because `tb_soc` drives the SoC's `jstick` port directly and
+never traverses this mapping — the one untested link in the chain was exactly the link that decides
+whether a button does anything. That is the argument for the fix being structural rather than a
+two-line edit: the mapping is now its own module, `cores/aw/src/fpga/core/aw_keys.v`, with its own
+testbench, `make sim-keys` (`src/sim/tb_keys.sv`, `scripts/sim_keys.sh`).
+
+13 checks: every d-pad direction, both face buttons as fire (one action verb), combinations, all six
+held, **start/select and shoulders/sticks producing nothing**, and the 3-deep synchroniser depth
+(nothing at 2 clocks, updated at 3). Negative control: restoring the old bit numbers fails 7 of 13
+and exits non-zero. `core_top.v` elaborates against verilator afterwards; only the Altera megacells
+(`altera_pll`, `altsyncram`) stay unresolved there, which is expected.
+
+Worth naming the failure mode: the previous comment block explained at length that the numbering was
+a belief and where to change it. Being explicit about an unverified assumption is good practice, but
+it is not a substitute for checking it — the network was available, the page was linked from the
+vendored template's own README, and nobody fetched it. Two lessons: when a fact is load-bearing,
+spend one HTTP request on it; and when a piece of logic is unreachable from the testbench, the fix is
+usually to move the logic where it can be reached, not to note that it is untested.
+
+Full field-by-field status of every declaration this core makes — including which `data.json` and
+`core.json` fields are **not** defined on Analogue's pages and remain community practice — is now in
+`docs/another-world/pocket-metadata.md`.
