@@ -95,6 +95,20 @@ s = s[:m.start()] + "// (board top dropped: it maps pins of a Lattice part; the 
       "//  top level is apf_top/core_top, which instantiates M_main directly)\n" + s[m.end():]
 if 'M_main' not in s:
     sys.exit("generated file has no M_main after stripping the board top")
+# Assert what the closing summary used to only print. silice-make.py exits 0 even when the make
+# it launches fails, so the existence check above is what catches a missing file - but a
+# translation that produced a plausible-looking file while losing the framebuffers, or that left
+# a Lattice primitive behind because the board top was not really dropped, sailed through and
+# failed much later as a Quartus error about a cell that does not exist on this part, or as a
+# design with no pixels. Measured on the current netlist: 0 SB_*, 8 M_videopage definitions.
+n_pages = len(re.findall(r'(?m)^\s*module\s+M_videopage', s))
+n_sb = len(re.findall(r'\bSB_', s))
+if n_sb:
+    sys.exit("generated netlist still has {} SB_* Lattice primitives: the board top was not "
+             "dropped, and Quartus will fail on cells absent from this part".format(n_sb))
+if n_pages < 1:
+    sys.exit("generated netlist has no M_videopage module: the framebuffers are missing, so "
+             "nothing can be drawn - look at aw_pocket.si, not at Quartus")
 open(dst, 'w').write(s)
 PY
 
