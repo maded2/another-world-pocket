@@ -79,6 +79,9 @@ help:
 	@echo
 	@echo "Another World (a5k / Silice) port - see docs/another-world/"
 	@echo "  make upstream              fetch/refresh pinned upstream a5k sources"
+	@echo "  make packs                 gamedata/ -> partN.bin packs (part1 = the intro)"
+	@echo "  make sim-soc [PACK=f]      boot the design in simulation, capture frames"
+	@echo "  make ref-sim               the same pack through the golden reference sim"
 	@echo "  make silice-image          build the Silice toolchain image"
 	@echo "  make a5k-translate         .si -> build.v (input for the Quartus flow)"
 	@echo "  make silice-shell          shell in the Silice image"
@@ -255,6 +258,14 @@ pocket-translate:
 # upstream a5k at the commit pinned in $(AW)/UPSTREAM_PIN; needs network
 upstream:
 	@./$(AW)/fetch_upstream.sh
+
+# The user's own licensed gamedata/ -> ports/another-world/packs/partN.bin (gitignored, never
+# committed). N is the extractor index, so part1.bin is the intro - the same N as upstream's
+# `make simulN`. extract_packs.sh has advertised this target in its usage line since it was
+# written, but no such rule existed: following the script's own help gave
+# "make: *** No rule to make target 'packs'".
+packs:
+	@./docker/run-extract.sh scripts/extract_packs.sh
 
 # feasibility probes expect to run inside the Quartus container:
 #   make probe SCRIPT=probe/pll/run.sh

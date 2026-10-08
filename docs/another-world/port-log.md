@@ -1154,3 +1154,45 @@ Still not proven, and not provable from here: the Pocket `cont1_key` bit numbers
 in `core_top.v`. `tb_soc` drives the SoC's jstick port directly and never passes through that
 mapping, so the bit positions remain a belief - symptom if wrong is exactly "game runs, intro
 plays, no button does anything". That belongs to the metadata check and the hardware checklist.
+
+## Part numbering aligned with the game, and the `packs.txt` column that was noise
+
+`make simulN` is upstream's simulation target and its README says "use N=1 for the intro"; it runs
+`--extract=N`. Our extractor wrote `part$((N+1)).bin`, so **every part number in this repo was one
+away from upstream's and from the game's**. That single off-by-one is what made the protection
+screen the default test target and cost two wrong conclusions earlier. Files are now named by the
+extractor index:
+
+| new | old | extract | what it is |
+|---|---|---|---|
+| `part0.bin` | `part1.bin` | 0 | copy-protection screen — near-black in the reference sim too |
+| `part1.bin` | `part2.bin` | 1 | **the intro** — upstream's `make simul1`, the S1 target |
+| `part2..part7.bin` | `part3..part8.bin` | 2..7 | later parts |
+
+The rename was checked, not assumed: hashes were recorded first, and the re-extracted set is
+byte-identical to the recorded set (the producer is deterministic across runs, which is worth
+knowing about the extractor). Log entries above this line keep the old names because they are the
+record of what was run at the time; this table is the mapping.
+
+**`packs.txt`'s `segVideo2` column was garbage.** It was scraped from the extractor's `data.si`,
+and `$$segVideo2` is uninitialised there: extract 1 printed `-644595728`, `-730292240` and
+`-831914000` on three runs of identical input, while the pack trailer held `241363` every time. The
+other three columns were right, which is exactly how a broken table survives — and I had quoted the
+video2 numbers in earlier reports. All four offsets now come from the pack trailer (last 16 bytes,
+4 LE uint32s), which is what the VM reads at boot, so the table reports what the design receives.
+Regenerated, it now cross-checks against the golden reference for both parts where we have
+independent data: `part0` → `0, 9445, 4321, 11493` and `part1` → `0, 75101, 9871, 241363` (the
+reference reports 110291 for the last one, being 241363 mod 2^17 through its 17-bit field).
+
+`make packs` is also new: `extract_packs.sh` had advertised it in its own usage line since it was
+written, and no such rule existed, so following the script's help produced
+`No rule to make target 'packs'`.
+
+Verified end to end after the change: default pack is `part1.bin`, role line reads *"intro - the
+S1 target, upstream's make simul1"*, run `95 frames, 80 non-black, 76 rich -> PASS` rc=0;
+`part0.bin` gives *"no rich frame (best 1 colours, 0 non-black, 110717 bytes to the VM)"* rc=134 —
+the protection screen is still a failure by the S1 bar, now with an exit code that says so.
+
+**What a first-time user should load: `part1.bin`.** They will see the intro sequence; the pad is
+proven to reach the VM's own hero variables in simulation, but the Pocket's `cont1_key` bit numbers
+are still unverified, so a real device may need `AW_KEY_*` corrected before buttons do anything.

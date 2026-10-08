@@ -23,10 +23,11 @@ set -euo pipefail
 set +e   # the run reports its own status
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Default is part2, NOT part1. extract_packs.sh writes part$((n+1)).bin from --extract=$n,
-# and part 0 is the protection screen, which is nearly black in the *reference* simulator too.
-# Defaulting to part1 made a working design look broken; see docs/another-world/port-log.md.
-PACK="${1:-$ROOT/ports/another-world/packs/part2.bin}"
+# Default is part1.bin: the intro. The part number is the extractor index and matches upstream's
+# `make simulN` (README: "use N=1 for the intro"). part0.bin is the copy-protection screen, which
+# is nearly black in the reference simulator too - it used to be named part1.bin, and defaulting
+# to that made a working design look broken. See docs/another-world/port-log.md.
+PACK="${1:-$ROOT/ports/another-world/packs/part1.bin}"
 SIM="$ROOT/cores/aw/src/sim"
 CORE="$ROOT/cores/aw/src/fpga/core"
 FRAMES="${FRAMES:-40}"
@@ -101,8 +102,8 @@ if ! verilator --binary -j 4 --timing --top-module tb_soc \
 fi
 
 case "$PACK" in
-    *part1.bin) role="protection screen (nearly black by design)" ;;
-    *part2.bin) role="intro - the S1 target" ;;
+    *part0.bin) role="copy-protection screen (near-black by design; the reference sim is too)" ;;
+    *part1.bin) role="intro - the S1 target, upstream's make simul1" ;;
     *)          role="unknown part; see ports/another-world/packs/packs.txt" ;;
 esac
 echo "pack  : $PACK"

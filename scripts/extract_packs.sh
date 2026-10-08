@@ -6,7 +6,13 @@
 #   scripts/extract_packs.sh         # same thing, from inside the container
 #
 # Input  : gamedata/  (BANK01..BANK0D + memlist.bin from the DOS 19/3/92 release)
-# Output : ports/another-world/packs/partN.bin   N = 1..10, 2 MiB each
+# Output : ports/another-world/packs/partN.bin   N = 0..9, 2 MiB each
+#          The number is the extractor index, which is also upstream's part number:
+#          upstream's `make simulN` runs `--extract=N` and its README says N=1 is the intro, so
+#          part1.bin is the intro here too. It used to be part$((N+1)).bin, and that off-by-one
+#          cost this project two wrong conclusions (a "working design looks broken" run on the
+#          protection screen, and a default that pointed at it). part0.bin is the copy-protection
+#          screen, near-black in the reference simulator as well.
 #          ports/another-world/packs/packs.txt   sizes + segment offsets
 #          ports/another-world/packs/parts.env   shell vars used by the build
 #
@@ -87,12 +93,18 @@ mkdir -p "$OUT"
     echo "# part  file          bytes     segBytecode  segPalettes  segCinematic  segVideo2  status"
     printf '# %-5s %-14s %-9s %-11s %-11s %-12s %-10s %s\n' \
         part file bytes bytecode palettes cinematic video2 status
+    echo "# offsets are read back from each pack's trailer (last 16 bytes, 4 LE uint32s), which is"
+    echo "# what the VM reads at boot. N = the extractor index = upstream's part number: part1.bin"
+    echo "# is the intro (upstream 'make simul1'); part0.bin is the copy-protection screen."
 } >> "$OUT/packs.txt"
 
 ok=0
 fail=0
 for n in 0 1 2 3 4 5 6 7 8 9; do
-    part=$((n + 1))
+    # N is the extract index verbatim: part1.bin == --extract=1 == upstream's `make simul1` == the
+    # intro. The old part$((n+1)) naming made every part number in this repo differ by one from
+    # upstream's, which is how the protection screen ended up being the default test target.
+    part=$n
     run="$AW/upstream/BUILD/run$n"
     rm -rf "$run"; mkdir -p "$run"
     status=ok
@@ -106,12 +118,20 @@ for n in 0 1 2 3 4 5 6 7 8 9; do
     if [ "$status" = ok ]; then
         cp "$run/data.raw" "$OUT/part$part.bin"
         size=$(wc -c < "$OUT/part$part.bin")
-        # data.si holds the in-RAM segment starts; the pack trailer holds the
-        # same four values as stored in the file.
-        bc=$(sed -n 's/^\$\$segBytecode = //p' "$run/data.si" 2>/dev/null || echo 0)
-        pa=$(sed -n 's/^\$\$segPalettes = //p' "$run/data.si" 2>/dev/null || echo 0)
-        ci=$(sed -n 's/^\$\$segCinematic = //p' "$run/data.si" 2>/dev/null || echo 0)
-        v2=$(sed -n 's/^\$\$segVideo2 = //p' "$run/data.si" 2>/dev/null || echo 0)
+        # Segment offsets come from the pack trailer: the same 16 little-endian uint32s at len-16
+        # that the VM reads at boot, so the table reports what the design actually receives.
+        # They used to be scraped from the extractor's data.si, and that is not trustworthy:
+        # $$segVideo2 is uninitialised there. Extract 1 printed -644595728, -730292240 and
+        # -831914000 on three runs of identical input, while the trailer has held 241363 every
+        # time (and the golden reference sim agrees, modulo its 17-bit field). The other three
+        # fields matched, which is why nobody noticed: 3 of 4 columns right is how a broken
+        # table survives.
+        read -r bc pa ci v2 <<< "$(python3 - "$OUT/part$part.bin" <<'PY'
+import struct, sys
+d = open(sys.argv[1], 'rb').read()
+print(*struct.unpack('<4I', d[-16:]))
+PY
+)"
         # useful bytes: the pack is zero-padded, so the last non-zero byte
         # before the trailer is the real end of content (data + stringtable)
         body=$(python3 - "$OUT/part$part.bin" <<'PY'
@@ -141,4 +161,7 @@ done
 cp "$OUT/packs.txt" /dev/stdout 2>/dev/null || cat "$OUT/packs.txt"
 echo
 echo "packs : $OUT  ($ok ok, $fail not available)"
-echo "size  : $(du -sh "$OUT" | cut -f1) total, $(wc -c < "$OUT/part1.bin" 2>/dev/null || echo 0) bytes each"
+first="$(ls "$OUT"/part*.bin 2>/dev/null | head -1)"
+echo "size  : $(du -sh "$OUT" | cut -f1) total, $(wc -c < "${first:-/dev/null}" 2>/dev/null || echo 0) bytes each"
+echo "load  : part1.bin for the intro (same N as upstream's 'make simulN'); part0.bin is the"
+echo "        copy-protection screen and is near-black in the reference simulator too"
