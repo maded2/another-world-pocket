@@ -511,8 +511,7 @@ reg design_run = 1'b0;
 `endif
                 dump_frame;
                 if (nonzero == 0) black_frames = black_frames + 1;
-                last_frame_t = $time;   // feeds the stall watchdog
-                frames = frames + 1;
+                frames = frames + 1;   // the watchdog watches this counter, not a copy of it
             end
             fbp = 0; frame_w = 0; frame_h = 0;
             sum_r = 0.0; sum_g = 0.0; sum_b = 0.0; nonzero = 0; nseen = 0;
@@ -665,28 +664,33 @@ reg design_run = 1'b0;
     // for a STALL instead: one frame is 16.7 ms of sim time, so 15 frames of silence is a
     // hang and nothing legitimate. Boot is allowed longer than a frame because the pack load
     // and the boot check run before the first vsync.
-    localparam integer FRAME_CYCLES = 825 * 500;                     // ~16.7 ms at 24.75 MHz
-    localparam integer STALL_FRAMES = 60;                             // 1 s of silence = hung
-    // The TB's time unit is picoseconds, not ns - $time here runs 1000x faster than an ns
-    // reading, which is what made the first version of this trip on a healthy design.
-    localparam real    STALL_UNITS  = FRAME_CYCLES * STALL_FRAMES * 40.32;
-    real last_frame_t = 0.0;
+    // Counts clk_core cycles since the frame counter last moved, and compares the frame counter
+    // itself - not $time. Two reasons, both learned the hard way:
+    //   (1) the timescale here is 1ns but $time reports picoseconds, so a budget written in ns
+    //       is silently 1000x out; and
+    //   (2) the previous version kept its own last_frame_t, updated from the capture loop, and
+    //       that update did not take effect - the watchdog then measured 61 frames from boot on
+    //       a design that was still rendering frames, and killed it. Any watchdog that shadows
+    //       the observable with its own copy of it can drift from the thing it watches, so it
+    //       now watches `frames`, which is exactly what this testbench prints.
+    localparam integer FRAME_CYCLES = 825 * 500;    // one frame of clk_core (24.75 MHz)
+    localparam integer STALL_FRAMES = 60;           // 1 s of silence = hung, nothing legit
+    localparam integer STALL_CYCLES = FRAME_CYCLES * STALL_FRAMES;
 
-    initial begin
-        // Arm only once at least one frame exists; before that, a separate generous budget
-        // covers the bridge load (2 MB at pace 10 is a few seconds of sim time).
-        wait (frames > 0);
-        last_frame_t = $time;
-        forever begin
-            // Sample much finer than the budget. The first version sampled every budget/8,
-            // which is ~18 frames, against a 15-frame budget: it saw 18 frames of ordinary
-            // frame-to-frame time and declared the design hung at frame 17. A watchdog that
-            // cannot tell a stall from normal progress is worse than none, because the first
-            // thing it teaches is to distrust watchdogs.
-            #(STALL_UNITS / 64.0);
-            if (($time - last_frame_t) > STALL_UNITS) begin
-                $display("tb_soc: HUNG - no frame for %0t at frame %0d (stall budget %0t)",
-                         $time - last_frame_t, frames, STALL_UNITS);
+    integer wd_frames_seen = 0;
+    integer wd_stall       = 0;
+    reg     wd_armed       = 1'b0;
+
+    always @(posedge clk_core) begin
+        if (frames != wd_frames_seen) begin
+            wd_frames_seen = frames;
+            wd_stall       = 0;
+            wd_armed       = 1'b1;   // boot (2 MB over the bridge) must not count as a stall
+        end else if (wd_armed) begin
+            wd_stall = wd_stall + 1;
+            if (wd_stall > STALL_CYCLES) begin
+                $display("tb_soc: HUNG - frame counter stuck at %0d for %0d cycles (%0d frames)",
+                         frames, wd_stall, STALL_FRAMES);
                 $fflush;
                 $fatal(1, "tb_soc: design stopped producing frames");
             end
