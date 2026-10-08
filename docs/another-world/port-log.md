@@ -1236,3 +1236,29 @@ usually to move the logic where it can be reached, not to note that it is untest
 Full field-by-field status of every declaration this core makes — including which `data.json` and
 `core.json` fields are **not** defined on Analogue's pages and remain community practice — is now in
 `docs/another-world/pocket-metadata.md`.
+
+## Bring-up kit written (so the hardware session has a sequence, not vibes)
+
+`docs/another-world/hardware-bringup.md` + `scripts/hw-bringup.sh` (a worksheet, `--save` to write it
+to `build/`). No device was involved; this exists so the first one gets used properly.
+
+The useful content came from what the core already reports rather than from invention: before
+`rom_ready` the placeholder screen distinguishes black-no-sync, a white blink (alive, waiting for a
+pack), **red** `ERR_TRAILER` (the offsets at `len-16` are not a pack), **purple** `ERR_OVERFLOW`
+(the bridge outran the chip) and **amber** `ERR_WAIT` (the chip never accepted anything). That
+legend plus the step order is what makes a blank screen answerable, and it also separates loader
+starvation from a VM hang: still on the placeholder means the pack never verified; a held game frame
+means it did and the VM stopped after that.
+
+Eight steps, each stating what to do, what should be seen, what it proves and what failure implies.
+Two are load-bearing for decisions already made:
+
+- **timing the `part1.bin` load** (file confirm → first picture) is the effective data-slot rate
+  that task #18 (direct random access) was explicitly gated on. The kit asks for seconds so that
+  gate can actually be evaluated instead of argued.
+- **START must not move the hero.** That is the hardware half of `25fd5ee`; simulation verified our
+  mapping against the documented word, and this checks the word itself.
+
+Also records that `part0.bin` being near-black is by design (the reference sim is equally dark), so
+nobody opens a bug for it at 1am, and asks for five specific answers to report back: load seconds,
+failure colour, input table outcome, soak result, whether parts 2 and 5 run on the same bitstream.
