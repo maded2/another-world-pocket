@@ -1262,3 +1262,53 @@ Two are load-bearing for decisions already made:
 Also records that `part0.bin` being near-black is by design (the reference sim is equally dark), so
 nobody opens a bug for it at 1am, and asks for five specific answers to report back: load seconds,
 failure colour, input table outcome, soak result, whether parts 2 and 5 run on the same bitstream.
+
+## Gate re-run 2026-10-08 (post controller fix) — all commands, all results
+
+Rebuilt from the current tree rather than trusting the previous build, then every bench, then
+packaged. Recorded with commands so it is reproducible, and the numbers compared against the last
+gate rather than eyeballed.
+
+| step | command | result |
+|---|---|---|
+| synthesis | `DETACH=1 RUN_NAME=aw-build ./docker/run.sh scripts/build.sh cores/aw --no-sigtap` | rc=0, `Full Compilation was successful` |
+| timing | from that build | worst setup **+2.610 ns** (was +2.537), hold +0.120, pulse width +1.443 |
+| utilisation | from that build | **3,523 ALMs / 18,480 (19 %)** — was 3,535, so `aw_keys` cost −12; 1,101,888 RAM bits (35 %) unchanged |
+| report check | `./docker/run.sh python3 scripts/check_build.py --core-dir cores/aw --expect-clock 24.75,24.75,49.5` | rc=0, three PLL outputs as expected, no dead logic |
+| write path | `scripts/sim_write.sh` | `rom_error=3 rom_ready=1, 0 errors -> PASS` |
+| controller map | `scripts/sim_keys.sh` | **13 checks, 0 errors -> PASS** |
+| ROM path | `scripts/sim_rom.sh` | tripwire fired **PASS**; **505 checks, 0 errors -> PASS** |
+| SoC, intro | `scripts/sim_soc.sh` (`part1.bin`) | `95 frames, 80 non-black, 76 rich (best 10 colours), 45396 bytes to the VM -> PASS` rc=0 |
+| SoC, protection | `scripts/sim_soc.sh ports/another-world/packs/part0.bin` | `FAIL - no rich frame (best 1 colours, 0 non-black, 110717 bytes to the VM)` rc=134 |
+| package | `make package CORE=aw` | 11 files, 0 errors, **no staleness warning**, packed `sha256` == `build/aw/bitstream.rbf_r` (`0dfcd087…`) |
+
+Two of those rows are negative controls, and they are the reason the rest means anything: `part0.bin`
+**must** fail the rich-frame bar (it is the copy-protection screen, near-black in the reference too),
+and `tb_keys` was checked against a mutant before being believed. The `rc=134` on part0 is new
+behaviour and the point of the exit-status fix — a failing run can no longer be read as a green one.
+
+`date_release` refreshed to 2026-10-08 to match the bitstream actually shipped, not the day the
+metadata was first typed.
+
+## Decision: one bitstream, part selection is data
+
+Upstream compiles a design per game part with the section offsets compiled in, and its `variants`
+machinery reflects that. **We ship one bitstream and treat the part as data**: `variants.json` has an
+empty `variant_list`, and the part comes entirely from the pack's own trailer — the four little-endian
+uint32s at `len−16` that the VM reads at boot — which is why no per-part rebuild is needed.
+
+Supporting evidence, as opposed to argument: the same netlist boots `part0` and `part1` and behaves
+differently in exactly the way the data says it should (part1 renders richly, part0 stays dark as the
+reference does); `SEGOFFSETS` read back from the design equal the trailer/reference for both; packs
+reproduce byte-identically across extractions; and `sim_soc` runs any part given as a path with no
+rebuild. Cost is one 2 MB slot and a boot-time trailer read; benefit is one core folder, one
+bitstream to test, and progress being a file swap rather than a re-flash.
+
+The one part of this that remains reasoning rather than measurement is the device side, and the
+bring-up kit makes it a single step: **load part1, then part2, then part5 without re-flashing**
+(step 7 of `docs/another-world/hardware-bringup.md`).
+
+Still open after this gate, stated plainly: everything above is simulation and a Quartus compile —
+**no Pocket has run this core yet** — frame-level parity against the reference at a matched game tick
+(task #20) has not been done, and the effective data-slot rate on device (task #18's gate) is still
+unmeasured.
