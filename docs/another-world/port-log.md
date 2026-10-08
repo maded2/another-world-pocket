@@ -1102,3 +1102,55 @@ first audit pass reported it missing its identity fields, which was my check loo
 `core_id`/`core_name` at top level when Pocket nests them under `core.metadata` and
 `core.cores[]`. Wrong check, not wrong artifact; noted here because the two look identical from
 the output.
+
+## Input path: proven from pin to game variable - and it exposed a hole bigger than the test
+
+Nothing asserted anything about input until now. `tb_soc` drives `up`, then `right`, because the
+opening scene waits for the player, but no test checked the VM noticed: "a button was pressed" and
+"the game responded" are different claims, and for an action game only the second one matters. My
+earlier note that the testbench "never drives jstick" was itself wrong - the signal is `js`, not
+`jstick`, and a grep for the latter missed it.
+
+The test asserts at two levels. Hard: `u_soc.vm.in_jstick` must equal what the tb drives, covering
+the SoC port, the `jstick_delay` register and the wire into the VM. Softer but more meaningful:
+`vm.si`'s per-frame input block writes the pad into the game's own variable RAM - `vmVars` at
+0xE5 up/down, 0xFC left/right, 0xFD mask, 0xFA action, 0xFE action|0x80 - and `vm.h` in the
+reference interpreter agrees with `vm.si` on every address. If those track the pad then the whole
+path is proven, in the game's terms rather than mine. Result: **7/7 patterns** (none, right, left,
+up, down, fire, right+fire).
+
+Two things that looked like design bugs and were mine:
+
+1. `m = {12b0, jstick[2], jstick[3], jstick[1], jstick[0]}` puts **UP in bit 3 and DOWN in bit 2**
+   - swapped relative to the `lr`/`ud` decode three lines above it, which uses `jstick[2]` for up.
+   I expected the sensible thing and got `mask=8` for up.
+2. `jstick[4]` (fire) is **not in `m` at all**. Fire is OR-ed in as `0x80` *after* `HERO_POS_MASK`
+   has been written, so 0xFD never shows fire; only `HERO_ACTION` (1) and `HERO_ACTION_POS_MASK`
+   (`m|0x80`) do. Expected `0x10`, saw `0x00`.
+
+Both are upstream's code, and reproducing them bit-for-bit is the requirement. This is the third
+time in this port that "the design is wrong" turned out to be "my expectation was reasoned rather
+than copied"; the fix in every case was to read the reference.
+
+The first version of the test sampled the variables **once** at the end of the window and reported
+that `right` and `up` did nothing while `left` worked. Both readings were true: the VM's input
+block runs periodically (matched after ~702k cycles, ~1.7 frames), so a single-instant check passes
+or fails on where the sample lands. Each pattern is now held for 8 frames while the variables are
+watched every cycle for the first match - which asserts only what is guaranteed, and reports the
+cadence for free.
+
+### A FAIL verdict did not reach the process
+
+To prove the test can fail, I injected a fault: the VM instance's `.in_jstick(_q_jstick_delay)`
+tied to `6'b000000` in the generated netlist. The test behaved correctly - every non-zero pattern
+failed, `tb_soc: FAIL - 12 errors` - but **the run exited 0**. `tb_soc` printed a verdict and
+`scripts/sim_soc.sh` checks only `rc`, so a design failing every one of these checks was a green
+build. The verdict is now a `s1_pass` flag and a failure calls `$fatal`, which exits non-zero.
+
+Verified both directions: clean run `95 frames, 80 non-black, 76 rich -> PASS`, rc=0; faulted run
+`FAIL - 12 errors`, rc=134; netlist restored by checksum afterwards.
+
+Still not proven, and not provable from here: the Pocket `cont1_key` bit numbers behind `AW_KEY_*`
+in `core_top.v`. `tb_soc` drives the SoC's jstick port directly and never passes through that
+mapping, so the bit positions remain a belief - symptom if wrong is exactly "game runs, intro
+plays, no button does anything". That belongs to the metadata check and the hardware checklist.

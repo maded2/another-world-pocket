@@ -124,13 +124,94 @@ reg design_run = 1'b0;
     reg [5:0] js = 6'b000000;
     integer noinput = 0;
     longint cyc_run = 0;
+    // The input-path test (in_case below) takes the pad over by asserting js_force_en. It has to
+    // go through this same process: a second process writing js would race with this one, and
+    // the loser would be whichever the scheduler liked less that cycle.
+    reg       js_force_en = 1'b0;
+    reg [5:0] js_force    = 6'b000000;
     always @(posedge clk_core) begin
         if (design_run) cyc_run = cyc_run + 1;
-        if (!noinput && design_run)
+        if (js_force_en)            js = js_force;
+        else if (!noinput && design_run)
             js = (cyc_run < 70_217_342) ? 6'b000100 : 6'b000001;  // up, then right
         else if (design_run)
             js = 6'b000000;
     end
+
+    // ---- input path (task #22) -------------------------------------------------------------
+    // Nothing asserted anything about input before this. The run drives up-then-right because the
+    // opening scene waits for the player, but no test ever checked the VM noticed, which is the
+    // difference between "a button was pressed" and "the game responded". Two levels:
+    //   hard:  u_soc.vm.in_jstick must equal what the tb drives - covers the SoC port, the
+    //          jstick_delay register and the wire into the VM.
+    //   soft:  print the game's own pad variables in vmVars (0xE5 up/down, 0xFC left/right,
+    //          0xFD mask, 0xFA action, 0xFE action|0x80; vm.h and vm.si agree on those
+    //          addresses). vm.si's per-frame input block writes them, so if the intro never runs
+    //          that block they will not move - print first, assert later, because asserting values
+    //          I have not measured is how you end up with a test that fails for the wrong reason.
+    // Still unreachable from here: the Pocket cont1_key bit numbers (AW_KEY_* in core_top.v). The
+    // tb drives the SoC's jstick port directly and never goes through that mapping, so the bit
+    // positions stay a belief until checked against the spec and a real pad.
+    integer in_checks    = 0;
+    integer in_acted     = 0;
+    // The first version sampled the pad variables once, at the end of the window, and reported
+    // that 'right' and 'up' did nothing while 'left' worked. Both readings were true: vm.si's
+    // input block runs periodically, so a single-instant check passes or fails depending on where
+    // in the cadence the sample landed. A test that depends on where a sample lands is not a test,
+    // so each pattern is now held and the variables are watched every cycle for the first moment
+    // they match. That asserts the thing that is actually guaranteed - hold a direction long
+    // enough and the game's own variables will reflect it - and it reports the cadence for free.
+    localparam integer IN_WINDOW_FRAMES = 8;
+    task automatic in_case(input string label, input [5:0] pat,
+                           input logic signed [15:0] want_lr, input logic signed [15:0] want_ud,
+                           input logic signed [15:0] want_mask,
+                           input logic signed [15:0] want_act,
+                           input logic signed [15:0] want_amask);
+        integer g;
+        bit     seen_pad;
+        bit     acted;
+        integer acted_at;
+        js_force    = pat;
+        js_force_en = 1'b1;
+        seen_pad = 0; acted = 0; acted_at = -1;
+        for (g = 0; g < IN_WINDOW_FRAMES * FRAME_CYCLES; g = g + 1) begin
+            @(posedge clk_core);
+            if (u_soc.vm.in_jstick === pat) seen_pad = 1;
+            else if (u_soc.vm.in_jstick !== pat && !seen_pad) begin
+                // report once per case, not once per cycle
+                if (acted_at == -1 && g > 16) begin
+                    $display("  input %-8s FAIL: VM sees %b, expected %b",
+                             label, u_soc.vm.in_jstick, pat);
+                    errors = errors + 1;
+                    acted_at = -2;   // suppress repeats; acted stays 0
+                end
+            end
+            if (!acted &&
+                u_soc.vm.__mem__vmVars.buffer[8'hFC] === want_lr   &&
+                u_soc.vm.__mem__vmVars.buffer[8'hE5] === want_ud   &&
+                u_soc.vm.__mem__vmVars.buffer[8'hFD] === want_mask &&
+                u_soc.vm.__mem__vmVars.buffer[8'hFA] === want_act  &&
+                u_soc.vm.__mem__vmVars.buffer[8'hFE] === want_amask) begin
+                acted = 1; acted_at = g;
+            end
+        end
+        in_checks = in_checks + 1;
+        if (acted) begin
+            in_acted = in_acted + 1;
+            $display("  input %-8s pad=%b -> VM lr=%0d ud=%0d mask=%h act=%h  ok (after %0d cycles, %0d frames)",
+                     label, pat, want_lr, want_ud, want_mask, want_act, acted_at,
+                     acted_at / FRAME_CYCLES);
+        end else begin
+            $display("  input %-8s pad=%b -> no match in %0d frames (saw lr=%0d ud=%0d mask=%h act=%h; want lr=%0d ud=%0d mask=%h act=%h)",
+                     label, pat, IN_WINDOW_FRAMES,
+                     u_soc.vm.__mem__vmVars.buffer[8'hFC],
+                     u_soc.vm.__mem__vmVars.buffer[8'hE5],
+                     u_soc.vm.__mem__vmVars.buffer[8'hFD],
+                     u_soc.vm.__mem__vmVars.buffer[8'hFA],
+                     want_lr, want_ud, want_mask, want_act);
+            errors = errors + 1;
+        end
+    endtask
 
     M_main u_soc (
         .in_mem_data          (mem_data),
@@ -167,6 +248,7 @@ reg design_run = 1'b0;
     integer   pace = 10;
     integer   max_frames = 40;
     integer   errors = 0;
+    reg       s1_pass = 1'b0;   // decides the process exit status, not just the printed verdict
 
     task automatic wr32(input [31:0] a, input [31:0] d);
         begin
@@ -607,24 +689,60 @@ reg design_run = 1'b0;
             end
         end
 
+        // ---- input path: drive the pad and check the VM sees it (task #22)
+        if (rom_ready) begin
+            $display("=== input path (VM pad variables; vm.h and vm.si agree on the addresses) ===");
+            // Expectations from vm.si's input block, and there are two traps in it that a
+            // 'sensible' expectation walks straight into. Both were mine, and the design was right
+            // both times - which is why these numbers are copied out of the source rather than
+            // reasoned about:
+            //   1. m = {12b0, jstick[2], jstick[3], jstick[1], jstick[0]} puts UP in bit 3 and
+            //      DOWN in bit 2 - swapped relative to the lr/ud decode just above it, which uses
+            //      jstick[2] for up and jstick[3] for down. So HERO_POS_MASK's up/down bits are
+            //      the opposite way round from everything else.
+            //   2. jstick[4] (fire) is not in m at all. Fire is OR-ed in as 0x80 *after*
+            //      HERO_POS_MASK has been written, so POS_MASK never shows fire; only
+            //      HERO_ACTION (1) and HERO_ACTION_POS_MASK (m|0x80) do.
+            //      lr/ud are +-1 signed.
+            in_case("none",    6'b000000, 16'sd0,  16'sd0,  16'h0000, 16'h0, 16'h0000);
+            in_case("right",   6'b000001, 16'sd1,  16'sd0,  16'h0001, 16'h0, 16'h0001);
+            in_case("left",    6'b000010, -16'sd1, 16'sd0,  16'h0002, 16'h0, 16'h0002);
+            in_case("up",      6'b000100, 16'sd0,  -16'sd1, 16'h0008, 16'h0, 16'h0008);
+            in_case("down",    6'b001000, 16'sd0,  16'sd1,  16'h0004, 16'h0, 16'h0004);
+            in_case("fire",    6'b010000, 16'sd0,  16'sd0,  16'h0000, 16'h1, 16'h0080);
+            in_case("rt+fire", 6'b010001, 16'sd1,  16'sd0,  16'h0001, 16'h1, 16'h0081);
+            js_force_en = 1'b0;
+            $display("  %0d patterns driven, the game's own pad variables reflected %0d of them",
+                     in_checks, in_acted);
+        end
+
         $display("tb_soc: data_available pulses while the VM was held off: %0d (must be 0)",
                  tr_da_before_run);
         if (tr_da_before_run != 0) errors = errors + 1;
 
         // A run that produced only black frames is not a pass, whatever else went right.
-        if (frames < 4)
+        // s1_pass is what decides the process exit status (see the end of this initial block):
+        // until now the verdict was print-only, so a failing design still exited 0 and
+        // `make sim-soc` reported success. Proven by fault injection, see the commit note.
+        if (frames < 4) begin
             $display("tb_soc: FAIL - only %0d frames; the video never framed anything", frames);
-        else if (rich_frames == 0)
+            s1_pass = 0;
+        end else if (rich_frames == 0) begin
             $display("tb_soc: FAIL - %0d frames, no rich frame (best %0d colours, %0d non-black, %0d bytes to the VM); a uniform fill is not a rendering",
                      frames, max_colours, frames - black_frames, bytes_to_vm);
-        else if (black_frames == frames)
+            s1_pass = 0;
+        end else if (black_frames == frames) begin
             $display("tb_soc: FAIL - %0d frames, every one of them black (%0d bytes reached the VM)",
                      frames, bytes_to_vm);
-        else if (errors != 0)
+            s1_pass = 0;
+        end else if (errors != 0) begin
             $display("tb_soc: FAIL - %0d errors", errors);
-        else
+            s1_pass = 0;
+        end else begin
             $display("tb_soc: %0d frames, %0d non-black, %0d rich (best %0d colours), %0d bytes to the VM -> PASS",
                      frames, frames - black_frames, rich_frames, max_colours, bytes_to_vm);
+            s1_pass = 1;
+        end
 
         // The palette, byte-exact, as the oracle for colour. vm.si loads a palette with
         //     mem.addr = segPalettes + (paletteId << 5);   // 32 bytes = 16 RGB565 colours
@@ -652,6 +770,13 @@ reg design_run = 1'b0;
                 else $write(" %04h", u_soc.__mem__palette.buffer[pi]);
             end
             $display;
+        end
+        // The verdict must reach the process, or every wrapper above this is reporting on text it
+        // did not read. Fault injection (VM jstick tied to 0) printed 'tb_soc: FAIL - 12 errors'
+        // and exited 0; scripts/sim_soc.sh checks only rc, so a broken design was a green build.
+        if (!s1_pass) begin
+            $fflush;
+            $fatal(1, "tb_soc: FAIL (see the checks above)");
         end
         $fflush;
         $finish;
