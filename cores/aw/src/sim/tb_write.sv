@@ -20,7 +20,7 @@ module tb_write;
     localparam integer NBYTES = 256;
 
     reg clk_core = 0, clk_psram = 0, clk_bridge = 0;
-    real T_CORE = 1000.0/24.75, T_PSRAM = 1000.0/49.5, T_BRIDGE = 1000.0/74.25;
+    real T_CORE = 1000.0/24.75, T_PSRAM = 1000.0/92.8125, T_BRIDGE = 1000.0/74.25;
     always #(T_CORE/2)   clk_core   = ~clk_core;
     always #(T_PSRAM/2)  clk_psram  = ~clk_psram;
     always #(T_BRIDGE/2) clk_bridge = ~clk_bridge;
@@ -60,7 +60,8 @@ module tb_write;
     );
 
     aw_psram_model u_mem (
-        .clk(cram0_clk), .a(cram0_a), .dq(cram0_dq),
+        .clk(clk_psram), .a(cram0_a), .dq(cram0_dq),   // the chip's CLK pin is held low by
+                                                       // the controller; this is time, not it
         .adv_n(cram0_adv_n), .cre(cram0_cre),
         .ce0_n(cram0_ce0_n), .ce1_n(cram0_ce1_n),
         .oe_n(cram0_oe_n), .we_n(cram0_we_n),
@@ -212,58 +213,27 @@ module tb_write;
                                           248+j, sbuf[j], j < 8 ? want[248+j] : 8'h5a);
             end
 
-        // ---- cram0_wait has to be survivable, and has to be reported ----------------
-        // Until this line nothing in the tree had ever asserted that pin: the model declared
-        // wait_hi and never drove it, the design saw x, and `if (psram_wait)` reads x as
-        // false. So both the counter in aw_psram and the ERR_WAIT report in aw_rom were
-        // dead code in an assumed-polarity signal - see aw_psram_model.v.
-        $display("tb_write: forcing cram0_wait high, expecting ERR_WAIT rather than a hang");
+        // ---- cram0_wait held high must not stop a single access --------------------
+        // On the fitted part this pin idles high and is not a handshake - its known-good
+        // neighbours never read it - yet two hardware runs painted amber because the
+        // controller treated it as one (2026-10-10 counting idle time, 2026-10-11 counting
+        // access cycles). The requirement that must stay tested: with the pin held high for
+        // the whole section, a write must land and a read must come back. A controller that
+        // stalls on WAIT fails here as a hang (rd_stream times out) or a lost write
+        // (mismatch), not as a silent pass.
+        $display("tb_write: holding cram0_wait high; writes and reads must still complete");
         u_mem.force_wait = 1'b1;
-        begin : waitstall
-            integer g2; g2 = 0;
-            while (!u_rom.u_psram.stall_wait && g2 < 300000) begin
-                @(posedge clk_core); g2 = g2 + 1;
-            end
-            if (!u_rom.u_psram.stall_wait) begin
-                errors = errors + 1;
-                $display("  WAIT never escalated: stall_wait stayed low after %0d cycles", g2);
-            end else begin
-                // rom_error follows stall_wait through aw_rom's status block, so it is one
-                // clock behind the observation that woke this loop up. Polling it on the same
-                // edge reported 0 and the test blamed the design; that was the test.
-                repeat (8) @(posedge clk_core);
-                $display("  stall_wait after %0d cycles, rom_error=%0d (want 3 = ERR_WAIT)",
-                         g2, rom_error);
-                if (rom_error != 2'd3) begin
-                    errors = errors + 1;
-                    $display("  rom_error is %0d, want 3", rom_error);
-                end
-            end
-            // A held chip must not hand out a byte. Busy staying up is the correct answer;
-            // dropping it would let the VM run on the previous byte and draw something
-            // plausible-looking but wrong, which is worse than a freeze.
-            @(negedge clk_core); mem_addr <= 24'h0; mem_in_ready <= 1;
-            @(negedge clk_core); mem_in_ready <= 0;
-            repeat (60) @(posedge clk_core);
-            if (!mem_busy) begin
-                errors = errors + 1;
-                $display("  busy fell while the chip was still being held");
-            end
+        wr32(32'h10000200, {8'h7d, 8'h3c, 8'h9b, 8'h5a});   // a word outside the main pattern
+        rd_stream(24'h200, 4, sbuf);
+        if (sbuf[0] !== 8'h5a || sbuf[1] !== 8'h9b || sbuf[2] !== 8'h3c || sbuf[3] !== 8'h7d) begin
+            errors = errors + 1;
+            $display("  with WAIT held: read back %02h%02h%02h%02h want 5a9b3c7d - access did not complete",
+                     sbuf[3], sbuf[2], sbuf[1], sbuf[0]);
+        end else begin
+            $display("  write landed and read back with WAIT held high, as it must");
         end
         u_mem.force_wait = 1'b0;
-        repeat (300) @(posedge clk_core);
-        // ERR_WAIT outlives rom_ready by design - a part that did this is not something to
-        // hand the game - so what is checked here is that the bus came back, not that the
-        // error cleared.
-        rd1(24'h0, got);
-        if (got !== want[0]) begin
-            errors = errors + 1;
-            $display("  after releasing WAIT, byte 0 reads %02h want %02h: bus did not recover",
-                     got, want[0]);
-        end else begin
-            $display("  bus recovered after WAIT; rom_error left at %0d (ERR_WAIT is sticky)",
-                     rom_error);
-        end
+        repeat (30) @(posedge clk_core);
 
         $display("tb_write: rom_error=%0d rom_ready=%b, %0d errors -> %s",
                  rom_error, rom_ready, errors, (errors == 0) ? "PASS" : "FAIL");
