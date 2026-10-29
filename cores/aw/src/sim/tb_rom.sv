@@ -29,7 +29,7 @@ module tb_rom;
     reg clk_bridge = 1'b0;
 
     real T_CORE = 1000.0/24.75;      // 40.404 ns
-    real T_PSRAM = 1000.0/49.5;      // 20.202 ns
+    real T_PSRAM = 1000.0/92.8125;   // 10.77 ns PSRAM sequence clock (PLL outclk2)
     real T_BRIDGE = 1000.0/74.25;    // 13.468 ns
 
     always #(T_CORE/2)  clk_core   = ~clk_core;
@@ -70,6 +70,11 @@ module tb_rom;
     wire        cram0_clk, cram0_adv_n, cram0_cre, cram0_ce0_n, cram0_ce1_n;
     wire        cram0_oe_n, cram0_we_n, cram0_ub_n, cram0_lb_n;
     wire        cram0_wait;   // driven by the model
+    wire [15:0] rom_selftest_die0;
+    wire [15:0] rom_selftest_be;
+    wire [15:0] rom_selftest_ceneg;
+    wire [15:0] rom_selftest_cre;
+    wire [15:0] rom_selftest_pack0;
 
     aw_rom dut (
         .clk_core(clk_core), .rst_core(rst_core),
@@ -86,11 +91,17 @@ module tb_rom;
         .cram0_clk(cram0_clk), .cram0_adv_n(cram0_adv_n), .cram0_cre(cram0_cre),
         .cram0_ce0_n(cram0_ce0_n), .cram0_ce1_n(cram0_ce1_n),
         .cram0_oe_n(cram0_oe_n), .cram0_we_n(cram0_we_n),
-        .cram0_ub_n(cram0_ub_n), .cram0_lb_n(cram0_lb_n)
+        .cram0_ub_n(cram0_ub_n), .cram0_lb_n(cram0_lb_n),
+        .rom_selftest_die0(rom_selftest_die0),
+        .rom_selftest_be(rom_selftest_be),
+        .rom_selftest_ceneg(rom_selftest_ceneg),
+        .rom_selftest_cre(rom_selftest_cre),
+        .rom_selftest_pack0(rom_selftest_pack0)
     );
 
     aw_psram_model psram0 (
-        .clk(cram0_clk), .a(cram0_a), .dq(cram0_dq),
+        .clk(clk_psram), .a(cram0_a), .dq(cram0_dq),   // the chip's CLK pin is held low by
+                                                      // the controller; this is time, not it
         .adv_n(cram0_adv_n), .cre(cram0_cre),
         .ce0_n(cram0_ce0_n), .ce1_n(cram0_ce1_n),
         .oe_n(cram0_oe_n), .we_n(cram0_we_n),
@@ -477,6 +488,64 @@ module tb_rom;
         $display("tb_rom: one byte per acceptance = %0d design cycles", cycles);
         measure_stream(24'h008000, 64, rate);
         $display("tb_rom: preload throughput = %.2f bytes per design cycle", rate);
+
+        // 6. the PSRAM self-test must actually round-trip its pattern: A5A5 written to a
+        //    die-1 scratch word and read back through the controller. Build 1030a proved
+        //    that this register can sit at its reset value (0000) forever while looking
+        //    healthy - nothing else observes it, so it is checked here.
+        begin : st_wait
+            integer sg = 0;
+            // All five probes must land: the four scratch round-trips (normal op, the
+            // byte-lane mask, and each remaining control-signal variant - the model now
+            // honours the real part's quirks, including UB#/LB# as output enables and a
+            // tAA measured pin-to-pin, so a controller that shortcuts any of them fails
+            // here instead of on hardware) and the pack word 0 readback, which only
+            // matches the file if the UPLOAD actually committed to PSRAM.
+            while (((rom_selftest_die0  !== 16'hA5A5) ||
+                    (rom_selftest_be    !== 16'hA55A) ||
+                    (rom_selftest_ceneg !== 16'hA5A5) ||
+                    (rom_selftest_cre   !== 16'hA5A5) ||
+                    (rom_selftest_pack0 !== {ref_mem[1], ref_mem[0]})) && sg < 400000) begin
+                @(posedge clk_core); sg = sg + 1;
+            end
+            checks = checks + 5;
+            if (rom_selftest_die0 !== 16'hA5A5) begin
+                errors = errors + 1;
+                $display("  FAIL: self-test normal-op readback = %04h after %0d cycles (want a5a5)",
+                         rom_selftest_die0, sg);
+            end else
+                $display("  ok   self-test normal-op round-trip = a5a5 (after %0d cycles)", sg);
+            // Probe B is the byte-lane probe: probe A put A5A5 in the scratch word,
+            // probe B then writes 5A5A with ONLY the low byte enabled, so A55A is the
+            // one readback that proves the mask masked (high byte survived, low byte
+            // changed) - the loader depends on that for every straddling entry, and a
+            // whole-word round-trip cannot see either failure.
+            if (rom_selftest_be !== 16'hA55A) begin
+                errors = errors + 1;
+                $display("  FAIL: self-test byte-lane readback = %04h after %0d cycles (want a55a)",
+                         rom_selftest_be, sg);
+            end else
+                $display("  ok   self-test byte-lane/mask round-trip = a55a (after %0d cycles)", sg);
+            if (rom_selftest_ceneg !== 16'hA5A5) begin
+                errors = errors + 1;
+                $display("  FAIL: self-test CE-inverted readback = %04h after %0d cycles (want a5a5)",
+                         rom_selftest_ceneg, sg);
+            end else
+                $display("  ok   self-test CE-inverted round-trip = a5a5 (after %0d cycles)", sg);
+            if (rom_selftest_cre !== 16'hA5A5) begin
+                errors = errors + 1;
+                $display("  FAIL: self-test CRE-high readback = %04h after %0d cycles (want a5a5)",
+                         rom_selftest_cre, sg);
+            end else
+                $display("  ok   self-test CRE-high round-trip = a5a5 (after %0d cycles)", sg);
+            if (rom_selftest_pack0 !== {ref_mem[1], ref_mem[0]}) begin
+                errors = errors + 1;
+                $display("  FAIL: pack word 0 readback = %04h after %0d cycles (want %04h)",
+                         rom_selftest_pack0, sg, {ref_mem[1], ref_mem[0]});
+            end else
+                $display("  ok   pack word 0 readback = %04h matches the file (after %0d cycles)",
+                         rom_selftest_pack0, sg);
+        end
 
         $display("");
         $display("tb_rom: %0d checks, %0d errors -> %s",

@@ -106,6 +106,41 @@ module aw_rom (
     output reg  [1:0]  rom_error,            // 0 none, 1 bad trailer, 2 overflow, 3 partial
     output wire        rom_loading,
 
+    // ---- debug ----
+    // The sixteen bytes the last trailer check read back, byte 0 first. core_top
+    // renders these on the red screen: a constant pattern (all FF, all 5A...) says
+    // the chip is not responding at all, changing garbage says marginal timing,
+    // plausible-but-wrong offsets say address corruption.
+    output wire [127:0] rom_chk_data,
+
+    // The rest of that photo. The red screen says "the trailer readback is wrong"
+    // without saying whether the bytes ever got here; these split it into three
+    // different bugs - no writes on the bridge at all, writes rejected by the
+    // window filter, or writes accepted but never latched by the chip.
+    output wire [31:0] rom_dbg_wr_match,   // host writes with addr[31:21]==0x080
+    output wire [31:0] rom_dbg_wr_all,     // every bridge write seen
+    output wire [15:0] rom_dbg_status,     // {overflow, allc_seen, last_match[23:10]}
+
+    // PSRAM self-test readbacks (see the selftest block), reported as
+    // "D<d> B<b> N<n> R<r> P<p>" on the CHK line. Expected on a living chip:
+    //   D : a5a5 - scratch round-trip, normal operation (byte enables asserted on the
+    //       read as well as the write, which is what the part needs to drive DQ at all)
+    //   B : a55a - the SAME word written again with only the LOW byte enabled, so a
+    //       high byte that survived plus a low byte that changed proves both lanes and
+    //       the write mask; a whole-word round-trip cannot tell you either of those
+    //   N : a5a5 - the OTHER physical die (normal "die 0" accesses assert CE1#)
+    //   R : a5a5 - CRE high instead of low
+    //   P : pack word 0 as read back through the chip - written by the UPLOAD, never
+    //       by us; 0004 for part1.bin means the upload reached PSRAM
+    // Every field that instead reads back the address of its own access means the part
+    // still is not driving DQ; a5a5 everywhere with a red screen means the read path is
+    // fine and the problem is above the chip.
+    output reg  [15:0] rom_selftest_die0,
+    output reg  [15:0] rom_selftest_be,
+    output reg  [15:0] rom_selftest_ceneg,
+    output reg  [15:0] rom_selftest_cre,
+    output reg  [15:0] rom_selftest_pack0,
+
     // ---- the chip ----
     output wire [5:0]  cram0_a,
     inout  wire [15:0] cram0_dq,
@@ -124,7 +159,9 @@ module aw_rom (
     localparam [1:0] ERR_NONE     = 2'd0;
     localparam [1:0] ERR_TRAILER  = 2'd1;
     localparam [1:0] ERR_OVERFLOW = 2'd2;
-    localparam [1:0] ERR_WAIT     = 2'd3;   // the chip has not accepted anything
+    localparam [1:0] ERR_WAIT     = 2'd3;   // no longer reachable: WAIT is not a
+                                           // functional pin on the fitted part -
+                                           // see aw_psram's header
 
     // The pack is 2 MB minus a 16-byte trailer, and that trailer sits at
     // (1<<21)-32 = 0x1FFFE0: it is the first thing vm.si ever reads (vm.si:366) and
@@ -209,12 +246,23 @@ module aw_rom (
     reg ld_overflow_b, ld_trailer_b, ld_quiet_b;
     reg [19:0] quiet_cnt_b;
 
+    // Debug counters. clk_bridge is clk_74a and dataslot_allcomplete comes from
+    // core_bridge_cmd on that same clock, so nothing here crosses a domain.
+    reg [31:0]  dbg_wr_match;
+    reg [31:0]  dbg_wr_all;
+    reg [23:10] dbg_last_match;
+    reg         dbg_allc_seen;
+
     always @(posedge clk_bridge) begin
         if (rst_bridge) begin
             ld_overflow_b <= 1'b0;
             ld_trailer_b  <= 1'b0;
             ld_quiet_b    <= 1'b0;
             quiet_cnt_b   <= 20'd0;
+            dbg_wr_match  <= 32'd0;
+            dbg_wr_all    <= 32'd0;
+            dbg_last_match<= 14'd0;
+            dbg_allc_seen <= 1'b0;
         end else begin
             // A full FIFO in the middle of a transfer is normal. A FIFO that stays
             // full while the host keeps writing means the drain cannot keep up, and
@@ -228,17 +276,30 @@ module aw_rom (
                 if (bridge_addr[20:5] >= 16'hFFFF) ld_trailer_b <= 1'b1;
                 quiet_cnt_b <= 20'd0;
                 ld_quiet_b  <= 1'b0;
+
+                dbg_wr_all <= dbg_wr_all + 32'd1;
+                if (bridge_addr[31:21] == 11'h080) begin
+                    dbg_wr_match   <= dbg_wr_match + 32'd1;
+                    dbg_last_match <= bridge_addr[23:10];
+                end
             end else if (quiet_cnt_b >= 20'd742500) begin      // ~10 ms at 74.25 MHz
                 ld_quiet_b <= 1'b1;
             end else begin
                 quiet_cnt_b <= quiet_cnt_b + 20'd1;
             end
+            if (dataslot_allcomplete) dbg_allc_seen <= 1'b1;
         end
     end
 
     reg [1:0] ov_s;
     always @(posedge clk_psram) ov_s <= {ov_s[0], ld_overflow_b};
     wire seen_overflow = ov_s[1];
+
+    assign rom_dbg_wr_match = dbg_wr_match;
+    assign rom_dbg_wr_all   = dbg_wr_all;
+    // seen_overflow is the clk_psram-synchronised copy of ld_overflow_b; a debug
+    // display does not need another synchroniser stage.
+    assign rom_dbg_status   = {seen_overflow, dbg_allc_seen, dbg_last_match};
     // ld_trailer_b and ld_quiet_b are needed where the check is issued, in clk_core,
     // and are synchronised there rather than relayed through this domain.
 
@@ -251,12 +312,18 @@ module aw_rom (
     // loses the write whenever ready is low on the cycle the pulse arrives - and in
     // simulation, where the memory is always ready, that bug is invisible.
     //
-    // One entry takes four cycles (pop, then two chip accesses with one wait cycle
-    // between them), which is about 40 MB/s: the ceiling of a x16 ZBT part accessed
-    // with an address phase, and comfortably above what the bridge sustains in
-    // practice. The straddling case takes four byte-masked writes instead, which is
-    // four times slower - the host writes sequentially from address 0, so aligned
-    // entries are the norm and straddling is the exception.
+    // One aligned entry is two chip accesses. The controller chains them back to
+    // back (seven 92.8125 MHz cycles each, see aw_psram), and this machine starts
+    // popping the NEXT entry while the second access of the current one is still in
+    // flight - the pop and arm hide inside the access window instead of adding two
+    // cycles to it. Steady state: 14 cycles per entry = 150.8 ns, against the
+    // 161.7 ns a paced upload sustains (PACE=10 in tb_rom). That margin is what
+    // keeps the FIFO from filling; an earlier version paid two extra cycles per
+    // entry and overflowed on every full pack.
+    //
+    // The straddling case takes four byte-masked writes instead, which is twice as
+    // slow - the host writes sequentially from address 0, so aligned entries are
+    // the norm and straddling is the exception.
     // ---------------------------------------------------------------------------
     localparam D_IDLE = 2'd0, D_ARM = 2'd1, D_RUN = 2'd2;
 
@@ -276,7 +343,9 @@ module aw_rom (
     // every read would have returned the byte two addresses away, and the only reason
     // that is not obvious from the boot check is that the trailer happened to read
     // back offsets that still looked plausible.
-    wire        d_act    = (d_state == D_RUN);
+    // Gated by ~st_active: while the self-test owns the controller, a taken write is
+    // the test's - counting it would advance the drain past a pack byte.
+    wire        d_act    = (d_state == D_RUN) & ~st_active;
     wire [19:0] ld_w0    = ld_baddr[20:1];                 // word holding byte 0
     wire [20:0] d_byaddr = ld_baddr + {19'd0, d_step};     // this byte's address
     wire        d_lane   = d_byaddr[0];
@@ -291,16 +360,129 @@ module aw_rom (
                                 : (d_step[0] ? ld_data[31:16] : ld_data[15:0]);
     wire        d_last   = d_odd ? (d_step == 2'd3) : (d_step == 2'd1);
 
-    // write side of the chip, driven straight from the state above
+    // ================================================================ selftest ===
+    // Round-trip probe for the PSRAM path on the fitted part. It exists because every
+    // hardware read from build 1027 to 1033 came back as the address this design had
+    // just driven onto DQ - on every address, both dies, and every read timing tried.
+    // That is the signature of a bus nobody drove (a floating DQ keeps the last value
+    // on it), and the cause was found by reading the known-good driver in
+    // analogue-pocket-utils against ours: UB#/LB# are output enables on this part, this
+    // controller asserted them only for writes, and so the chip spent every read in
+    // output deselect. See aw_psram's header; the fix is unconditional now.
+    //
+    // What is left here is the rest of the "or is something else wrong" question, one
+    // assumption per probe, plus a pack-word-0 readback that only matches the file if
+    // the UPLOAD committed.
+    localparam [21:0] ST_ADDR_D0  = 22'h100000; // die 0, first word past the pack (it ends at word 0xFFFF7)
+    localparam [21:0] ST_ADDR_P0  = 22'h000000; // pack word 0 - written by the upload, never by us
+    localparam [15:0] ST_PAT      = 16'hA5A5;
+    // Probe B's pattern, written with the low byte enabled only, on top of the A5A5
+    // probe A put in the same word a moment earlier: the readback must be A55A.
+    localparam [15:0] ST_PAT_BE   = 16'h5A5A;
+    localparam [15:0] ST_PERIOD   = 16'd41_250;   // ~450 ms at 92.8125 MHz
+
+    // One round per period: seq 0..3 are scratch round-trips (0 = normal, 1 = the
+    // byte-lane/mask probe, 2 = the other die, 3 = CRE high), seq 4 is the pack word 0
+    // readback. st_cfg only carries the two flips that live inside aw_psram; probe B is
+    // a byte-enable thing and needs none of them.
+    localparam [2:0] ST_SEQ_P0 = 3'd4;
+    wire [1:0] st_cfg = (st_seq == 3'd2) ? 2'd2 :
+                        (st_seq == 3'd3) ? 2'd3 : 2'd0;
+    // Probe B masks every write else in this design out of the picture: only the LOW
+    // lane, so the high byte on readback is proof the earlier write is still there.
+    wire [1:0] st_be     = (st_seq == 3'd1) ? 2'b01 : 2'b11;
+    wire [15:0] st_wdata = (st_seq == 3'd1) ? ST_PAT_BE : ST_PAT;
+    wire [21:0] st_rd_addr = (st_seq == ST_SEQ_P0) ? ST_ADDR_P0 : ST_ADDR_D0;
+
+    // 3 bits: ST_WAIT is 4 - a 2-bit encoding truncated it to 0 (= ST_IDLE), which
+    // made the producer's push gate (st_s != ST_WAIT) drop every read while the
+    // self-test sat idle, and gave the case statement two identical items.
+    localparam [2:0] ST_IDLE = 3'd0, ST_WR = 3'd1, ST_GAP = 3'd2,
+                      ST_RD   = 3'd3, ST_WAIT = 3'd4;
+    reg  [2:0] st_s;
+    reg  [2:0] st_seq;             // which probe of the round is in flight (0..4)
+    reg  [15:0] st_cnt;
+    reg  [2:0] st_gap;
+    wire       st_active  = (st_s != ST_IDLE);
+    wire       st_rd_take = (st_s == ST_RD);
+
+    always @(posedge clk_psram) begin
+        if (rst_psram) begin
+            st_s               <= ST_IDLE;
+            st_cnt             <= 16'd0;
+            st_gap             <= 3'd0;
+            st_seq             <= 3'd0;
+            rom_selftest_die0  <= 16'h0000;
+            rom_selftest_be    <= 16'h0000;
+            rom_selftest_ceneg <= 16'h0000;
+            rom_selftest_cre   <= 16'h0000;
+            rom_selftest_pack0 <= 16'h0000;
+        end else begin
+            case (st_s)
+            ST_IDLE: if (st_cnt == ST_PERIOD - 16'd1) begin
+                st_cnt <= 16'd0;
+                st_seq <= 3'd0;                // first probe of the round
+                st_s   <= ST_WR;               // seqs 0..3 have a write phase
+            end else begin
+                st_cnt <= st_cnt + 16'd1;
+            end
+            ST_WR: if (wr_taken) begin
+                st_gap <= 3'd4;                // let the write access finish first
+                st_s   <= ST_GAP;
+            end
+            ST_GAP: begin
+                st_s   <= (st_gap == 3'd0) ? ST_RD : ST_GAP;
+                st_gap <= (st_gap == 3'd0) ? 3'd0 : st_gap - 3'd1;
+            end
+            ST_RD: if (rd_taken) st_s <= ST_WAIT;
+            // Hold until the readback lands below. Without this explicit item
+            // ST_WAIT fell into `default` and cleared itself in one cycle - six
+            // cycles too early for rd_q_valid, so the capture could never fire
+            // (build 1030a printed T0000 on hardware: the reset value, not a read).
+            ST_WAIT: st_s <= ST_WAIT;
+            default: st_s <= ST_IDLE;
+            endcase
+
+            // The controller serialises accesses, so the next rd_q_valid after our
+            // read is taken is ours - and only ours goes here, never to the stream
+            // FIFO (see the producer's push gate). Route it to the probe that owns
+            // it, then advance: cfg0 -> cfg1 -> cfg2 -> cfg3 -> pack read -> done.
+            if (rd_q_valid && st_s == ST_WAIT) begin
+                case (st_seq)
+                3'd0: rom_selftest_die0  <= rd_q;
+                3'd1: rom_selftest_be    <= rd_q;
+                3'd2: rom_selftest_ceneg <= rd_q;
+                3'd3: rom_selftest_cre   <= rd_q;
+                default: rom_selftest_pack0 <= rd_q;     // ST_SEQ_P0
+                endcase
+                if (st_seq == ST_SEQ_P0) begin
+                    st_s <= ST_IDLE;                     // round complete
+                end else begin
+                    st_seq <= st_seq + 3'd1;
+                    // the NEXT sequence's first phase: seq 4 is read-only, the rest write
+                    st_s   <= (st_seq == 3'd3) ? ST_RD : ST_WR;
+                end
+            end
+        end
+    end
+
+    // write side of the chip, driven straight from the state above; the self-test
+    // owns it for one access while in ST_WR
     wire        wr_ready;
     wire        wr_taken = wr_req & wr_ready;
     reg         wr_req;
     reg  [21:0] wr_addr;
     reg  [15:0] wr_wdata;
     always @(*) begin
-        wr_req   = d_act & ~ld_abort;
-        wr_addr  = d_addr;
-        wr_wdata = d_wdata;
+        if (st_s == ST_WR) begin
+            wr_req   = 1'b1;
+            wr_addr  = ST_ADDR_D0;     // every write probe hits the same scratch word
+            wr_wdata = st_wdata;       // probe B writes 5A5A on the low lane only
+        end else begin
+            wr_req   = d_act & ~ld_abort;
+            wr_addr  = d_addr;
+            wr_wdata = d_wdata;
+        end
     end
     assign ld_rd = ld_rd_q;
 
@@ -335,7 +517,16 @@ module aw_rom (
             // chip's own rate
             D_RUN: if (wr_taken) begin
                 if (d_last) begin
-                    d_state <= D_IDLE;
+                    // The last access of this entry is now in flight. If the next
+                    // entry is already queued, start pulling it out on this very
+                    // cycle: the registered FIFO output appears next cycle, which is
+                    // still eight cycles before the chip will take the next write.
+                    if (!ld_empty && !ld_abort) begin
+                        ld_rd_q <= 1'b1;
+                        d_state <= D_ARM;
+                    end else begin
+                        d_state <= D_IDLE;
+                    end
                 end else begin
                     d_step  <= d_step + 2'd1;
                 end
@@ -378,9 +569,16 @@ module aw_rom (
     // than "fill the FIFO", for two reasons. Seeking past stale words costs one cycle per
     // word, so a deep buffer makes every restart expensive - the first version buffered
     // 256 words and spent tens of thousands of cycles discarding them before a single
-    // byte. And at full rate the producer supplies exactly one word per core cycle while
-    // the consumer takes exactly one word per core cycle: the buffer is the entire margin,
-    // so what matters is having a fill's worth of it, not having a lot of it.
+    // byte.
+    //
+    // The buffer is not a margin here, it is the whole mechanism, and that is arithmetic
+    // rather than a choice: one chip access is twelve sequence cycles plus the idle cycle
+    // every read parks in (140 ns), while a gapless fill consumes a word every two core
+    // cycles (80.8 ns). A single ZBT access on one bus cannot go faster than that, whatever
+    // clock it runs on - this design's read side is one access per 140 ns, the reference's
+    // is one per 225 ns - so the only way a 63-byte fill stays gapless is that the bytes
+    // come out of a buffer someone filled earlier. Which is why PREFILL_WORDS is a hard
+    // gate on the first byte and not a hint.
     //
     // The FIFO's read is registered (rd_en at T puts the word on rd_q at T+1, per
     // aw_fifo's header), hence the two stages: n_word is the prefetched next word, c_word
@@ -452,11 +650,15 @@ module aw_rom (
     wire p_start = run_s[1] & ~run_s[2];
     wire p_allow = run_s[2] & (sf_free >= FETCH_HEADROOM) & (sf_level <= LOOKAHEAD);
 
-    assign rd_req  = p_allow;
-    assign rd_addr = p_addr;
+    // The self-test read preempts while presented (one access, ~500 ms apart); the
+    // producer is paused for that window and must not book its traffic as its own.
+    assign rd_req   = st_rd_take | (p_allow & ~st_active);
+    assign rd_addr  = st_rd_take ? st_rd_addr : p_addr;
+    wire [TW-1:0] rd_tag_w = st_rd_take ? st_rd_addr[TW-1:0] : p_addr[TW-1:0];
 
     reg  [21:0] p_addr;
-    wire        rd_taken = rd_req & rd_ready;
+    wire        rd_taken   = rd_req & rd_ready;
+    wire        prod_taken = rd_taken & ~st_rd_take;
 
     always @(posedge clk_psram) begin
         if (rst_psram) begin
@@ -467,12 +669,14 @@ module aw_rom (
             sf_wr <= 1'b0;
             if (p_start) begin
                 p_addr <= start_addr_r;
-            end else if (rd_taken) begin
+            end else if (prod_taken) begin
                 p_addr <= p_addr + 22'd1;
             end
-            if (rd_q_valid) begin
+            if (rd_q_valid && st_s != ST_WAIT) begin
                 sf_wr    <= 1'b1;
                 sf_wdata <= {rd_addr_q, rd_q};   // the address the controller read
+                                                 // (ST_WAIT is the self-test's own
+                                                 // readback - captured in its block)
             end
         end
     end
@@ -523,7 +727,18 @@ module aw_rom (
     wire [TW-1:0] want_word = {1'b0, c_addr[20:1]};        // word the next byte lives in
     wire [TW-1:0] next_word = c_waddr + {{(TW-1){1'b0}}, 1'b1};
 
-    wire prefill_ok = chk_active | ~inr[0] | (sf_level >= PREFILL_WORDS);
+    // A held request needs the whole fill buffered before its FIRST byte; a pulsed one
+    // (readByte, in_ready long dropped by the time any memory can answer) never does.
+    // The gate is on host_rdy - whoever is asking, and whether they are asking in a way
+    // that forbids a gap - not on inr[0], because the boot check's readiness is chk_cnt,
+    // not the VM's. Keying it on inr[0] alone meant the check saw "host not ready",
+    // skipped the prefill, and served byte 0 from a drained FIFO; with a twelve-cycle
+    // read word 1 could not be there two core cycles later, so it rewound, re-served
+    // into the same chk_data shift register, and the trailer never validated however
+    // perfectly the chip answered (that is what held this design in reset once the read
+    // stopped being faster than the consumer). Prefilling costs the check about 4 us
+    // and every holder of a held stream needs it anyway.
+    wire prefill_ok = ~host_rdy | (sf_level >= PREFILL_WORDS);
     wire want       = c_run & (host_rdy | ~c_served);
 
     wire word_ok = c_v & (c_waddr == want_word);
@@ -533,12 +748,43 @@ module aw_rom (
 
     // prefetch is kept only if it is the word that comes after the one handing out
     wire n_keep     = n_v & (n_addr == next_word);
-    wire handoff    = exhausted & (n_keep | (landing & (land_addr == next_word)));
+    // The primary handoff window is the cycle a word is exhausted: its successor must
+    // already be prefetched or landing. But the FIFO's read side can only be popped
+    // every other core cycle (pend is a register), so the consumer's ceiling is exactly
+    // the two core cycles (80.8 ns) a continuous stream needs per word, and a PSRAM read
+    // (twelve 92.8125 MHz cycles plus the idle cycle every read parks in = 140 ns) is
+    // slower than that. Where a stream starts in the fetch pipeline therefore decides
+    // whether the successor lands ON the exhausting cycle or one cycle AFTER it, and the
+    // late arrival has to count too. Without it the reader rewinds every other word on
+    // any continuous stream, which is how the boot check's sixteen bytes degenerated
+    // into four repeated zeros.
+    wire late_handoff = (c_state == C_RUN) & want & c_served & ~take
+                       & landing & (land_addr == next_word);
+    wire handoff    = exhausted & (n_keep | (landing & (land_addr == next_word)))
+                       | late_handoff;
     // wanted a byte, cannot deliver one: the VM's fill pointer is about to reset, so
     // this reader restarts at the address the acceptance began
     wire rewind     = (c_state == C_RUN) & want & c_served & ~take & ~handoff;
 
-    wire pop = c_run & ~sf_empty & ~pend & ((c_state == C_SEEK) | ~n_v);
+    // Between streams the FIFO is drained, so a check can never serve a word left
+    // over from the previous stream (its seek would terminate on the stale entry).
+    wire drain = (c_state == C_IDLE) & ~sf_empty;
+    // Pop whenever there is no USEFUL prefetch in hand - not merely no prefetch.
+    //
+    // The first version asked ~n_v here, and that silently locked the bus on a slow
+    // chip. A seek leaves n_word holding whatever landed while it was looking (the
+    // C_SEEK landing handler drops those words and does not touch the prefetch), so
+    // the reader entered C_RUN with n_v=1 and n_addr pointing somewhere else: ~n_v
+    // said "do not pop", nothing could land, so no handoff could happen, and the
+    // first exhausted word rewound a fill that had 32 perfectly good words sitting
+    // in the FIFO behind it. It went unseen at seven cycles per read because the
+    // producer was then fast enough that the landing word was always the one wanted
+    // on the very cycle it mattered; at twelve cycles per read (what tAA at the pins
+    // actually requires - see aw_psram) the stale prefetch holds the bus and the
+    // stream never gets past its first two bytes. n_keep is the honest predicate:
+    // a prefetch you cannot use is the same as no prefetch, and the landing handler
+    // below already replaces it on exactly that condition.
+    wire pop   = drain | (c_run & ~sf_empty & ~pend & ((c_state == C_SEEK) | ~n_keep));
 
 `ifdef READ_TRACE
     always @(posedge clk_core) begin
@@ -788,6 +1034,8 @@ module aw_rom (
         end
     end
 
+    assign rom_chk_data = chk_data;
+
     wire [31:0] off0 = chk_data[31:0];
     wire [31:0] off1 = chk_data[63:32];
     wire [31:0] off2 = chk_data[95:64];
@@ -799,8 +1047,8 @@ module aw_rom (
 
 `ifdef CHECK_TRACE
     always @(posedge clk_core) if (chk_done)
-        $display("  CHECK data=%h off=[%0d %0d %0d %0d] ok=%b ovf=%b stall=%b",
-                 chk_data, off0, off1, off2, off3, offs_ok, seen_overflow, ps_stall);
+        $display("  CHECK data=%h off=[%0d %0d %0d %0d] ok=%b ovf=%b",
+                 chk_data, off0, off1, off2, off3, offs_ok, seen_overflow);
 `endif
 
     always @(posedge clk_core) begin
@@ -808,12 +1056,11 @@ module aw_rom (
             rom_ready <= 1'b0;
             rom_error <= ERR_NONE;
         end else begin
-            // Overflow is the more actionable of the two fatal reports: it says the
-            // drain is too slow, which is a fact about this design, whereas a held
-            // WAIT says nothing is moving at all.
-            if (ps_stall)    rom_error <= ERR_WAIT;
+            // Overflow is the fatal report: it says the drain is too slow, which is
+            // a fact about this design. (The old ERR_WAIT path is gone - WAIT idles
+            // high on the fitted part and was never a handshake; see aw_psram.)
             if (seen_overflow) rom_error <= ERR_OVERFLOW;
-            if (chk_done && !seen_overflow && !ps_stall) begin
+            if (chk_done && !seen_overflow) begin
                 if (offs_ok) begin
                     rom_ready <= 1'b1;
                     // ERR_TRAILER is a diagnosis of the moment, not a verdict: a check
@@ -834,22 +1081,23 @@ module aw_rom (
     assign rom_loading = ~rom_ready;
 
     // =============================================================== the chip ===
-    wire ps_stall;
-
     aw_psram u_psram (
-        .stall_wait  (ps_stall),
         .clk         (clk_psram),
         .rst         (rst_psram),
+        .st_cfg      (st_cfg),
 
         .wr_req      (wr_req),
         .wr_addr     (wr_addr),
         .wr_data     (wr_wdata),
-        .wr_be       (d_be),
+        // The self-test owns the byte enables for its own access; the loader's are the
+        // straddling-entry mask. Both are held stable until wr_ready, which is the
+        // controller's contract - it latches wr_be on the take edge.
+        .wr_be       (st_s == ST_WR ? st_be : d_be),
         .wr_ready    (wr_ready),
 
         .rd_req      (rd_req),
         .rd_addr     (rd_addr),
-        .rd_tag      (p_addr[TW-1:0]),  // the address being issued, latched with the read
+        .rd_tag      (rd_tag_w),        // the address being issued, latched with the read
         .rd_ready    (rd_ready),
         .rd_q        (rd_q),
         .rd_q_valid  (rd_q_valid),
