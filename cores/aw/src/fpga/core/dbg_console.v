@@ -28,6 +28,15 @@ module dbg_console (
     input  wire [15:0]  rom_selftest_ceneg,  // self-test matrix: CE-inverted round-trip
     input  wire [15:0]  rom_selftest_cre,    // self-test matrix: CRE-high round-trip
     input  wire [15:0]  rom_selftest_pack0,  // self-test: pack word 0 readback (0004 for part1)
+    // Video / VM liveness, so a black screen can be told apart from a loaded one without
+    // a logic analyser. 1036a reached C0 (pack validated, rom_ready high, VM released) and
+    // the panel stayed black: everything below the render path now reports success on
+    // hardware, so the next question is which side of the SoC's video output is silent.
+    input  wire [23:0]  vid_frames,          // game-path vsync pulses counted since boot
+    input  wire [19:0]  vid_de_per_frame,    // de pulses in the last complete frame (64000 = fa00)
+    input  wire [19:0]  vid_lit_per_frame,   // of those, how many were non-black
+    input  wire [31:0]  rom_rd_bytes,        // bytes aw_rom has streamed to the VM
+    input  wire [7:0]   vid_status,          // {saw_hs,saw_vs,inmenu,design_run,video_sel,suppress,_,rom_ready}
     output reg  [7:0]  tx_data,
     output wire        tx_valid,
     input  wire        tx_ready
@@ -49,7 +58,7 @@ localparam MID_UP      = 3'd0,   // "AW 1026a up\n"            console out of re
 // sits in the MSB.
 // The tag in the boot line is the build id - the first thing a hardware session
 // prints, so any capture identifies which bitstream is actually in the FPGA.
-localparam [8*12-1:0]  MSG_UP      = "AW 1036a up\n";   // diag build: also re-sent every ~2 s (tag_cnt)
+localparam [8*12-1:0]  MSG_UP      = "AW 1037a up\n";   // diag build: also re-sent every ~2 s (tag_cnt)
 localparam [8*13-1:0]  MSG_RUN     = "game running\n";
 localparam [8*15-1:0]  MSG_OK      = "pack loaded ok\n";
 localparam [8*21-1:0]  MSG_ERR1    = "ROM ERR: bad trailer\n";
@@ -206,7 +215,7 @@ always @(*) begin
         MID_ERR3:    msg_len = 6'd25;
         MID_MENUIN:  msg_len = 6'd8;
         MID_MENUOUT: msg_len = 6'd8;
-        MID_CHK:     msg_len = 7'd90;
+        MID_CHK:     msg_len = 7'd126;
         default:     msg_len = 6'd8;
     endcase
 end
@@ -232,7 +241,11 @@ always @(*) begin
     case (msg_id)
         MID_CHK: begin
             // "C<err>:<32 hex chk_data> <match 8hex>/<all 8hex> S<status 4hex>
-            //  D<normal rt> B<BE-low rt> N<CE-inverted rt> R<CRE-high rt> P<pack word 0>\n"
+            //  D<normal rt> B<BE-low rt> N<CE-inverted rt> R<CRE-high rt> P<pack word 0>
+            //  V<frames 6hex> F<de/frame 5hex> L<lit/frame 5hex> Y<rom bytes 8hex> X<vid status 2hex>\n"
+            // X bits: 0 rom_ready, 1 design_run, 2 video_sel, 3 suppress, 4 inmenu,
+            // 5 saw a game vsync, 6 saw a game hsync. F=fa00 (64000) means the display
+            // window is being scanned; L=0 with F correct means it is scanning black.
             // The W/S fields are the aw_rom loader counters (also on the error screen,
             // rows 8-10). D/B/N/R are the control-signal search: the same scratch
             // round-trip under normal operation and with one assumption flipped each;
@@ -264,6 +277,21 @@ always @(*) begin
             else if (pos == 7'd83) tx_data = 8'h20;                    // ' '
             else if (pos == 7'd84) tx_data = 8'h50;                    // 'P'
             else if (pos <= 7'd88) tx_data = hxn(rom_selftest_pack0[(7'd88 - pos)*4 +: 4]);
+            else if (pos == 7'd89) tx_data = 8'h20;                    // ' '
+            else if (pos == 7'd90) tx_data = 8'h56;                    // 'V' frames
+            else if (pos <= 7'd96) tx_data = hxn(vid_frames[(7'd96 - pos)*4 +: 4]);
+            else if (pos == 7'd97) tx_data = 8'h20;                    // ' '
+            else if (pos == 7'd98) tx_data = 8'h46;                    // 'F' de per frame
+            else if (pos <= 7'd103) tx_data = hxn(vid_de_per_frame[(7'd103 - pos)*4 +: 4]);
+            else if (pos == 7'd104) tx_data = 8'h20;                   // ' '
+            else if (pos == 7'd105) tx_data = 8'h4c;                   // 'L' lit per frame
+            else if (pos <= 7'd110) tx_data = hxn(vid_lit_per_frame[(7'd110 - pos)*4 +: 4]);
+            else if (pos == 7'd111) tx_data = 8'h20;                   // ' '
+            else if (pos == 7'd112) tx_data = 8'h59;                   // 'Y' ROM bytes to the VM
+            else if (pos <= 7'd120) tx_data = hxn(rom_rd_bytes[(7'd120 - pos)*4 +: 4]);
+            else if (pos == 7'd121) tx_data = 8'h20;                   // ' '
+            else if (pos == 7'd122) tx_data = 8'h58;                   // 'X' status
+            else if (pos <= 7'd124) tx_data = hxn(vid_status[(7'd124 - pos)*4 +: 4]);
             else                   tx_data = 8'h0a;                    // '\n'
         end
         MID_UP:      tx_data = MSG_UP      [(11 - pos)*8 +: 8];

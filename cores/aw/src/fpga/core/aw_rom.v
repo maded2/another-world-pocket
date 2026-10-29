@@ -120,6 +120,11 @@ module aw_rom (
     output wire [31:0] rom_dbg_wr_match,   // host writes with addr[31:21]==0x080
     output wire [31:0] rom_dbg_wr_all,     // every bridge write seen
     output wire [15:0] rom_dbg_status,     // {overflow, allc_seen, last_match[23:10]}
+    // Bytes handed to the VM since reset (clk_core domain) - the one honest proxy for
+    // "is the VM executing". A running VM takes ROM bytes; one held off, or stuck in
+    // while (mem.busy), takes none. 1036a reached C0 with a black screen and nothing
+    // in the report told those two apart.
+    output reg  [31:0] rom_dbg_rd_bytes,
 
     // PSRAM self-test readbacks (see the selftest block), reported as
     // "D<d> B<b> N<n> R<r> P<p>" on the CHK line. Expected on a living chip:
@@ -816,6 +821,7 @@ module aw_rom (
     always @(posedge clk_core) begin
         if (rst_core) begin
             c_state      <= C_IDLE;
+            rom_dbg_rd_bytes <= 32'd0;
             gap          <= 2'd0;
             c_addr       <= 21'd0;
             c_start      <= 21'd0;
@@ -903,6 +909,8 @@ module aw_rom (
             // byte out
             if (take) begin
                 mem_data <= c_byte;
+                // count the bytes the VM got, not the boot check's own reads
+                if (!chk_active) rom_dbg_rd_bytes <= rom_dbg_rd_bytes + 32'd1;
                 c_served <= 1'b1;
                 c_addr   <= c_addr + 21'd1;
                 if (!chk_active) mem_data_available <= 1'b1;

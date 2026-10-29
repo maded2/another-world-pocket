@@ -105,6 +105,8 @@ module tb_dbg_console;
         .rom_dbg_wr_match(32'h0), .rom_dbg_wr_all(32'h0), .rom_dbg_status(16'h0),
         .rom_selftest_die0(16'h0), .rom_selftest_be(16'h0), .rom_selftest_ceneg(16'h0),
         .rom_selftest_cre(16'h0), .rom_selftest_pack0(16'h0),
+        .vid_frames(24'h0), .vid_de_per_frame(20'h0), .vid_lit_per_frame(20'h0),
+        .rom_rd_bytes(32'h0), .vid_status(8'h0),
         .tx_data(b_data), .tx_valid(b_valid), .tx_ready(b_ready)
     );
 
@@ -133,6 +135,14 @@ module tb_dbg_console;
         .rom_selftest_ceneg(16'hCCCC),
         .rom_selftest_cre  (16'hDDDD),
         .rom_selftest_pack0(16'h5678),
+        // video/VM liveness: 300 frames, a full 64000-pixel window of which 7500 lit,
+        // 0x1255d3 ROM bytes streamed, status {0,saw_hs,saw_vs,inmenu,design_run,
+        // video_sel,suppress,rom_ready} = 0111_0101
+        .vid_frames(24'h00012C),
+        .vid_de_per_frame(20'h0FA00),
+        .vid_lit_per_frame(20'h01D4C),
+        .rom_rd_bytes(32'h001255D3),
+        .vid_status(8'h75),
         .tx_data(c_data), .tx_valid(c_valid), .tx_ready(c_ready)
     );
 
@@ -154,11 +164,11 @@ module tb_dbg_console;
         end
     endtask
 
-    task recv_line_c(input [8*96-1:0] want, input integer want_len);
+    task recv_line_c(input [8*160-1:0] want, input integer want_len);
         begin
             nbyte = 0;
             decode_c(got_byte);
-            while (got_byte !== 8'h0a && nbyte < 95) begin
+            while (got_byte !== 8'h0a && nbyte < 158) begin
                 got_line_c[nbyte*8 +: 8] = got_byte;
                 nbyte = nbyte + 1;
                 decode_c(got_byte);
@@ -194,7 +204,7 @@ module tb_dbg_console;
 
     integer nbyte, k;
     reg [8*32-1:0] got_line;
-    reg [8*96-1:0] got_line_c;   // phase C: the CHK line is 90 chars
+    reg [8*160-1:0] got_line_c;  // phase C: the CHK line is 126 chars
     reg line_ok;
 
     // want is a string literal right-justified in its 32-byte vector, so char c
@@ -275,7 +285,7 @@ module tb_dbg_console;
 
         // out of reset: boot tag (build id; the device build re-sends it every ~2 s).
         // want_len is chars + 1 (the \n), like every other call in this bench.
-        recv_line("AW 1036a up\n", 12);
+        recv_line("AW 1037a up\n", 12);
 
         // pack loaded, then game running.
         // Events are level-latched by the console every cycle they are high, so
@@ -315,9 +325,9 @@ module tb_dbg_console;
         c_rst_n = 1'b0;
         repeat (5) @(posedge clk);
         c_rst_n = 1'b1;
-        recv_line_c("AW 1036a up\n", 12);
+        recv_line_c("AW 1037a up\n", 12);
         // C<err>:<32 hex chk> W<match>/<all> S<status> - the loader counters
-        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678\n", 90);
+        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75\n", 126);
 
         if (errors == 0) $display("tb_dbg_console: -> PASS");
         else             $display("tb_dbg_console: -> FAIL (%0d errors)", errors);

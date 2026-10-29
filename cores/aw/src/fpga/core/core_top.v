@@ -514,6 +514,7 @@ wire [127:0] rom_chk_data;    // debug: last trailer readback, shown on the red 
 wire [31:0]  rom_dbg_wr_match; // debug: host writes that passed the window filter
 wire [31:0]  rom_dbg_wr_all;   // debug: every bridge write seen
 wire [15:0]  rom_dbg_status;   // debug: {overflow, allc_seen, last_match[23:10]}
+wire [31:0]  rom_dbg_rd_bytes; // debug: ROM bytes streamed to the VM (clk_core)
 // debug: PSRAM self-test matrix (see aw_rom) - a5a5 in D/B/N/R names the control
 // assumption that was wrong; P must read 0004 (part1) once reads work at all
 wire [15:0]  rom_selftest_die0;
@@ -862,6 +863,7 @@ aw_rom u_rom (
     .rom_dbg_wr_match     ( rom_dbg_wr_match     ),
     .rom_dbg_wr_all       ( rom_dbg_wr_all       ),
     .rom_dbg_status       ( rom_dbg_status       ),
+    .rom_dbg_rd_bytes     ( rom_dbg_rd_bytes     ),
     .rom_selftest_die0    ( rom_selftest_die0    ),
     .rom_selftest_be      ( rom_selftest_be      ),
     .rom_selftest_ceneg   ( rom_selftest_ceneg   ),
@@ -916,6 +918,50 @@ synch_3 u_inmenu_sync (
     .fall  ( inmenu_fall     )
 );
 
+// ---- video / VM liveness counters -------------------------------------------------
+// 1036a reported C0 (pack validated, trailer correct, rom_ready high, so design_run
+// high and the VM released) and the panel stayed black. Every layer under the render
+// path now answers on hardware, so the console has to name which side of the SoC's
+// video output is quiet: frames, de per frame, non-black pixels per frame, ROM bytes
+// the VM has consumed, and the mux/reset state.
+//
+// All of this is already in clk_core - the generated SoC runs on clk_core and so does
+// the idle raster - so no synchroniser is needed, and nothing here leaves the clock
+// (dbg_console is clk_core as well).
+reg [23:0] vid_frames;              // game-path vsync pulses since rst_core released
+reg [19:0] vid_de, vid_lit;         // counting the frame in progress
+reg [19:0] vid_de_last, vid_lit_last;
+reg        vid_saw_hs, vid_saw_vs;
+always @(posedge clk_core) begin
+    if (rst_core) begin
+        vid_frames     <= 24'd0;
+        vid_de         <= 20'd0;
+        vid_lit        <= 20'd0;
+        vid_de_last    <= 20'd0;
+        vid_lit_last   <= 20'd0;
+        vid_saw_hs     <= 1'b0;
+        vid_saw_vs     <= 1'b0;
+    end else begin
+        if (game_hs) vid_saw_hs <= 1'b1;
+        if (game_vs) begin
+            // vs is a one-cycle pulse inside blanking, so snapshotting here rather
+            // than counting this cycle too costs nothing
+            vid_saw_vs   <= 1'b1;
+            vid_frames   <= vid_frames + 24'd1;
+            vid_de_last  <= vid_de;
+            vid_lit_last <= vid_lit;
+            vid_de       <= 20'd0;
+            vid_lit      <= 20'd0;
+        end else if (game_de) begin
+            vid_de <= vid_de + 20'd1;
+            if (game_r | game_g | game_b) vid_lit <= vid_lit + 20'd1;
+        end
+    end
+end
+// {saw_hs, saw_vs, inmenu, design_run, video_sel, suppress, 0, rom_ready}
+wire [7:0] vid_status = {1'b0, vid_saw_hs, vid_saw_vs, inmenu_s, design_run,
+                         video_sel, suppress, rom_ready};
+
 wire [7:0] cons_data;
 wire       cons_valid, cons_ready;
 
@@ -936,6 +982,11 @@ dbg_console u_cons (
     .rom_selftest_ceneg( rom_selftest_ceneg ),
     .rom_selftest_cre( rom_selftest_cre    ),
     .rom_selftest_pack0( rom_selftest_pack0 ),
+    .vid_frames    ( vid_frames         ),
+    .vid_de_per_frame( vid_de_last      ),
+    .vid_lit_per_frame( vid_lit_last    ),
+    .rom_rd_bytes  ( rom_dbg_rd_bytes   ),
+    .vid_status    ( vid_status         ),
     .tx_data    ( cons_data         ),
     .tx_valid   ( cons_valid        ),
     .tx_ready   ( cons_ready        )
