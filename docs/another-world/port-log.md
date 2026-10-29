@@ -1469,3 +1469,83 @@ only readback that proves the write mask masks, which the loader depends on for 
 upload entry that straddles a word boundary. CHK line format is unchanged:
 `C<err>:<32 hex> <match>/<all> S<status> D<d> B<b> N<n> R<r> P<p>`, expected `a5a5 a55a a5a5
 a5a5 <pack0>`.
+
+---
+
+## 2026-10-29 (later): 1035a on hardware — the chip answers. What was left was byte order
+
+First read-back this PSRAM has ever given. Boot tag `AW 1035a up`, and a CHK line every
+second on the debug UART:
+
+```
+AW 1035a up
+C1:d3ae03008f2600005d25010000000000 0007fffc/00080030 S47ff Da5a5 Ba55a Na5a5 R0000 Pe700
+```
+
+* **`D=a5a5`** — the byte-enable fix works: the part drives DQ and a round trip through it
+  returns what was written. Nine builds of `Tf000`-style echoes, and that was the whole
+  chip story.
+* **`B=a55a`** — both byte lanes are live and the write mask masks.
+* **`N=a5a5`** — the other physical die is alive too.
+* **`R=0000`** — with CRE driven high the part stays mute. That is the answer to that
+  probe: async mode wants CRE low, which is what normal operation does. Not a fault.
+* **`0007fffc/00080030`** — 524,284 matched writes, 524,336 writes seen. The file is
+  2,097,136 bytes = 0x7FFFC words, so **every word of the pack arrived inside the window**,
+  and the 52 extra writes are the loader's command traffic. The upload is complete.
+* **`C1`** = `ERR_TRAILER`, and `P=e700`.
+
+The CHK field's variation from line to line (`d3ae0300…5d2501000003 0000` one second, clean
+the next) is the console sampling `chk_data` while the check re-runs: it retries while
+`rom_ready` is low, so it is mid-shift when the 66-byte line goes out. Not corruption — the
+steady value is the one to read.
+
+### The remaining bug: `bridge_wr_data` carries the lowest-address byte in its top byte
+
+The 16 trailer bytes in the chip were the file's, but with each 32-bit entry's four bytes
+reversed, so `offs_ok` compared `off3 = 0xd3ae0300` (the correct `0x0003aed3` written
+backwards) against `< 0x200000` and failed. Byte-swapping the four groups of the read-back
+gives exactly `[0, 0x1255d, 0x268f, 0x3aed3]` — part1's real segoffsets. `P=e700` is the
+same fault: part1's first bytes are `04 00`, little-endian word `0x0004`, and `0xe700` is
+the reversed entry's first half.
+
+`aw_rom` took `bridge_wr_data[7:0]` as the byte for the lowest address. The APF wire is the
+other way round: `core_top` ties `bridge_endian_little = 0` (the template default, a core's
+declaration of what it wants, consumed by `core_bridge_cmd`'s swap mux), and the proven
+loader in `analogue-pocket-utils/ip/data_loader.sv` — whose own testbench runs with
+`bridge_endian_little = 0` — maps `bridge_wr_data = 32'hAABBCCDD` at address `C` to
+`C<-AA, D<-BB, E<-CC, F<-DD`. Measured hardware agrees with the reference, not with us.
+
+Fix (`aw_rom.v`): reverse the payload word once, where it is taken from the load FIFO
+(`ld_wire`), and take both the byte-masked and the whole-word paths from it.
+
+**Why 510 checks missed it**: the benches fed the design the order it assumed. So the swap
+now lives in the benches' model of the framework (`tb_write.wr32`, `tb_rom.bridge_write32`
+and `load_full_rate`, `tb_soc.wr32`, and a new `tb_top.slot_write32` — host commands at
+`0xF8000000` keep their own path through `core_bridge_cmd` and are deliberately untouched),
+and the design reads the word the way the wire delivers it. Negative control: putting the
+little-endian reading back, with the benches still modelling the framework, makes
+`scripts/sim_write.sh` fail with 506 errors and `rom_ready=0`. A DUT/bench agreement is not
+evidence; the reference and the hardware are.
+
+### Gate results (1036a tree)
+
+| step | result |
+|---|---|
+| `scripts/sim_write.sh` | `rom_error=0 rom_ready=1, 0 errors -> PASS`; **with the little-endian reading restored: 506 errors, rom_ready=0 -> FAIL** |
+| `scripts/sim_rom.sh` | 510 checks, 0 errors -> PASS |
+| `scripts/sim_iv.sh` | 24 accesses, 0 X cycles on DQ -> PASS |
+| `scripts/sim_keys.sh` / `scripts/sim_reset.sh` | 13 checks / all checks -> PASS |
+| `scripts/sim_dbg.sh` | PASS (boot tag `AW 1036a up`) |
+| `scripts/sim_soc.sh` (part1.bin) | `rom_ready=1 rom_error=0 after 162 cycles`; 95 frames, 79 non-black, 75 rich; `SEGOFFSETS 00000000 0001255d 0000268f 0003aed3` -> PASS |
+| `make sim-top` (`tb_top`) | all checks passed -> PASS |
+
+**What 1036a should say on the wire** (`scripts/sd_install_1036a.sh`, identity
+`Eddie Chan.AW 1036`, refuses the 1035a SHA `cab279d6…`):
+
+```
+AW 1036a up
+C0:000000005d2501008f260000d3ae0300 <match>/<all> S<status> Da5a5 Ba55a Na5a5 R0000 P0004
+```
+
+and the idle grid should switch to the game. `rom_ready` rising is the milestone; the trailer
+and `P=0004` say the bytes in the chip are the bytes in the file.
