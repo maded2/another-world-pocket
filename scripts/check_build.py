@@ -143,6 +143,39 @@ def check_pll(texts, expect):
     return clocks, out
 
 
+def check_sdc(build_dir):
+    """Constraints the compiler accepted the file with and then silently dropped.
+
+    Quartus reports an SDC constraint that matched nothing - an empty collection from a
+    typo, a rename, a get_pins where get_registers was meant, a hierarchy path rooted at
+    the wrong entity - as a Warning (332049) and carries on as if nothing happened. The
+    build still says "successful", every report still says the timing is clean, and the
+    interface the constraint existed to protect is unconstrained. That is not hypothetical
+    here: the cram0 set_max_delay bounds were dropped in every build until the report was
+    read line by line, because the collection named pins of an instance under a hierarchy
+    root that does not exist (the netlist's top is apf_top).
+
+    A rejected SDC is worse and says so differently (332008: Read_sdc failed - clock
+    groups and all, so an unrelated-but-false clean report), so both are caught."""
+    log = os.path.join(build_dir, 'compile.log')
+    if not os.path.isfile(log):
+        return ['no %s - cannot tell whether the SDC constraints actually loaded' % log]
+    dropped, rejected = [], []
+    for line in read(log).split('\n'):
+        if 'Warning (332049)' in line:
+            dropped.append(line.strip())
+        elif 'Read_sdc failed' in line or '(332008)' in line:
+            rejected.append(line.strip())
+    msgs = []
+    if rejected:
+        msgs.append('sdc: the constraints file was REJECTED (%d message(s), e.g. %s) - '
+                    'nothing in it, including the clock groups, is in effect'
+                    % (len(rejected), rejected[0][:120]))
+    for d in sorted(set(re.sub(r'\s+', ' ', x) for x in dropped)):
+        msgs.append('sdc: a constraint was dropped - %s' % d[:200])
+    return msgs
+
+
 def check_timing(build_dir):
     rep = os.path.join(build_dir, 'report.txt')
     if not os.path.isfile(rep):
@@ -202,6 +235,8 @@ def main():
         print('   sta  worst slack %.3f ns' % worst)
     problems += tim_msgs
 
+    problems += check_sdc(build_dir)
+
     ram_findings = check_ram_as_rom(texts, allow_res)
     for kind, atom in ram_findings:
         problems.append('%s: %s is a RAM the compiler turned into a ROM - its write '
@@ -222,6 +257,7 @@ def main():
         return 1
 
     print('   ok   no dead logic in the core\'s own modules')
+    print('   ok   every SDC constraint in compile.log matched something')
     return 0
 
 
