@@ -1312,3 +1312,160 @@ Still open after this gate, stated plainly: everything above is simulation and a
 **no Pocket has run this core yet** — frame-level parity against the reference at a matched game tick
 (task #20) has not been done, and the effective data-slot rate on device (task #18's gate) is still
 unmeasured.
+
+## Full-core simulation gate 2026-10-25 (tb_top + protocol-safe mux switch)
+
+The biggest coverage gap so far was that **no bench ever instantiated `core_top`**: the idle
+screen, the idle→game video mux, the final APF video pins, the audio pins and the full host
+boot sequence were never simulated together. That is now closed by `tb_top`
+(`cores/aw/src/sim/tb_top.sv`, run via `make sim-top`), which powers the whole core on from
+t=0 and checks, in order: idle-screen palette (black / white blink / the red trailer-error
+grid the retry check paints), APF video protocol on the idle stream, debug-UART behaviour
+(traffic allowed, but TX may never stick low >3 ms), host status before load, a synthetic
+pack trailer written through the real bridge window at the documented ~75-cycle pace,
+`rom_ready` rising (trailer check against PSRAM readback), Reset Exit → `design_run`, the
+mux switch to game video, 59 frame boundaries with at most one phase-jump frame, host status
+after load (`{0x4F4B, idle}`), and audio pin rates (MCLK 122,880 edges / LRCK 480 rises in a
+10 ms window, DAC silent). A self-checking APF protocol monitor
+(`cores/aw/src/sim/apf_video_check.sv`, rules R1–R5 from the openFPGA video contract) is now
+instantiated on the muxed output in `tb_top` **and** on the game pins in `tb_soc`.
+
+### Design change: the mux switch is now protocol-safe (core_top.v)
+
+Switching exactly when `rom_ready` rises was never safe: both rasters run free on `clk_core`
+with a fixed but unpredictable phase offset, so a naive switch can glue an idle sync pulse to
+a game sync pulse into a two-cycle pulse (R1 violation), and the line containing the switch
+cycle carries the idle remainder of its line plus the game beginning — any partial mix is an
+R5 violation. The switch now waits for a provably clean cycle:
+
+- `i_x` counts cycles since the idle hs pulse; the idle DE window sits at `i_x [214, 533]`
+  (measured in sim, not assumed). `i_safe = (i_x < 215) || (i_x > 533)` — landing there means
+  the idle remainder of the transition line is exactly 0 or a full 320 DE cycles.
+- `pulse_safe` uses one-cycle-delay copies of the idle pulses (geometry-free glue guard).
+- The game side of the transition line is suppressed (DE and RGB forced to 0) until the next
+  game hs, so that line carries exactly what the idle remainder had: one blank line in the
+  first game frame instead of a mixed pixel count.
+- Liveness: `i_safe` holds ~504 consecutive cycles every line and the pulse guard can block at
+  most two of them, so the switch always resolves within one line.
+
+### Bug found by the new bench: a dropped latch (and why the build report matters)
+
+The first green run never came because an edit had silently dropped the
+`always @(posedge clk_core) if (switch_now) video_sel_r <= 1'b1;` block, leaving `video_sel_r`
+undriven. Verilator elaborated it as constant 0 with no warning under `-Wno-fatal -Wno-lint`,
+so the mux flickered game/idle every line and the monitor reported "line carried 319 DE
+cycles" on one drifting line per frame (319 = exactly the width of the unsafe `i_x` window —
+the fingerprint that the excluded region itself was being output). **Quartus had warned about
+it** ("object video_sel_r used but never assigned" in `aw.map.rpt`); the lesson is to scan
+synthesis warnings, not just success/failure. Restored the latch; everything went green.
+
+### Gate results (current tree)
+
+| step | command | result |
+|---|---|---|
+| synthesis | `DETACH=1 RUN_NAME=aw-build ./docker/run.sh scripts/build.sh cores/aw --jobs 16` | rc=0, Fitter Successful |
+| timing | from that build | worst setup **+1.261 ns** (PSRAM domain), hold +0.301, TNS 0.000 all corners |
+| utilisation | from that build | **3,583 ALMs / 18,480 (19 %)**; RAM 35 % unchanged |
+| full core | `make sim-top` (`tb_top`) | **all checks passed -> PASS** (idle palette, APF protocol clean across the mux switch with 0 phase-jump frames, pack→rom_ready, Reset Exit, host status, audio rates) |
+| write path | `scripts/sim_write.sh` | PASS (make sim reached later targets) |
+| controller map | `scripts/sim_keys.sh` | PASS (ditto) |
+| ROM path | `scripts/sim_rom.sh` | 505 checks, 0 errors -> PASS |
+| IV path | `scripts/sim_iv.sh` | 24 accesses, 0 X cycles -> PASS |
+| reset gen | `scripts/sim_reset.sh` | all checks passed -> PASS |
+| SoC + protocol | `scripts/sim_soc.sh` (part1) | 95 frames, 82 non-black, 78 rich -> PASS, **zero APF protocol violations** |
+
+The transition frame landed on a clean raster boundary in this run (0 phase-jump frames);
+the check accepts 0 or 1 because the offset is set by pack-load duration and is not
+deterministic across boots.
+
+Still open: no Pocket has run this core yet; frame-level parity against the reference at a
+matched game tick (task #20) and the effective data-slot rate on device (task #18's gate)
+remain unmeasured — both are bring-up-kit steps, not simulation gaps.
+
+## 2026-10-29: read of `analogue-pocket-utils/mem/psram.sv` — the read bug was the byte enables
+
+Nine hardware builds of silent reads, and the answer was in the known-good driver the whole
+time. Diffed `aw_psram.v` against `ip/mem/psram.sv` from
+[agg23/analogue-pocket-utils](https://github.com/agg23/analogue-pocket-utils) (MIT) — same
+cellular-RAM part, same Pocket mainboard, in users' hands as cartridge save RAM — and found
+four real defects, one of which explains every address-echoing readback since build 1027.
+
+**1. `UB#`/`LB#` are output enables, and reads never asserted them (the bug).** The reference
+asserts both byte enables on the *read* branch too, held from the ADV# edge through the
+capture. Ours asserted them only for writes. On this family of parts OE# low with both
+enables high is *output deselect*: the part obeys the address and drives nothing. A floating
+DQ keeps whatever was last driven on it, and the last thing driven is always the address, so
+every read returned its own address — which is precisely what the self-test reported
+(`T=f000`, `D=0000`) on every address, both dies, and every read timing tried. It was never a
+timing problem, which is why no amount of re-timing changed it. Reads now assert both enables
+on the same edge as CE# and the address and hold them to the capture; `aw_psram_model` now
+models per-byte output deselect, so a controller that forgets them fails 510 checks in
+simulation instead of passing all of them.
+
+**2. The reference does *not* sample at ~75 ns, and the comment that said it does was the
+reason a too-fast read looked validated.** Our notes recorded "the known-good reference
+samples at ~75 ns with OE# low ~45 ns". It does not: its read states run from
+`READ_INITIAL_COUNT = 20` to `STATE_READ_DATA_RECEIVED = 20 + TOTAL_READ_CYCLE_COUNT = 30`,
+so it samples **thirty** cycles (225 ns at 133.12 MHz) after ADV# and holds OE# low eight of
+them (~60 ns). Believing the bad number is what made seven cycles (75.4 ns) look like proven
+practice. Worse, seven cycles was a violation even at 70 ns: the capture at sequence edge N
+only asks the part for `N x 10.77 − 12` ns once this fabric's measured 7.4 ns clock-to-pin on
+the cram0 outputs, ~1 ns of trace each way and ~2.5 ns of capture setup are counted — so the
+seven-cycle read asked 63 ns of a part whose budget starts at 70, and STA cannot see it
+because there is no clock at the part. Reads now run twelve cycles: ~117 ns of window at the
+chip's pins against a 70 ns maximum, OE# low ~86 ns (more than the reference's proven 60 ns).
+Writes stay at seven cycles — nothing is sampled there, so the clock-to-pin cancels, and the
+upload drain needs the rate.
+
+**3. A stale prefetch used to lock the read bus (`aw_rom`'s pop gate).** `pop` in C_RUN asked
+`~n_v` instead of `~n_keep`. A seek leaves the prefetch register holding a word from the
+search, so the reader entered C_RUN with `n_v=1` pointing at the wrong address: no pop could
+be issued, nothing could land, no handoff could happen, and a fill rewound with 32 perfectly
+good words sitting in the FIFO behind it. Invisible while the producer was accidentally
+near-matched to the consumer's rate; fatal the moment a read cost 140 ns. A prefetch you
+cannot use is the same as no prefetch — which is already the condition the landing handler
+uses to replace it.
+
+**4. The prefill gate was keyed to the wrong readiness signal.** `prefill_ok` tested `inr[0]`
+(the VM's `in_ready`) with `chk_active` exempted, but the boot check's readiness is `chk_cnt`,
+not `inr[0]` — so the check saw "host not ready", skipped the prefill, served byte 0 from a
+drained FIFO, could not have word 1 two core cycles later, and rewound into the same
+`chk_data` shift register forever: `rom_ready` never rose no matter how correctly the chip
+answered. It now gates on `host_rdy`, whoever is asking. The reader's own ceiling is a pop
+every two core cycles (the FIFO read is registered, `pend` is a register), so with one chip
+access at 140 ns the buffer is not a margin, it is the entire mechanism; both comments now
+say so with the arithmetic.
+
+**Testbench defects found on the way** (`tb_iv_check`, the four-state contention bench):
+`st_cfg` was left unconnected, so `(st_cfg == 2'd2)` was undefined and propagated X into
+`CE0#`/`CE1#` — the model saw an unselected chip and drove nothing, so the bench was testing
+nothing. Its stimulus also raced the design: blocking assignments from a process woken by
+`@(posedge clk)` are sampled in arbitrary order, and it showed up as the model latching one
+access's address with the *next* access's write data. Both fixed (tie `st_cfg`, drive with
+nonblocking assignments), phase 1's payload now advances on the handshake rather than on a
+fixed six-cycle step that skipped requests, and phase 2 now drops `rd_req` on the take instead
+of one edge late, which had been issuing a duplicate read per iteration. Tag equality is
+checked, not just data.
+
+### Gate results (this tree)
+
+| step | result |
+|---|---|
+| `scripts/sim_write.sh` | `rom_error=0 rom_ready=1, 0 errors -> PASS` |
+| `scripts/sim_rom.sh` | **510 checks, 0 errors -> PASS** (self-test now: normal `a5a5`, byte-lane `a55a`, other die `a5a5`, CRE `a5a5`, pack word 0 matches the file) |
+| `scripts/sim_iv.sh` (Icarus, four-state) | **24 accesses, 0 X cycles on DQ -> PASS**, tags checked |
+| `scripts/sim_keys.sh` | 13 checks, 0 errors -> PASS |
+| `scripts/sim_reset.sh` | all checks passed -> PASS |
+| `scripts/sim_dbg.sh` | PASS (boot tag `AW 1035a up`) |
+| `scripts/sim_soc.sh` (part1) | 95 frames, 79 non-black, 75 rich (best 9 colours) -> PASS, SEGOFFSETS correct |
+| `make sim-top` (`tb_top`) | all checks passed -> PASS |
+| Quartus (build 1035a) | clean: worst setup **+0.335 ns**, hold +0.143, pulse width +1.346, TNS 0.000 in every corner; **4,113 ALMs / 18,480 (22 %)**; `bitstream.rbf_r` sha256 `cab279d61af3a2df5ca6e72b12b855e77c5292b81486a6a74e26583a4ee51d64` |
+| `scripts/check_build.py` | ok no dead logic; **ok every SDC constraint matched something** (the new 332049 check — the cram0 bounds had been silently dropped in every previous build) |
+
+Self-test probe B was repurposed: "byte enables held low through the read" is no longer a
+hypothesis worth testing on hardware (it is how the part works), so B now writes the scratch
+word **with only the low byte enabled** on top of probe A's `A5A5` and expects `A55A` — the
+only readback that proves the write mask masks, which the loader depends on for every
+upload entry that straddles a word boundary. CHK line format is unchanged:
+`C<err>:<32 hex> <match>/<all> S<status> D<d> B<b> N<n> R<r> P<p>`, expected `a5a5 a55a a5a5
+a5a5 <pack0>`.

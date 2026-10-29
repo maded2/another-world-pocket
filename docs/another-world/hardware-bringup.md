@@ -1,8 +1,7 @@
 # Hardware bring-up kit
 
-Written now, executed on a device. Everything currently green is Verilator plus a Quartus compile;
-**no result in this project has ever been observed on a Pocket.** This is the list to run the first
-time the bitstream goes on a card, in order, with what each step proves and what its failure means.
+Written now, executed on a device. This is the list to run the first time the bitstream goes on a
+card, in order, with what each step proves and what its failure means.
 
 `scripts/hw-bringup.sh` prints this sequence with a worksheet to fill in.
 
@@ -22,6 +21,24 @@ time the bitstream goes on a card, in order, with what each step proves and what
 The unknowns that can stop the core working are: the real bridge write rate, loader/VM contention on
 `cram0`, and whether the scaler/OSD accept what we generate. None of them can be simulated honestly.
 
+## Root causes found on hardware (do not regress these)
+
+**1. Missing Chip32 VM loader (2026-10-15).** The OS's "File: Load ... Slot: load done" only stages
+the file in *host* memory; the bytes cross the bridge only when a declared
+`core.framework.chip32_vm` program calls `loadf`. Ours declared none, so every "successful" load
+moved zero bytes (debug grid: `wr_match=0`, total bridge writes < 65536 = command traffic only).
+Fix: `cores/aw/support/loader.asm` → `loader.bin` (`make loader`), declared in `core.json`, copied
+by the packager. The PSRAM protocol was never at fault here.
+
+**2. Load path held in reset during the load (2026-10-17).** With the loader in place, the boot log
+showed the full sequence: `CORE` → bitstream, `LOADF` → "File: LOADF Long Start", *then* Run →
+**Reset Exit**. The OS streams the pack while still holding the core in reset. But
+`rst_bridge = ~reset_n | ~pll_locked`, so bridge acceptance, the FIFO, the drain and the debug
+counters were all in reset for the entire transfer - every byte discarded, same red screen.
+The known-good SNES `data_loader` has no reset input at all for exactly this reason. Fix:
+`aw_reset_gen.v` - the load path resets on PLL lock only; `reset_n` gates the game
+(`design_run`) and nothing else. `tb_reset_gen` pins the ordering down.
+
 ## Screen legend (the core already reports its own state)
 
 Before `rom_ready`, the core drives the same 825×500 timing as the game and shows one of four things
@@ -33,11 +50,66 @@ Before `rom_ready`, the core drives the same 825×500 timing as the game and sho
 | **white blinking block, centre** | alive, waiting for a pack | data slot wiring, `data.json` slot address, did the OSD load a file |
 | **red** | `ERR_TRAILER` — the offsets at `len−16` are not a pack | wrong/renamed file, truncated copy, `size` smaller than 2 MiB−16 |
 | **purple** | `ERR_OVERFLOW` — bridge wrote faster than the chip accepted | `cram0` timing/contention; see symptom table below |
-| **amber** | `ERR_WAIT` — the chip never accepted anything | PSRAM clocking/WAIT path; nothing downstream can work |
+| **amber** | `ERR_WAIT` — no longer reachable in this build: WAIT is not read and the chip's CLK pin is held low (async mode, see below) | if it ever appears again, the bitstream on the card is not the one you think it is |
 | intro picture | loaded, booted, rendering | — |
+
+**Expected one-time glitch:** the frame that straddles the idle→game mux switch may contain one
+blank line (the switch suppresses the game side of its own line so the transition line carries a
+legal DE count — see the 2026-10-25 port-log entry). It happens once, at boot, and is not a bug.
+
+**PSRAM protocol (what this build assumes about the chip):** async mode — `cram0_clk` held low,
+`cram0_wait` never read. The fitted part idles WAIT high and its known-good neighbours ignore it;
+two amber runs (2026-10-10/11) came from treating it as a handshake. The access sequence is timed
+on the PLL's 82.5 MHz output in `aw_psram.v` (6 cycles = 72.7 ns per access, matching the
+datasheet's ~70 ns budgets). Writes chain back-to-back on their release edge (the part never
+drives DQ during a write) so the drain sustains ~27.5 MB/s — above the pace-10 model load of
+24.75 MB/s with margin. Reads do NOT chain: every read parks one idle cycle after cleanup,
+matching the reference's gap between all accesses, which is what lets the part finish releasing
+DQ (tOE) before the next address appears. That costs one cycle per read (84.9 ns/word, just over
+the reader's 80.8 ns budget); the reader's late-handoff/seek path absorbs it.
+
+**The red screen is a debugger.** On ERR_TRAILER it renders the sixteen bytes the last trailer
+check read back as a bit grid (one column per byte, top bit = MSB; columns left→right are
+chk_data[7:0] … [127:120], so the first four columns are offset 0). A constant pattern
+everywhere means the chip never answered (DQ floating); a pattern that changes between the ~84 ms
+retries means marginal timing; plausible-but-wrong offsets mean address corruption. If the chip
+does not respond at all, suspect pin assignments (`cram0_clk` G10, `cram0_wait` K7), the
+async-mode assumption itself (try driving `psram_clk` from `clk_psram` — one-line change in
+`aw_psram.v`), or the CE# die-select mapping.
 
 Error codes are sticky once latched, so a colour that appears briefly and is then replaced by the
 game is still a real event worth writing down.
+
+## Debug channels beyond the screen
+
+The screen legend answers "what state is the core in". These answer "where exactly".
+
+**1. Debug-key UART console (devkit only).** The core logs short lines at 115200 8N1 on the
+cartridge bus: TX on pin 3 (`cart_tran_bank0[6]`), activity LED on pin 4 (`bank0[5]`) — the
+wiring of the Analogue devkit debug key (agg23/analogue-pocket-utils, `debug_key.v`). Lines:
+core up, pack loaded, ROM error codes, menu in/out. It needs cart power, which is why
+`core.json` carries `cartridge_adapter: 0`; a core without the dev key pays a little idle
+power for that flag, and we keep it because this console is the difference between "no sync at
+all" and "alive, waiting, here is why" when the screen gives no answer. If you have the
+devkit, capture it (`scripts/capture_serial.py` exists for the breakout; the key's SI2104 is a
+plain USB-UART at 300 bps–2 Mbps) and read the log before touching anything else.
+
+**2. SignalTap.** A session already lives in the core (`src/fpga/core/stp1.stp`, instance
+`auto_signaltap_2`); it needs an Intel-approved USB Blaster (Terasic P0302 works). Two things
+from the community wiki that matter for this core specifically:
+* *Tools → Developer → **Pause Core Boot*** halts boot until a button press, and ***Pause Data
+  Load*** halts data-slot loading. Our boot order streams the pack while the core is still held
+  in reset (root cause #2 above), so anything you want to catch on the load path — bridge
+  acceptance, FIFO levels, the drain FSM, `rom_error` before it latches — is only catchable
+  with one of these pauses armed. Without them the interesting part happens in the first second.
+* Multiple debugger instances can be saved in one design; and changing *which nets trigger*
+  (not the AND/OR mode) does not require a recompile, so iterate on triggers between flashes.
+
+**3. If no core produces any video.** Our stream cannot put vsync inside hsync (sim-enforced:
+vs at x=0, hs at x=3, one cycle each), but older arcade cores have done exactly that and on
+current firmware it hard-crashes the scaler so badly that *no* core shows video afterwards.
+If after a failure even known-good cores are black: fully restart the Pocket (power cycle),
+then re-test. Do not spend an evening on our bitstream first.
 
 ## Bring-up sequence
 
@@ -45,11 +117,16 @@ game is still a real event worth writing down.
 the core.
 *Expect:* the white blinking block, stable, no rolling.
 *Proves:* bitstream loads, PLL locks, the video pins and `video.json` agree well enough to sync.
-*If not:* nothing below is reachable. Check the zip layout (`Cores/EddieChan.AnotherWorld/`), then
+*If not:* nothing below is reachable. Check the zip layout (`Cores/Eddie Chan.Another World/` — folder must match author.shortname in core.json exactly, spaces included), then
 `video.json`'s single 320×200 scaler mode.
 
 **2. Load `part1.bin` (the intro) and time it.** Use the OSD data-slot pick. Start timing when you
-confirm the file, stop at the first game picture.
+confirm the file, stop at the first game picture. **Do not test with part0**: its content is only
+the opening credits ("IBM PC VERSION / BY / DANIEL MORAIS" on black), after which the VM idles -
+and on hardware it has been observed rendering a white screen with dark blocky glyphs that matches
+no reference frame (2026-10-17, unexplained; see the root-causes section). part1 is the real test:
+the golden reference (`make ref-sim PART=.../part1.bin`) shows the hero in a doorway at ~1 min and
+the green "I see you have driven here in your Ferrari" / IDENTIFICATION scene at ~2 min.
 *Expect:* intro within a couple of seconds; definitely under the declared `timeout_ms` 30000.
 *Proves:* the bridge, the `0180 Data slot read` path, `cram0` writes at real rates, the boot check,
 and the trailer, all on hardware.
@@ -104,11 +181,11 @@ nothing tries to use it.
 
 | symptom | reading | action |
 |---|---|---|
-| purple screen during load | bridge outran the chip: write pulses arriving with `WAIT` not honoured at real speed | check `cram0` timing constraints and the WAIT handling; note the pace at which it appears |
+| purple screen during load | bridge outran the drain: the FIFO filled because the chip accepted slower than the model assumes | the drain is 26.8 MB/s by construction (145.5 ns per word); if the real chip needs more than that per access, the protocol in `aw_psram.v` is too fast for it — add cycles to the write window and re-sim |
 | load OK, then stutter during play | VM reads competing with remaining bridge writes | measure how long the bridge stays active; this is the case task #18 (direct random access instead of the byte stream) was deferred for lack of |
 | load OK then hang at a fixed frame | VM waiting on data that never arrives | deterministic → data/protocol; capture the frame number and compare to sim |
 | hang at varying frames | marginal timing | re-check STA corners, then reduce `cram0` clock or add margin |
-| amber from power-on | PSRAM WAIT path never released | clock plan, not the loader |
+| (amber is unreachable now) | — | see the protocol note in the screen legend |
 
 ## Telling loader starvation from a VM hang
 
