@@ -4,19 +4,13 @@
         "data_slots": [
             {
                 "name": "Another World pack",
-                "filename": "{osd_origin}/{osd_filename}",
+                "id": 0,
+                "required": true,
+                "parameters": "0x109",
                 "extensions": [
                     "bin"
                 ],
-                "address": "10000000",
-                "size": "00200000",
-                "ways": 1,
-                "onlaunch": {
-                    "priority": 1,
-                    "address": "10000000",
-                    "timeout_ms": 30000
-                },
-                "savestate_supported": false
+                "address": "0x10000000"
             }
         ]
     }

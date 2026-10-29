@@ -100,3 +100,21 @@ obj_*/
 # Same rule as ports/another-world/probe/build.v: it is generated output, and the
 # probe's run script regenerates it.
 ports/**/gen/
+
+# --- bring-up scratch that is not source --------------------------------------
+# Stray build logs (scripts/build.sh writes its log under build/, so anything at
+# the repo root is a manual redirect that outlived the run it described).
+/build*.log
+# Packs staged for packaging: derived from the user's own game files (17 MB of
+# licensed binaries the extractor drops here). Regenerate with scripts/make_packs.
+cores/aw/dist/
+# The Chip32 loader image is assembled from cores/aw/support/loader.asm by
+# `make loader` (scripts/build_loader.sh); the .asm is the source, the .bin is
+# output that package_core.py copies into the SD tree.
+cores/*/loader.bin
+# Superseded per-build SD installers. Each one guarded the exact SHA of the bit
+# it was written for, so they are useful while a build is live and dead weight
+# afterwards; the running record of what each build tested is docs/another-world/
+# port-log.md. The current installer stays tracked.
+scripts/sd_install_102*.sh
+scripts/sd_install_103[0-4]*.sh

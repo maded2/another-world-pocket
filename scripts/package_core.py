@@ -46,7 +46,9 @@ CORE_FILES = [
     "interact.json", "variants.json", "video.json", "info.txt",
 ]
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-ID_RE = re.compile(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_\-]+$")
+# Spaces allowed between words: the Pocket indexes cores by the metadata name
+# (author.shortname, spaces preserved) and builds the launch path from it.
+ID_RE = re.compile(r"^[A-Za-z0-9_]+(?: [A-Za-z0-9_]+)*\.[A-Za-z0-9_\-]+(?: [A-Za-z0-9_\-]+)*$")
 REVERSE_TABLE = bytes(int("{:08b}".format(i)[::-1], 2) for i in range(256))
 
 
@@ -80,10 +82,16 @@ def load_json(path, report, required=False):
 
 
 def derive_core_id(core_dir, core_cfg, report):
-    """Pocket core folders are Author.CoreName with the spaces squeezed out."""
+    """The Pocket core folder must be exactly author.shortname as written in core.json.
+
+    Pocket OS builds the launch path from the metadata, not the folder name: on OS 2.7 a
+    folder named EddieChan.AnotherWorld (author 'Eddie Chan', shortname 'Another World')
+    was indexed and launched as '/Cores/Eddie Chan.Another World/core.json' and failed to
+    load. Spaces are preserved - cf. the working cjchand.Mattel Football core.
+    """
     md = core_cfg.get("core", {}).get("metadata", {})
-    author = re.sub(r"\s+", "", md.get("author") or "Author")
-    short = re.sub(r"\s+", "", md.get("shortname") or core_dir.name)
+    author = (md.get("author") or "Author").strip()
+    short = (md.get("shortname") or core_dir.name).strip()
     candidate = "{}.{}".format(author, short)
     if not ID_RE.match(candidate):
         report.warn("derived core id '{}' looks unusual; pass --id Author.CoreName "
@@ -285,7 +293,11 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
         for i, s in enumerate(slots):
             if not isinstance(s, dict):
                 report.error("data_slots[{}] must be an object".format(i)); continue
-            for key in ("name", "filename", "extensions", "address", "size"):
+            # filename/size are optional: the working agg23.SNES cartridge slot has
+            # neither, and a placeholder filename is actively harmful (the OS checks it
+            # literally and never scans the directory - see docs/another-world/
+            # pocket-metadata.md). Only name/extensions/address are load-bearing.
+            for key in ("name", "extensions", "address"):
                 if key not in s:
                     report.warn("data_slots[{}]: no '{}' - verify against the Analogue "
                                 "data slot spec on hardware".format(i, key))
@@ -293,11 +305,13 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
             if isinstance(exts, list) and not exts:
                 report.error("data_slots[{}]: extensions is empty - no file would match"
                              .format(i))
+            # Both hex styles appear in released cores (SNES writes "0x10000000",
+            # others write "10000000") and both load on hardware - accept both.
             for key in ("address", "size"):
                 val = s.get(key)
-                if isinstance(val, str) and not re.match(r"^[0-9a-fA-F]+$", val):
+                if isinstance(val, str) and not re.match(r"^(0x)?[0-9a-fA-F]+$", val):
                     report.error("data_slots[{}].{!r} is {!r}; expected a hex string "
-                                 "without 0x".format(i, key, val))
+                                 "(with or without 0x)".format(i, key, val))
 
     # variants.json: the list the OSD offers the user. core.cores[] above is the
     # *bitstream* list; these are different lists and both need unique ids.
@@ -375,6 +389,23 @@ def package(core_dir, out_dir, core_id=None, bitstream=None,
             shutil.copy2(str(src), str(dest / name))
             copied += 1
     report.ok("{}/ <- {} definition file(s)".format(cid, copied))
+
+    # A declared Chip32 VM program (core.framework.chip32_vm) is the piece that
+    # streams the data-slot file across the bridge (loadf). The OS happily logs
+    # "Slot: load done" without it - the bytes just never leave host memory - so
+    # a missing artifact packages a core that can never boot on real hardware.
+    framework = cfg.get("core", {}).get("framework", {}) or {}
+    for key in ("chip32_vm",):
+        fname = framework.get(key)
+        if not fname:
+            continue
+        src = core_dir / fname
+        if not src.is_file():
+            report.error("core.framework.{} declares {} which does not exist "
+                         "(run make loader)".format(key, fname))
+            continue
+        shutil.copy2(str(src), str(dest / fname))
+        report.ok("{}/{} <- {} ({})".format(cid, fname, src, key))
 
     # Every filename declared in core.cores[] has to be backed by its own real
     # artifact. Writing the one supplied bitstream under all of them packages a

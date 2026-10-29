@@ -756,6 +756,9 @@ set_global_assignment -name VERILOG_FILE core/aw_fifo.v
 set_global_assignment -name VERILOG_FILE core/aw_keys.v
 set_global_assignment -name VERILOG_FILE core/aw_psram.v
 set_global_assignment -name VERILOG_FILE core/aw_rom.v
+set_global_assignment -name VERILOG_FILE core/aw_reset_gen.v
+set_global_assignment -name VERILOG_FILE core/dbg_uart_tx.v
+set_global_assignment -name VERILOG_FILE core/dbg_console.v
 set_global_assignment -name SYSTEMVERILOG_FILE core/aw_pocket_build.v
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to bridge_1wire
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to bridge_spiclk
