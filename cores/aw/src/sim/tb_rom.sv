@@ -134,12 +134,18 @@ module tb_rom;
     int     pace = 10;          // idle bridge cycles between writes
     bit     tripwire = 0;
 
+    // d is little-endian (the byte belonging at address a is d[7:0]); the APF wire
+    // carries that byte at [31:24] for a core declaring bridge_endian_little = 0, the
+    // mapping analogue-pocket-utils' data_loader.sv is tested with. Modelling the wire
+    // here is what keeps the design honest: while both sides assumed little-endian the
+    // whole pack was stored byte-reversed inside every 32-bit entry and every test
+    // passed - hardware found it (PSRAM word 0 = 16'he700 for file bytes 04 00 e7 00).
      task automatic bridge_write32(input [31:0] a, input [31:0] d);
     begin
         @(negedge clk_bridge);
         bridge_wr      <= 1'b1;
         bridge_addr    <= a;
-        bridge_wr_data <= d;
+        bridge_wr_data <= {d[7:0], d[15:8], d[23:16], d[31:24]};
         @(negedge clk_bridge);
         bridge_wr      <= 1'b0;
         repeat (pace) @(negedge clk_bridge);
@@ -173,7 +179,8 @@ module tb_rom;
             for (i = 0; i < words; i = i + 1) begin
                 bridge_wr      <= 1'b1;
                 bridge_addr    <= 32'h10000000 + i*4;
-                bridge_wr_data <= {ref_mem[i*4+3], ref_mem[i*4+2], ref_mem[i*4+1], ref_mem[i*4]};
+                // wire order: byte at address i*4 rides at [31:24] - see bridge_write32
+                bridge_wr_data <= {ref_mem[i*4], ref_mem[i*4+1], ref_mem[i*4+2], ref_mem[i*4+3]};
                 @(negedge clk_bridge);
                 if (rom_error === 2) begin
                     bridge_wr <= 1'b0;

@@ -265,6 +265,14 @@ reg design_run = 1'b0;
     integer   errors = 0;
     reg       s1_pass = 1'b0;   // decides the process exit status, not just the printed verdict
 
+    // d is little-endian (the byte belonging at address a is d[7:0]); the APF wire puts
+    // that byte at [31:24] for a core declaring bridge_endian_little = 0, so the word is
+    // reversed on the way out. This is the mapping data_loader.sv in
+    // analogue-pocket-utils is tested with, and the one build 1035a measured on hardware
+    // (file bytes 04 00 e7 00 landed in PSRAM word 0 as 16'he700 with the little-endian
+    // reading). Bench and design must not agree with each other and disagree with the
+    // framework: while both took the payload little-endian, every byte of a real pack
+    // was stored reversed inside its 32-bit entry and this bench still passed.
     task automatic wr32(input [31:0] a, input [31:0] d);
         begin
             // WR high for exactly one cycle, then pace cycles of quiet. Leaving WR high
@@ -274,7 +282,7 @@ reg design_run = 1'b0;
             @(negedge clk_bridge);
             dataslot_wr    <= 1'b1;
             dataslot_addr  <= a;
-            dataslot_wdata <= d;
+            dataslot_wdata <= {d[7:0], d[15:8], d[23:16], d[31:24]};
             @(negedge clk_bridge);
             dataslot_wr    <= 1'b0;
             repeat (pace)  @(negedge clk_bridge);

@@ -71,9 +71,16 @@ module tb_write;
     // what was written, so the comparison is against intent and not against the model
     reg [7:0] want [0:NBYTES-1];
 
+    // d is little-endian: the byte that belongs at address a is d[7:0]. The APF wire
+    // is the other way round - the lowest-address byte rides at [31:24], because this
+    // core declares bridge_endian_little = 0 (cf. analogue-pocket-utils data_loader.sv,
+    // whose test maps 32'hAABBCCDD at address C to C<-AA). The swap belongs here, in
+    // the model of the framework, not in the design's idea of itself: when the bench
+    // and the design assume the same wrong order, a byte-reversed pack passes sim.
     task wr32(input [31:0] a, input [31:0] d);
     begin
-        @(negedge clk_bridge); bridge_wr <= 1; bridge_addr <= a; bridge_wr_data <= d;
+        @(negedge clk_bridge); bridge_wr <= 1; bridge_addr <= a;
+        bridge_wr_data <= {d[7:0], d[15:8], d[23:16], d[31:24]};
         @(negedge clk_bridge); bridge_wr <= 0;
         repeat (6) @(negedge clk_bridge);
     end

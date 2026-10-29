@@ -275,7 +275,7 @@ module tb_dbg_console;
 
         // out of reset: boot tag (build id; the device build re-sends it every ~2 s).
         // want_len is chars + 1 (the \n), like every other call in this bench.
-        recv_line("AW 1035a up\n", 12);
+        recv_line("AW 1036a up\n", 12);
 
         // pack loaded, then game running.
         // Events are level-latched by the console every cycle they are high, so
@@ -315,7 +315,7 @@ module tb_dbg_console;
         c_rst_n = 1'b0;
         repeat (5) @(posedge clk);
         c_rst_n = 1'b1;
-        recv_line_c("AW 1035a up\n", 12);
+        recv_line_c("AW 1036a up\n", 12);
         // C<err>:<32 hex chk> W<match>/<all> S<status> - the loader counters
         recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678\n", 90);
 

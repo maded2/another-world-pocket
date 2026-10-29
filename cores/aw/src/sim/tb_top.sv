@@ -258,6 +258,18 @@ module tb_top;
         end
     endtask
 
+    // A data-slot write, where d is little-endian (the byte belonging at address a is
+    // d[7:0]). The APF wire carries that byte at [31:24] for a core declaring
+    // bridge_endian_little = 0 - the mapping data_loader.sv in analogue-pocket-utils is
+    // tested with, and the one 1035a measured on hardware. Host COMMANDS at 0xF8000000
+    // keep their own convention (core_bridge_cmd applies the same rule to both of its
+    // ports), so bridge_write above stays unsalted and only the data path swaps.
+    task slot_write32(input [31:0] a, input [31:0] d);
+        begin
+            bridge_write(a, {d[7:0], d[15:8], d[23:16], d[31:24]});
+        end
+    endtask
+
     task bridge_read(input [31:0] a, output [31:0] d);
         begin
             @(negedge clk_74a);
@@ -390,13 +402,13 @@ module tb_top;
             check("UART idle before pack write (no console traffic pending)", idle);
         end
 
-        bridge_write(32'h101FFFE0, 32'h0000_0000);   // off0 = 0
+        slot_write32(32'h101FFFE0, 32'h0000_0000);   // off0 = 0
         repeat (10) @(posedge clk_74a);
-        bridge_write(32'h101FFFE4, 32'h0000_2000);   // off1 = 8192
+        slot_write32(32'h101FFFE4, 32'h0000_2000);   // off1 = 8192
         repeat (10) @(posedge clk_74a);
-        bridge_write(32'h101FFFE8, 32'h0000_1000);   // off2 = 4096
+        slot_write32(32'h101FFFE8, 32'h0000_1000);   // off2 = 4096
         repeat (10) @(posedge clk_74a);
-        bridge_write(32'h101FFFEc, 32'h0000_4000);   // off3 = 16384
+        slot_write32(32'h101FFFEc, 32'h0000_4000);   // off3 = 16384
 
         $display("tb_top: trailer written; waiting for the quiet timer + boot check");
         begin : wait_ready

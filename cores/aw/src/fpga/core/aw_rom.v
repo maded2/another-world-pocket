@@ -228,6 +228,21 @@ module aw_rom (
     // {word address, byte 0..3} and the byte offset inside the word is ld_q[33:32].
     wire [20:0] ld_baddr = ld_q[LWIDTH-1 -: 21];
     wire [31:0] ld_data  = ld_q[31:0];
+    // The APF bridge carries the byte destined for the LOWEST address in the MOST
+    // significant byte of the 32-bit write. That is the declaration this core makes -
+    // core_top ties bridge_endian_little = 0, the template default - and the proven
+    // loader in analogue-pocket-utils (ip/data_loader.sv, whose own test runs with
+    // bridge_endian_little = 0) maps bridge_wr_data = 32'hAABBCCDD at address C to
+    // C<-AA, D<-BB, E<-CC, F<-DD. Hardware confirms it: on build 1035a the first word
+    // of part1.bin (bytes 04 00 e7 00) read back from PSRAM word 0 as 16'he700, and
+    // the trailer came back as offsets like 3551396608 - the bytes of 0x0003aed3 in
+    // the wrong order. Taking the payload little-endian, as this did until then, put
+    // every entry's four bytes in reverse while leaving the entries at the right
+    // addresses: a whole pack of corrupt data that no simulation could see, because
+    // the benches had been feeding the design the order it assumed. See the note in
+    // the testbenches' bridge-write tasks - the wire order is now modelled there.
+    wire [31:0] ld_wire  = {ld_data[7:0], ld_data[15:8],
+                            ld_data[23:16], ld_data[31:24]};
     wire [1:0]  ld_ba    = ld_q[33:32];
 
     // Only overflow aborts the drain. A trailer that does not make sense must NOT:
@@ -349,7 +364,7 @@ module aw_rom (
     wire [19:0] ld_w0    = ld_baddr[20:1];                 // word holding byte 0
     wire [20:0] d_byaddr = ld_baddr + {19'd0, d_step};     // this byte's address
     wire        d_lane   = d_byaddr[0];
-    wire [7:0]  d_byte   = ld_data[{d_step, 3'd0} +: 8];   // payload byte d_step
+    wire [7:0]  d_byte   = ld_wire[{d_step, 3'd0} +: 8];   // payload byte d_step
     // 1 = write that lane. An aligned whole word is therefore 2'b11, not 2'b00: the
     // first version used 00 here, which with ub_n/lb_n = ~be disabled both lanes and
     // so wrote nothing at all, while every read still looked correct.
@@ -357,7 +372,7 @@ module aw_rom (
     wire [21:0] d_addr   = d_odd ? {2'b00, d_byaddr[20:1]}
                                 : {2'b00, ld_w0 + {19'd0, d_step[0]}};
     wire [15:0] d_wdata  = d_odd ? (d_lane ? {d_byte, 8'h00} : {8'h00, d_byte})
-                                : (d_step[0] ? ld_data[31:16] : ld_data[15:0]);
+                                : (d_step[0] ? ld_wire[31:16] : ld_wire[15:0]);
     wire        d_last   = d_odd ? (d_step == 2'd3) : (d_step == 2'd1);
 
     // ================================================================ selftest ===
