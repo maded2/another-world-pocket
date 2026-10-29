@@ -233,15 +233,15 @@ assign port_ir_rx_disable = 1;
 // bridge endianness
 assign bridge_endian_little = 0;
 
-// cart is unused, so set all level translators accordingly
-// directions are 0:IN, 1:OUT
+// cart is otherwise unused; directions are 0:IN, 1:OUT.
+// bank0 goes out on the debug console (debug key UART + LED) - see that section
+// below for the assign; it must not be driven here as well.
 assign cart_tran_bank3 = 8'hzz;
 assign cart_tran_bank3_dir = 1'b0;
 assign cart_tran_bank2 = 8'hzz;
 assign cart_tran_bank2_dir = 1'b0;
 assign cart_tran_bank1 = 8'hzz;
 assign cart_tran_bank1_dir = 1'b0;
-assign cart_tran_bank0 = 4'hf;
 assign cart_tran_bank0_dir = 1'b1;
 assign cart_tran_pin30 = 1'b0;      // reset or cs2, we let the hw control it by itself
 assign cart_tran_pin30_dir = 1'bz;
@@ -293,7 +293,6 @@ assign sram_we_n  = 1;
 assign sram_ub_n  = 1;
 assign sram_lb_n  = 1;
 
-assign dbg_tx = 1'bZ;
 assign user1 = 1'bZ;
 assign aux_scl = 1'bZ;
 assign vpll_feed = 1'bZ;
@@ -492,13 +491,16 @@ core_bridge_cmd icb (
 // Clocking and reset.
 //
 // clk_74a is the only clock a core is given. From it: 24.75 MHz for the design and
-// the pixels, its quadrature twin for the scaler, 49.5 MHz for the cellular PSRAM.
+// the pixels, its quadrature twin for the scaler, 92.8125 MHz for the PSRAM sequence.
 // See aw_pll.v for the ratios and for why this clock and not upstream's 25 MHz.
 //
-// Reset is staged on purpose. The bridge and the PSRAM come out first - the pack
-// has to be loadable while the game is held still - and the design itself only
-// leaves reset once rom_ready says a pack is there and its trailer made sense.
-// Starting the interpreter on an empty PSRAM would not only show garbage: it would
+// Reset is staged on purpose, and the two halves come out in a specific order that
+// hardware proved (2026-10-17): the LOAD path (bridge acceptance, FIFO, PSRAM drain,
+// trailer check) must be up as soon as the PLL locks, because the OS streams the pack
+// with `loadf` while still holding the core in reset - Reset Exit comes after the
+// transfer. The GAME only leaves reset once rom_ready says a pack is there and its
+// trailer made sense AND the host has released us. aw_reset_gen owns this ordering;
+// starting the interpreter on an empty PSRAM would not only show garbage: it would
 // run the VM off whatever the chip happened to contain, with the read path it uses
 // for everything else untested.
 //
@@ -507,7 +509,18 @@ core_bridge_cmd icb (
 
 wire clk_core, clk_core90, clk_psram, pll_locked;
 wire rom_ready;
-wire [1:0] rom_error;
+wire [1:0]  rom_error;
+wire [127:0] rom_chk_data;    // debug: last trailer readback, shown on the red screen
+wire [31:0]  rom_dbg_wr_match; // debug: host writes that passed the window filter
+wire [31:0]  rom_dbg_wr_all;   // debug: every bridge write seen
+wire [15:0]  rom_dbg_status;   // debug: {overflow, allc_seen, last_match[23:10]}
+// debug: PSRAM self-test matrix (see aw_rom) - a5a5 in D/B/N/R names the control
+// assumption that was wrong; P must read 0004 (part1) once reads work at all
+wire [15:0]  rom_selftest_die0;
+wire [15:0]  rom_selftest_be;
+wire [15:0]  rom_selftest_ceneg;
+wire [15:0]  rom_selftest_cre;
+wire [15:0]  rom_selftest_pack0;
 
 aw_pll u_pll (
     .reset_n    ( 1'b1     ),   // no dynamic reconfiguration in this core
@@ -525,23 +538,27 @@ synch_3 s_pll_locked (pll_locked, pll_locked_s, clk_74a);
 assign status_boot_done  = pll_locked_s;
 assign status_setup_done = pll_locked_s;
 
-// bridge-domain reset: the host's, or the PLL not being up yet
-wire rst_bridge = ~reset_n | ~pll_locked;
-
-// synchronous, stretched releases into each design clock, so nothing comes out of
-// reset on the same edge the PLL lock pin happens to tick
-reg [3:0] cnt_core, cnt_psram;
-reg       rst_core, rst_psram;
-
-always @(posedge clk_core) begin
-    cnt_core <= rst_bridge ? 4'd0 : ((cnt_core == 4'd15) ? cnt_core : cnt_core + 4'd1);
-    rst_core <= rst_bridge || (cnt_core != 4'd15);
-end
-
-always @(posedge clk_psram) begin
-    cnt_psram <= rst_bridge ? 4'd0 : ((cnt_psram == 4'd15) ? cnt_psram : cnt_psram + 4'd1);
-    rst_psram <= rst_bridge || (cnt_psram != 4'd15);
-end
+// The host's reset and the PLL lock pin, in the order hardware proved. See
+// aw_reset_gen.v for why reset_n must NOT touch the load path.
+//
+// rst_bridge drives bridge-domain logic, so it is derived from the SYNCHRONISED copy
+// of the lock pin (pll_locked_s), not the raw async output of the PLL: the raw pin
+// crossing clk_74a unsynchronised was exactly the single-bit CDC this design's own
+// rules forbid (the same signal already goes through s_pll_locked for status_boot_done,
+// and the host only starts writing after seeing that, so releasing the load path on
+// the same cycle is both safe and consistent).
+wire rst_bridge, rst_core, rst_psram, design_run;
+aw_reset_gen u_rstgen (
+    .clk_core   ( clk_core   ),
+    .clk_psram  ( clk_psram  ),
+    .pll_locked ( pll_locked_s ),
+    .reset_n    ( reset_n    ),
+    .rom_ready  ( rom_ready  ),
+    .rst_bridge ( rst_bridge ),
+    .rst_core   ( rst_core   ),
+    .rst_psram  ( rst_psram  ),
+    .design_run ( design_run )
+);
 
 // the game: clocks up, host happy, and a pack it can read
 //
@@ -558,7 +575,6 @@ end
 // wired to 0 inside the generated netlist. It is held off instead by aw_rom's vm_running
 // gate, which declines its requests until the pack is loaded - without that, the ROM streams
 // to a VM that has nothing to do with the data and the pack load reports ERR_OVERFLOW.
-wire design_run   = ~rst_core && rom_ready;
 wire design_reset = ~design_run;
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -625,7 +641,7 @@ localparam VID_H_TOTAL   = 825,
 // aw_rom's rom_error codes (its localparams, repeated here rather than exported)
 localparam ERR_TRAILER  = 2'd1,   // the offsets are there but are not a pack
            ERR_OVERFLOW = 2'd2,   // the bridge wrote faster than the chip took it
-           ERR_WAIT    = 2'd3;    // the chip has not accepted anything: see aw_psram
+           ERR_WAIT    = 2'd3;    // unreachable: WAIT is not functional on the fitted part
 
 reg  [9:0]  idle_x, idle_y;
 reg  [24:0] idle_blink;
@@ -642,6 +658,52 @@ wire in_block = (idle_x >= (VID_H_BPORCH + VID_H_ACTIVE/2 - 20))
              && (idle_y >= (VID_V_BPORCH + VID_V_ACTIVE/2 - 20))
              && (idle_y <  (VID_V_BPORCH + VID_V_ACTIVE/2 + 20));
 
+// The red screen is also a debugger. Cell pitch is 16 px with a 14 px mark, 16
+// columns x 12 rows = 256 x 192 in the 320 x 200 active area. Reading it off a
+// photo (a lit cell = a set bit):
+//
+//   rows 0-7  the sixteen bytes the last trailer check read back, one column per
+//             byte, top bit = MSB: columns left to right are chk_data[7:0] ...
+//             chk_data[127:120], so the first four columns are offset 0 (must be
+//             all dark), the next four offset 1, and so on. A constant pattern
+//             (every column identical) means the chip never answered; a pattern
+//             that changes between the ~84 ms retries means marginal timing;
+//             plausible-but-wrong values mean address corruption.
+//   rows 8-9  rom_dbg_wr_match, top row = [31:16], MSB left. A complete 2 MiB pack
+//             is 524284 words = 0x7FFEC, so a good load shows 0007 / FFEC.
+//   row 10    rom_dbg_wr_all[31:16]: host command traffic plus any writes that did
+//             NOT match the window filter. If rows 8-9 are zero but this is not,
+//             the bridge is alive and the address filter is wrong.
+//   row 11    {overflow, allc_seen, last_match_addr[23:10]}: cell 0 lit = the FIFO
+//             overflowed (bytes dropped), cell 1 lit = the host sent "all complete",
+//             cells 2-15 are where the last accepted write landed (a good load ends
+//             at 0x1FFEF0, which is all lit).
+wire [9:0] dbg_ax = idle_x - VID_H_BPORCH;
+wire [8:0] dbg_ay = idle_y - VID_V_BPORCH;
+wire       dbg_in_grid = (dbg_ax >= 10'd32) && (dbg_ax < 10'd288)
+                      && (dbg_ay >= 9'd4)   && (dbg_ay <  9'd196);
+wire [8:0] dbg_gx = dbg_ax - 10'd32;
+wire [8:0] dbg_gy = dbg_ay - 9'd4;
+wire [3:0] dbg_col = dbg_gx[7:4];
+wire [3:0] dbg_row = dbg_gy[7:4];
+wire       dbg_in_cell = (dbg_gx[3:0] < 4'd14) && (dbg_gy[3:0] < 4'd14);
+
+wire [7:0] dbg_byte = rom_chk_data[{dbg_col, 3'b000} +: 8];
+wire [3:0] dbg_bit  = 4'd7 - dbg_row;
+
+reg        dbg_set;
+always @(*) begin
+    if (dbg_row < 4'd8)           dbg_set = dbg_byte[dbg_bit];
+    else if (dbg_row == 4'd8)     dbg_set = rom_dbg_wr_match[31 - dbg_col];
+    else if (dbg_row == 4'd9)      dbg_set = rom_dbg_wr_match[15 - dbg_col];
+    else if (dbg_row == 4'd10)     dbg_set = rom_dbg_wr_all[31 - dbg_col];
+    else begin
+        if (dbg_col == 4'd0)       dbg_set = rom_dbg_status[15];
+        else if (dbg_col == 4'd1)  dbg_set = rom_dbg_status[14];
+        else                       dbg_set = rom_dbg_status[dbg_col - 4'd2];
+    end
+end
+
 always @(posedge clk_core) begin
 
     idle_de  <= 1'b0;
@@ -654,9 +716,15 @@ always @(posedge clk_core) begin
     if (idle_active) begin
         idle_de <= 1'b1;
         case (rom_error)
-            ERR_TRAILER:  idle_rgb <= 24'hc01010;   // red:    not a pack
+            ERR_TRAILER: begin
+                // red, and the trailer bytes as a bit grid - see dbg_* above
+                if (dbg_in_grid)
+                    idle_rgb <= dbg_set ? 24'hffffff : (dbg_in_cell ? 24'h501010 : 24'h180000);
+                else
+                    idle_rgb <= 24'h280000;
+            end
             ERR_OVERFLOW: idle_rgb <= 24'hc010c0;   // purple: bridge outran the chip
-            ERR_WAIT:     idle_rgb <= 24'hc08010;   // amber:  WAIT held, nothing moves
+            ERR_WAIT:     idle_rgb <= 24'hc08010;   // amber:  (unreachable - see above)
             default:
                 if (blinking && in_block) idle_rgb <= 24'hffffff;
         endcase
@@ -681,10 +749,65 @@ wire [23:0] mem_addr;
 wire [7:0]  rom_data;
 wire        rom_data_available, rom_busy;
 
-assign video_rgb = rom_ready ? {game_r, game_g, game_b} : idle_rgb;
-assign video_de  = rom_ready ? game_de : idle_de;
-assign video_hs  = rom_ready ? game_hs : idle_hs;
-assign video_vs  = rom_ready ? game_vs : idle_vs;
+// The mux switch must be protocol-clean in two ways, and both matter:
+//
+// 1. No stretched sync pulse. Both rasters run free on clk_core (the generated
+//    netlist does not reset the timing registers - see the note above M_main), with
+//    a fixed but unpredictable phase offset set by how long the pack load took.
+//    Switching exactly when rom_ready rises can glue the idle stream's hs/vs to the
+//    game stream's into a two-cycle pulse - R1 says pulses are exactly one cycle
+//    wide. Guarded with one-cycle-delay copies of the idle pulses (geometry-free).
+//
+// 2. No partial-DE line. The line containing the switch cycle carries the idle
+//    stream's remainder of its current line plus the game stream's beginning.
+//    i_x counts cycles since the idle hs pulse; this raster's idle de window sits at
+//    i_x [214, 533], and the switch cycle itself shows the game stream. The idle
+//    remainder is therefore exactly 0 or a full 320 only when the switch lands at
+//    i_x <= 214 (window not started) or i_x >= 534 (window already spent). The game
+//    side of that line is suppressed (de and rgb forced to 0) until the next game hs,
+//    so the transition line carries exactly what the idle remainder had: one blank
+//    line in the first game frame instead of a mixed pixel count (R5: lines carry 0
+//    or exactly 320). i_safe holds for ~504 consecutive cycles every line, and the
+//    pulse guard can block at most two of them, so the switch always resolves within
+//    one line.
+reg [9:0] i_x;
+always @(posedge clk_core) begin
+    if (idle_hs) i_x <= 10'd0; else i_x <= i_x + 10'd1;
+end
+reg idle_hs_d, idle_vs_d;
+always @(posedge clk_core) begin
+    idle_hs_d <= idle_hs;
+    idle_vs_d <= idle_vs;
+end
+
+wire i_safe     = (i_x < 10'd215) || (i_x > 10'd533);   // idle de window [214, 533]
+wire pulse_safe = !(game_hs && idle_hs_d) && !(game_vs && idle_vs_d);
+
+reg  video_sel_r;
+wire switch_now = rom_ready && !video_sel_r && i_safe && pulse_safe;
+wire video_sel  = video_sel_r | switch_now;
+// Explicit reset to 0: without one, Quartus folds this latch to a VCC constant
+// (it picks the self-consistent power-up value Q=1, which makes switch_now dead),
+// and then optimises the ENTIRE idle screen out of the bitstream - on hardware that
+// is a black M_main-in-reset raster with valid sync, no idle block, no error screens.
+always @(posedge clk_core) begin
+    if (rst_core)        video_sel_r <= 1'b0;
+    else if (switch_now) video_sel_r <= 1'b1;
+end
+
+// Suppress the game side of the transition line (de + rgb), mid-line switches only:
+// if the switch lands on a game hs cycle, that line ends right there and nothing is lost.
+reg suppress_de;
+always @(posedge clk_core) begin
+    if (switch_now && !game_hs) suppress_de <= 1'b1;
+    else if (game_hs)           suppress_de <= 1'b0;
+end
+wire suppress = suppress_de | (switch_now && !game_hs);
+
+assign video_rgb = video_sel ? (suppress ? 24'h0 : {game_r, game_g, game_b}) : idle_rgb;
+assign video_de  = video_sel ? (game_de & ~suppress) : idle_de;
+assign video_hs  = video_sel ? game_hs : idle_hs;
+assign video_vs  = video_sel ? game_vs : idle_vs;
 
 M_main u_soc (
     .in_mem_data          ( rom_data           ),
@@ -735,6 +858,15 @@ aw_rom u_rom (
     .rom_ready            ( rom_ready            ),
     .rom_error            ( rom_error            ),
     .rom_loading          (                      ),
+    .rom_chk_data         ( rom_chk_data         ),
+    .rom_dbg_wr_match     ( rom_dbg_wr_match     ),
+    .rom_dbg_wr_all       ( rom_dbg_wr_all       ),
+    .rom_dbg_status       ( rom_dbg_status       ),
+    .rom_selftest_die0    ( rom_selftest_die0    ),
+    .rom_selftest_be      ( rom_selftest_be      ),
+    .rom_selftest_ceneg   ( rom_selftest_ceneg   ),
+    .rom_selftest_cre     ( rom_selftest_cre     ),
+    .rom_selftest_pack0   ( rom_selftest_pack0   ),
 
     .cram0_a              ( cram0_a              ),
     .cram0_dq             ( cram0_dq             ),
@@ -749,6 +881,86 @@ aw_rom u_rom (
     .cram0_ub_n           ( cram0_ub_n           ),
     .cram0_lb_n           ( cram0_lb_n           )
 );
+
+//
+// debug console (115200 8N1)
+//
+// Short log lines: core up, pack loaded, game running, ROM errors, and menu
+// navigation. Everything runs in the clk_core domain; osnotify_inmenu is the
+// one signal that crosses from the bridge handler (clk_74a) and gets the usual
+// 3FF, whose rise/fall outputs are the events.
+//
+// The line goes out two ways:
+//   - cart_tran_bank0[6]: UART TX of the Analogue devkit debug key (cart pin 3),
+//     with bank0[5] as its activity LED (pin 4). Wiring per agg23/
+//     analogue-pocket-utils, wiki "Devkit - Debug Key" / ip/debug_key.v. The
+//     key needs cart power: core.json cartridge_adapter must be 0.
+//   - dbg_tx: the FPGA breakout pin, same signal, for a soldered/external UART.
+//
+
+wire design_run_rise, rom_ready_rise;
+reg design_run_d, rom_ready_d;
+always @(posedge clk_core) begin
+    design_run_d <= design_run;
+    rom_ready_d  <= rom_ready;
+end
+assign design_run_rise = design_run & ~design_run_d;
+assign rom_ready_rise  = rom_ready  & ~rom_ready_d;
+
+wire inmenu_s, inmenu_rise, inmenu_fall;
+synch_3 u_inmenu_sync (
+    .i     ( osnotify_inmenu ),
+    .o     ( inmenu_s        ),
+    .clk   ( clk_core        ),
+    .rise  ( inmenu_rise     ),
+    .fall  ( inmenu_fall     )
+);
+
+wire [7:0] cons_data;
+wire       cons_valid, cons_ready;
+
+dbg_console u_cons (
+    .clk        ( clk_core          ),
+    .rst_n      ( ~rst_core         ),
+    .ev_boot    ( design_run_rise   ),
+    .ev_rom_ok  ( rom_ready_rise    ),
+    .rom_error  ( rom_error         ),
+    .ev_inmenu  ( inmenu_rise       ),
+    .ev_outmenu ( inmenu_fall       ),
+    .rom_chk_data( rom_chk_data     ),
+    .rom_dbg_wr_match( rom_dbg_wr_match ),
+    .rom_dbg_wr_all  ( rom_dbg_wr_all   ),
+    .rom_dbg_status  ( rom_dbg_status   ),
+    .rom_selftest_die0( rom_selftest_die0  ),
+    .rom_selftest_be( rom_selftest_be      ),
+    .rom_selftest_ceneg( rom_selftest_ceneg ),
+    .rom_selftest_cre( rom_selftest_cre    ),
+    .rom_selftest_pack0( rom_selftest_pack0 ),
+    .tx_data    ( cons_data         ),
+    .tx_valid   ( cons_valid        ),
+    .tx_ready   ( cons_ready        )
+);
+
+wire uart_line, uart_busy;
+
+dbg_uart_tx #(
+    .CLK_FREQ ( 24_750_000 ),
+    .BAUD     ( 115_200    )
+) u_dbg_uart (
+    .clk      ( clk_core   ),
+    .rst_n    ( ~rst_core  ),
+    .tx_data  ( cons_data  ),
+    .tx_valid ( cons_valid ),
+    .tx_ready ( cons_ready ),
+    .busy     ( uart_busy  ),
+    .dbg_tx   ( uart_line  )
+);
+
+assign dbg_tx = uart_line;
+
+// debug key: [7] and [4] stay high as before, [6] = UART TX, [5] = LED.
+// bank3[0] (button) and pin31 (UART RX) remain inputs if ever needed.
+assign cart_tran_bank0 = {1'b1, uart_line, uart_busy, 1'b1};
 
 //
 // audio i2s silence generator

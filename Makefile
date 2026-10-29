@@ -10,7 +10,7 @@
 #   make build CORE=mygame         quartus_sh --flow compile + rbf_r
 #   make package CORE=mygame       -> build/sd/<core>/{Cores,Platforms,Assets} + zip
 #   make check-build CORE=mygame   audit the Quartus reports for dead logic / bad clocks
-#   make sim | sim-write | sim-rom | sim-soc   simulate (Silice image: verilator)
+#   make sim | sim-write | sim-rom | sim-soc | sim-top | sim-iv | sim-reset  simulate (Silice image)
 #   make pocket-translate          .si -> cores/aw/src/fpga/core/aw_pocket_build.v
 #
 # Variables (override on the command line or in config.mk):
@@ -81,6 +81,7 @@ help:
 	@echo "  make upstream              fetch/refresh pinned upstream a5k sources"
 	@echo "  make packs                 gamedata/ -> partN.bin packs (part1 = the intro)"
 	@echo "  make sim-soc [PACK=f]      boot the design in simulation, capture frames"
+	@echo "  make sim-top               whole core_top: idle screen, load, mux switch, APF video protocol"
 	@echo "  make ref-sim               the same pack through the golden reference sim"
 	@echo "  make silice-image          build the Silice toolchain image"
 	@echo "  make a5k-translate         .si -> build.v (input for the Quartus flow)"
@@ -164,8 +165,27 @@ sim-rom:
 sim-keys:
 	@$(SILICE) scripts/sim_keys.sh
 
+# Four-state DQ contention check under Icarus. The Verilator suite above is two-state
+# and cannot see two drivers fighting on a bus, so this one exists to keep that class
+# of bug (the 2026-10-12 red-screen suspect) failing in simulation.
+sim-iv:
+	@$(SILICE) scripts/sim_iv.sh
+
+# Host-reset vs load-path ordering (aw_reset_gen). The OS streams the pack with
+# `loadf` while still holding the core in reset - 2026-10-17 proved that gating the
+# load path on ~reset_n discards every pack byte, so this keeps it failing in sim.
+sim-reset:
+	@$(SILICE) scripts/sim_reset.sh
+
 sim-soc:
 	@$(SILICE) scripts/sim_soc.sh $(if $(PACK),$(PACK),)
+
+# Whole core_top from power-on: idle screen, pack load over the real bridge window,
+# mux switch to game video, host commands, audio pins. The only bench that enforces
+# the APF scaler protocol rules on the muxed output from cycle zero (apf_video_check)
+# - the gap between "simulation passes" and "device works".
+sim-top:
+	@$(SILICE) scripts/sim_top.sh
 
 # Golden reference: the *upstream* a5k design, unmodified, simulated with one of our
 # packs. This is what tells us what a pack is supposed to look like; without it every
@@ -176,11 +196,28 @@ ref-setup:
 ref-sim:
 	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh scripts/ref_sim.sh
 
-sim: sim-write sim-keys sim-rom
+sim: sim-write sim-keys sim-rom sim-iv sim-reset sim-top
 
 # ------------------------------------------------------------------- package --
-package:
+# The pack .bin files are game content, not build output: they live in
+# ports/another-world/packs and must reach Assets/anotherworld/common/ on the
+# card or the host has nothing to load into the data slot ("Total loadsize is 0",
+# the core sits on a red screen reading back an empty chip - 2026-10-14). Stage
+# them into dist/assets, which package_core.py merges into Assets/.
+#
+# The Chip32 VM loader (cores/<core>/support/loader.asm) is the other half of
+# that story: the OS stages the file in host memory, but only the loader's
+# `loadf` streams it across the bridge into the FPGA. Without it the load log
+# says "Slot: load done" and nothing moves (measured 2026-10-15: wr_match=0).
+loader:
+	@bash scripts/build_loader.sh $(CORE)
+
+package: loader
 	@test -d $(CORE_DIR) || { echo "no such core: $(CORE_DIR)"; exit 1; }
+	@if [ -d ports/another-world/packs ]; then \
+	 mkdir -p $(CORE_DIR)/dist/assets/anotherworld/common && \
+	 cp -f ports/another-world/packs/part*.bin $(CORE_DIR)/dist/assets/anotherworld/common/; \
+	fi
 	@bit=$(BUILD)/bitstream.rbf_r; \
 	 test -f "$$bit" || { echo "$$bit missing - run make build first"; exit 1; }; \
 	 $(PY) scripts/package_core.py --core-dir $(CORE_DIR) --bitstream "$$bit" \

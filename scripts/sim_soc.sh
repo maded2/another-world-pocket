@@ -94,6 +94,7 @@ if ! verilator --binary -j 4 --timing --top-module tb_soc \
     "${DEFINES[@]}" \
     "$CORE/aw_rom.v" "$CORE/aw_fifo.v" "$CORE/aw_psram.v" \
     "$SIM/aw_psram_model.v" \
+    "$SIM/apf_video_check.sv" \
     "$CORE/aw_pocket_build.v" "$SIM/tb_soc.sv" \
     -o tb_soc > build.log 2>&1; then
     echo "error: tb_soc build failed - first errors:" >&2

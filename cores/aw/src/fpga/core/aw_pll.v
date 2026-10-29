@@ -4,10 +4,10 @@
 // The Pocket hands a core two asynchronous 74.25 MHz inputs and nothing else;
 // everything else the design needs comes out of this PLL.
 //
-//   clk_core   24.75 MHz = 74.25 / 3   design clock *and* pixel clock
-//   clk_core90 24.75 MHz, +90 deg      video_rgb_clock_90 (the scaler samples
-//                                       on this edge; the APF contract)
-//   clk_psram  49.5  MHz = 74.25 * 2/3 ZBT PSRAM controller
+//   clk_core   24.75 MHz = 74.25 / 3    design clock *and* pixel clock
+//   clk_core90 24.75 MHz, +90 deg        video_rgb_clock_90 (the scaler samples
+//                                        on this edge; the APF contract)
+//   clk_psram  92.8125 MHz = VCO / 8     PSRAM sequence clock
 //
 // Why 24.75 and not something closer to upstream's 25 MHz: 25 MHz is not an
 // integer relationship to 74.25 MHz, and this clock is also the pixel clock, so
@@ -16,8 +16,27 @@
 // is 1 % below upstream, which is well inside what the game's own pacing needs
 // (its frame wait is a vblank sync, not a stopwatch).
 //
-// 24.75 = 49.5/2 and both are exact integer ratios of the reference, so this is
-// an ordinary integer-mode PLL: VCO at 742.5 MHz, divided by 30 and 15.
+// All three are exact integer ratios of the reference, so this is an ordinary
+// integer-mode PLL: VCO at 742.5 MHz, divided by 30, 30 and 8.
+//
+// Why 92.8125 for the PSRAM sequence: the fitted part runs in async mode (its
+// clock pin is held low - see aw_psram), so its timing is a matter of nanoseconds,
+// not cycles, and the sequence may be timed on any fast clock - but not any FAST
+// clock: this fabric needs ~7.4 ns clock-to-pin on the cram0 outputs (measured in
+// STA), so the period must leave room for that plus the protocol's inter-signal
+// setup times. 123.75 MHz failed both setup and hold on exactly those paths;
+// 92.8125 (10.77 ns) leaves ~3.4 ns of margin there.
+//
+// The step up from 82.5 was forced by hardware, not bandwidth: at six cycles per
+// access OE# was low for only two of them (build 1031's self-test read its own
+// scratch address back off the bus). Reads now take twelve cycles rather than the
+// seven that were thought to be enough - see aw_psram's header for the pin-level
+// tAA arithmetic and for the real reason reads were silent (UB#/LB# are output
+// enables). What the clock still has to do is fit the WRITE shape: seven cycles
+// (75.4 ns) per access, two chained = 150.8 ns per 32-bit bridge word against the
+// 161.7 ns a paced upload sustains (PACE=10 in tb_rom = 12 clk_74a cycles per
+// bridge write), and ~7.4 ns of that period
+// spent getting a signal from a register to a cram0 pin.
 //
 // Phase: 24.75 MHz has a 40404 ps period, so quadrature is 10101 ps.
 // -----------------------------------------------------------------------------
@@ -38,7 +57,12 @@ module aw_pll (
     output wire locked
 );
 
-    wire outclk0, outclk1, outclk2;
+    // Full-width connection: the megafunction's outclk is 4 bits (four clock
+    // outputs) and we use three of them. Connecting a 3-bit concat to the port
+    // works in Quartus (zero extension) but Verilator 5.020 misaligns the bit
+    // mapping on width-mismatched output connections - outclk[0] then never
+    // reaches the net and clk_core does not run in simulation.
+    wire [3:0] outclk;
 
     altera_pll #(
         .fractional_vco_multiplier("false"),
@@ -54,7 +78,7 @@ module aw_pll (
         .phase_shift1("10101 ps"),
         .duty_cycle1(50),
 
-        .output_clock_frequency2("49.5 MHz"),
+        .output_clock_frequency2("92.8125 MHz"),
         .phase_shift2("0 ps"),
         .duty_cycle2(50),
 
@@ -66,16 +90,16 @@ module aw_pll (
         .pll_subtype("General")
     ) altera_pll_i (
         .rst      (~reset_n),
-        .outclk   ({outclk2, outclk1, outclk0}),
+        .outclk   (outclk),
         .locked   (locked),
         .fboutclk ( ),
         .fbclk    (1'b0),
         .refclk   (refclk)
     );
 
-    assign clk_core  = outclk0;
-    assign clk_core90 = outclk1;
-    assign clk_psram = outclk2;
+    assign clk_core   = outclk[0];
+    assign clk_core90 = outclk[1];
+    assign clk_psram  = outclk[2];
 
 endmodule
 

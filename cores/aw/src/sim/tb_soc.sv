@@ -28,7 +28,7 @@ module tb_soc;
     // a coherent-timescale test here would be telling a lie anyway.
     reg clk_core = 1'b0, clk_psram = 1'b0, clk_bridge = 1'b0;
     always#20.20202 clk_core   = ~clk_core;    // 24.750 MHz
-    always#10.10101 clk_psram  = ~clk_psram;   // 49.500 MHz
+    always#5.38720 clk_psram  = ~clk_psram;   // 92.8125 MHz PSRAM sequence clock
     always #6.73400 clk_bridge = ~clk_bridge;  // 74.250 MHz
 
     reg rst_core = 1'b1, rst_psram = 1'b1, rst_bridge = 1'b1;
@@ -48,6 +48,21 @@ reg design_run = 1'b0;
     wire [7:0] game_r, game_g, game_b;
     wire       game_de, game_hs, game_vs;
     wire [7:0] leds;
+
+    // APF scaler protocol monitor on the game's video pins. tb_top checks the muxed
+    // core_top output; this one protects M_main itself, so a future .si regeneration
+    // that changes raster timing (pulse widths, vs/hs placement, rgb during blanking)
+    // fails here instead of garbling or crashing the Pocket's scaler on the device.
+    wire [31:0] vid_errors;
+    apf_video_check #(.H_ACTIVE(320), .V_ACTIVE(200)) u_vidcheck (
+        .clk  ( clk_core     ),
+        .rgb  ( {game_r, game_g, game_b} ),
+        .de   ( game_de      ),
+        .skip ( 1'b0         ),
+        .vs   ( game_vs      ),
+        .hs   ( game_hs      ),
+        .errors ( vid_errors )
+    );
 
     // ---- bridge ----
     reg               dataslot_wr;
@@ -719,6 +734,15 @@ reg design_run = 1'b0;
         $display("tb_soc: data_available pulses while the VM was held off: %0d (must be 0)",
                  tr_da_before_run);
         if (tr_da_before_run != 0) errors = errors + 1;
+
+        // APF protocol violations are a design failure even when every frame looks fine:
+        // the scaler's hard rules (one-cycle vs/hs, hsync >= 3 cycles after vsync,
+        // rgb=0 while de low, exactly 320x200 of de per frame) are what separate a
+        // stream the Pocket accepts from one it garbles or crashes on.
+        if (vid_errors != 0) begin
+            $display("tb_soc: FAIL - %0d APF video protocol violations", vid_errors);
+            s1_pass = 0;
+        end
 
         // A run that produced only black frames is not a pass, whatever else went right.
         // s1_pass is what decides the process exit status (see the end of this initial block):
