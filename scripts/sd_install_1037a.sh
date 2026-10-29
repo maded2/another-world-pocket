@@ -85,16 +85,18 @@ case "$NEWSHA" in
                 echo "       rebuild before installing 1037a"; exit 1 ;;
 esac
 
-# source for the JSON/loader files: prefer the newest diagnostic identity
-SRC=""
-for cand in "$CARD/Cores/Eddie Chan.AW 1035" "$CARD/Cores/Eddie Chan.AW 1034" \
-            "$CARD/Cores/Eddie Chan.AW 1032" "$CARD/Cores/Eddie Chan.AW 1031" \
-            "$CARD/Cores/Eddie Chan.AW 1030" "$CARD/Cores/Eddie Chan.AW 1029" \
-            "$CARD/Cores/Eddie Chan.AW 1028" "$CARD/Cores/Eddie Chan.AW 1027" \
-            "$CARD/Cores/Eddie Chan.Another World"; do
-    [ -f "$cand/core.json" ] && { SRC="$cand"; break; }
+# Metadata and the loader come from the repo, which is where they are written - earlier
+# installers copied them out of whatever the previous card folder happened to be, which
+# made the candidate list something to bump every build. 1037's list was written before
+# 1036 was on a card and the install stopped with "no source folder", so the indirection
+# is gone: cores/aw/*.json is the source of truth and the identity below is patched into
+# it after copying.
+SRC="$REPO/cores/aw"
+for f in core.json data.json audio.json input.json interact.json variants.json \
+         video.json info.txt loader.bin; do
+    [ -f "$SRC/$f" ] || { echo "missing $SRC/$f" \
+                          "(loader.bin is built by: make loader)"; exit 1; }
 done
-[ -n "$SRC" ] || { echo "no source core folder found on card (need AW 1035/1034/1033/... or Another World)"; exit 1; }
 echo "source: $SRC"
 
 DST="$CARD/Cores/Eddie Chan.AW 1037"
@@ -105,7 +107,7 @@ fi
 mkdir -p "$DST"
 cp -v "$SRC"/core.json "$SRC"/loader.bin "$SRC"/data.json \
       "$SRC"/audio.json "$SRC"/input.json "$SRC"/interact.json "$SRC"/variants.json \
-      "$SRC"/video.json "$SRC"/info.txt "$DST"/ 2>/dev/null
+      "$SRC"/video.json "$SRC"/info.txt "$DST"/
 cp -v "$NEWBS" "$DST/bitstream.rbf_r"
 
 # new identity in core.json: shortname + version + date so no cached entry can match
@@ -117,18 +119,46 @@ md = d["core"]["metadata"]
 md["shortname"] = "AW 1037"
 md["version"] = "1.0.0"
 md["date_release"] = "2026-10-29"
-md["description"] = ("Another World - diagnostic build 1037a (video/VM counters on the CHK line: "
-                     "V frames, F de/frame (fa00 = a full window), L lit/frame, Y ROM bytes to the VM, "
-                     "X status). part1.bin should give C0:0003aed30000268f0001255d00000000 "
-                     "... D=a5a5 B=a55a N=a5a5 R=0000 P=0004 and V counting up. "'
-                     "Same core as Eddie Chan.Another World.")
+md["description"] = ("Another World - diagnostic build 1037a: video/VM counters on the CHK "
+                     "line (V frames, F de per frame with fa00 = a full 320x200 window, "
+                     "L non-black per frame, Y ROM bytes streamed to the VM, X status bits "
+                     "{0,saw_hs,saw_vs,inmenu,design_run,video_sel,suppress,rom_ready}). "
+                     "part1.bin should give C0:0003aed30000268f0001255d00000000 with "
+                     "D=a5a5 B=a55a N=a5a5 R=0000 P=0004 and V counting up.")
 json.dump(d, open(p, "w"), indent=4)
-print("core.json updated: shortname='AW 1035' version=1.0.0")
+print("core.json updated: shortname=%r version=%s" % (md["shortname"], md["version"]))
 EOF
 
-# remove the previous diagnostic identity so the menu has exactly one AW entry
-OLD="$CARD/Cores/Eddie Chan.AW 1036"
-[ -d "$OLD" ] && { echo "removing old identity: $OLD"; rm -rf "$OLD"; }
+# Remove every other diagnostic identity, so the menu has exactly one AW entry - two
+# entries is a mislaunch waiting to happen, and a launch of the wrong one reads as a
+# failed experiment. Archive each bitstream first: these folders have been the only
+# surviving copy of a measured build more than once (build/ overwrites it next compile).
+for d in "$CARD/Cores/Eddie Chan.AW "*; do
+    [ -d "$d" ] || continue
+    [ "$d" = "$DST" ] && continue
+    if [ -f "$d/bitstream.rbf_r" ]; then
+        mkdir -p "$REPO/build/bitstreams"
+        tag=$(basename "$d" | tr ' ' '_')
+        cp "$d/bitstream.rbf_r" "$REPO/build/bitstreams/$tag.rbf_r"
+        echo "archived  $d bitstream -> build/bitstreams/$tag.rbf_r"
+    fi
+    echo "removing old identity: $d"
+    rm -rf "$d"
+done
+
+# Fail here, not on the Pocket: the launch path is built from author.shortname, so a
+# core.json that did not get patched does not merely look wrong in the OSD, it never
+# loads at all (that is how this install script's own bug shipped a dead core once).
+python3 - "$DST/core.json" "$(basename "$DST")" <<'EOF'
+import json, sys
+d = json.load(open(sys.argv[1]))
+md = d["core"]["metadata"]
+want = "%s.%s" % (md["author"], md["shortname"])
+if want != sys.argv[2]:
+    sys.exit("FATAL: folder %r is not author.shortname %r - the OS would launch %r and fail"
+             % (sys.argv[2], want, want))
+print("identity verified: folder == %r" % want)
+EOF
 
 echo
 echo "=== verify new folder ==="
