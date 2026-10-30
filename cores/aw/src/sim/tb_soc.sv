@@ -319,6 +319,78 @@ reg design_run = 1'b0;
     reg [23:0] seen [0:63];
     integer   nseen;
 
+    // ---- colour oracle -----------------------------------------------------------
+    // The palette entry is the game's 12-bit format, not rgb565, and the authority on that
+    // is the renderer which consumes this exact pack data upstream
+    // (sysImplementation.cpp::setPalette):
+    //     c1 = p[0], c2 = p[1]
+    //     r = (((c1&0x0f)<<2) | ((c1&0x0f)>>2)) << 2
+    //     g = (((c2&0xf0)>>2) | ((c2&0xf0)>>6)) << 2
+    //     b = (((c2&0x0f)>>2) | ((c2&0x0f)<<2)) << 2
+    // The vm stores the pair as {second, first} (vm.si: clr = {mem.data, clr[8,8]}), so for
+    // an entry E read back out of the palette ram: R = E[3:0], B = E[11:8], G = E[15:12],
+    // E[7:4] unused - and a nibble n becomes {n, n[3:2], 2'b00}, which is the reference's
+    // own 4->8 scaling (full scale 252, and it is what reference screenshots are made of,
+    // so matching it beats inventing a prettier one).
+    // So every colour the SoC puts on screen has to be a decoding of some entry it held.
+    // "The shapes are right" and "the colours are right" are different claims: the rgb565
+    // reading aw_pocket.si carried passes every shape test this bench has, and on hardware
+    // gives a recognizable picture in the wrong colours.
+    function automatic [23:0] pal_rgb(input [15:0] e);
+        begin
+            pal_rgb = { e[3:0],   e[3:2],   2'b00,
+                        e[15:12], e[15:14], 2'b00,
+                        e[11:8],  e[11:10], 2'b00 };
+        end
+    endfunction
+
+    reg [23:0] hist_rgb [0:511];   // decodings of every entry the design ever held
+    integer    nhist = 0;
+    reg [23:0] col_seen [0:127];   // colours already judged
+    integer    ncol_seen = 0;
+    integer    col_bad = 0;
+
+    task automatic check_colours;
+        integer i, k, hit;
+        reg [23:0] c, d;
+        begin
+            // the bank can be reloaded between the pixel and the frame end, so the set is
+            // cumulative: the condition stays necessary, and no scene transition is a false
+            // failure on a palette that has already moved on
+            for (k = 0; k < 32; k = k + 1) begin
+                d = pal_rgb(u_soc.__mem__palette.buffer[k]);
+                if (^d === 1'bx) continue;
+                hit = 0;
+                for (i = 0; i < nhist && !hit; i = i + 1)
+                    if (hist_rgb[i] === d) hit = 1;
+                if (!hit && nhist < 512) begin
+                    hist_rgb[nhist] = d; nhist = nhist + 1;
+                end
+            end
+            for (i = 0; i < nseen; i = i + 1) begin
+                c = seen[i];
+                if (^c === 1'bx) continue;
+                if (c === 24'h0) continue;              // black is a legal background
+                hit = 0;
+                for (k = 0; k < ncol_seen && !hit; k = k + 1)
+                    if (col_seen[k] === c) hit = 1;
+                if (hit) continue;                      // already judged
+                if (ncol_seen < 128) begin
+                    col_seen[ncol_seen] = c; ncol_seen = ncol_seen + 1;
+                end
+                hit = 0;
+                for (k = 0; k < nhist && !hit; k = k + 1)
+                    if (hist_rgb[k] === c) hit = 1;
+                if (!hit) begin
+                    col_bad = col_bad + 1;
+                    errors = errors + 1;
+                    if (col_bad <= 5)
+                        $display("  COLOUR %h on screen is not a decoding of any palette entry: channels are not in the nibbles the game uses", c);
+                end
+            end
+        end
+    endtask
+
     task automatic dump_frame;
         integer i, idx;
         begin
@@ -342,6 +414,7 @@ reg design_run = 1'b0;
                      sum_b / (fbp == 0 ? 1 : fbp));
             if (nseen >= MIN_COLOURS && nonzero > 0) rich_frames = rich_frames + 1;
             if (nseen > max_colours) max_colours = nseen;
+            check_colours;
             $fflush;
         end
     endtask
@@ -777,7 +850,7 @@ reg design_run = 1'b0;
         end
 
         // The palette, byte-exact, as the oracle for colour. vm.si loads a palette with
-        //     mem.addr = segPalettes + (paletteId << 5);   // 32 bytes = 16 RGB565 colours
+        //     mem.addr = segPalettes + (paletteId << 5);   // 32 bytes = 16 12-bit colours
         //     palette.addr1 = {~pal_swap,4b000} | (n>>1);  // into the bank not on screen
         // so every entry here has to equal a 2-byte little-endian word at a known offset in
         // the pack - a check that needs no opinion about what the intro is supposed to look

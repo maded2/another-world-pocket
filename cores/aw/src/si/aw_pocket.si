@@ -633,17 +633,28 @@ unit main(
 
     palette.addr0  = {pal_swap_p1,4b000} | pixel;
 
-    // palette entries are RGB565, like the game's own palette data:
-    //   bits 4..0 R, bits 10..5 G, bits 15..11 B
+    // Palette entries are the game's 12-bit colours, NOT rgb565. The authority is the
+    // renderer that consumes this exact pack data (sysImplementation.cpp::setPalette),
+    // with c1 the first byte of the pair and c2 the second:
+    //     r = (((c1&0x0f)<<2) | ((c1&0x0f)>>2)) << 2
+    //     g = (((c2&0xf0)>>2) | ((c2&0xf0)>>6)) << 2
+    //     b = (((c2&0x0f)>>2) | ((c2&0x0f)<<2)) << 2
+    // The vm assembles the pair as {second, first} (vm.si: clr = {mem.data, clr[8,8]}), so
+    // c1 = low byte and, for entry E: R = E[3:0], B = E[11:8], G = E[15:12], E[7:4] unused.
+    // Each nibble n expands to {n, n[3:2], 0} - the reference's own 4->8 scaling, full
+    // scale 252. a5k.si:800 decodes the same nibbles; the "565" comment appears in both
+    // repos and is wrong in both, which is how this got here: reading rgb565 keeps every
+    // shape and moves every channel, and on hardware the intro's blue ramp came out green
+    // and its fire came out violet. tb_soc now refuses any on-screen colour that is not a
+    // nibble decoding of an entry the design held, so it cannot come back quietly.
     uint8 c1 = palette.rdata0[ 0,8];
     uint8 c2 = palette.rdata0[ 8,8];
-    uint5 r5 = c1[ 0,5];                  // bits  4..0
-    uint6 g6 = { c2[ 0,3], c1[ 5,3] };    // bits 10..5
-    uint5 b5 = c2[ 3,5];                  // bits 15..11
-
-    video_r  = active_p2 ? {r5, r5[2,3]} : 0;
-    video_g  = active_p2 ? {g6, g6[4,2]} : 0;
-    video_b  = active_p2 ? {b5, b5[2,3]} : 0;
+    // Silice slices are [start,length]: n[2,2] is bits 3..2, the top of the nibble. Writing
+    // n[3,2] here reads bit 4 of a uint4, which silice pads with zero, so the fill bits came
+    // out 0 and every channel landed ~4 counts low (0x4602 -> 32/64/96 instead of 32/68/100).
+    video_r  = active_p2 ? {c1[ 0,4], c1[ 2,2], 2b00} : 0;   // R nibble = E[3:0]
+    video_g  = active_p2 ? {c2[ 4,4], c2[ 6,2], 2b00} : 0;   // G nibble = E[15:12]
+    video_b  = active_p2 ? {c2[ 0,4], c2[ 2,2], 2b00} : 0;   // B nibble = E[11:8]
     video_de = active_p2;
 
     leds = vm.leds;

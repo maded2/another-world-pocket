@@ -1549,3 +1549,61 @@ C0:000000005d2501008f260000d3ae0300 <match>/<all> S<status> Da5a5 Ba55a Na5a5 R0
 
 and the idle grid should switch to the game. `rom_ready` rising is the milestone; the trailer
 and `P=0004` say the bytes in the chip are the bytes in the file.
+
+## 2026-10-31: the game runs on hardware, in the wrong colours — palette is 12-bit nibbles, not rgb565
+
+1037a showed the first animated picture on a Pocket panel. The counters said everything a
+raster can say:
+
+```
+C0:0003aed30000268f0001255d00000000 0007fffc/00080030 S47ff Da5a5 Ba55a Na5a5 R0000 P0004
+  V0008e8 F0fa00 L0fa00 Y00128d97 X6d   ->   V0010e0 ... Y0031ba69
+```
+
+`V` +2040 frames in 34.5 s = 59.1 fps against a 60.000 Hz design; `F=0xfa00` = a full
+320x200 window scanned every frame; `Y` grew ~59 kB/s, so the VM was executing and fetching,
+and with a 2 MiB pack it was re-reading scripts the way a bytecode VM does; `X=0x6d` =
+saw_hs, saw_vs, design_run, video_sel, rom_ready all set, suppress and inmenu clear.
+The user's report: "it is running ... but the color seems off".
+
+The palette bank the VM had loaded, read back out of the SoC's BRAM in simulation:
+
+```
+PALETTE32 1101 0008 2401 3501 4602 5703 7905 ab07 800b 000f 900c a00d c00e e00f f70f fa0f
+```
+
+Decode those as the game does and they are the crash sequence: a blue ramp
+`0x2401 -> 0xab07` stepping (16,32,68) to (116,168,184) for the night sky, and a fire ramp
+`0x800b -> 0xfa0f` going (184,136,0) red-orange through (252,236,0) to (252,252,168) near
+white. `aw_pocket.si` was reading the entry as rgb565 - R = bits 4..0, G = 10..5, B = 15..11 -
+which turns that blue ramp green (8,128,32) and that fire violet (88,0,128). Recognizable
+shapes, wrong everything else. The same misreading explains an old note in this log about
+"the greens on frame 40": there were no greens in the intro.
+
+Authority, in order of usefulness:
+
+1. `sysImplementation.cpp::setPalette` in the reference interpreter, which renders *this*
+   pack data: with `c1 = p[0]`, `c2 = p[1]`, `r = (((c1&0x0f)<<2)|((c1&0x0f)>>2))<<2`,
+   `g = (((c2&0xf0)>>2)|((c2&0xf0)>>6))<<2`, `b = (((c2&0x0f)>>2)|((c2&0x0f)<<2))<<2`.
+   12-bit, one nibble per channel, and the low nibble of the first byte is unused.
+2. `a5k.si:800` decodes the same three nibbles in hardware, and its comment - like the
+   interpreter's - calls the format 565. Both comments are wrong; both implementations
+   agree with the numbers above. A comment describing a format is worth nothing next to
+   code that consumes the format.
+3. The vm assembles the pair as `{second, first}` (`vm.si: clr = {mem.data, clr[8,8]}`), so
+   for entry E in the palette ram: **R = E[3:0], B = E[11:8], G = E[15:12], E[7:4] unused**,
+   and a nibble n becomes `{n, n[3:2], 2'b00}` - the reference's own 4->8 scaling, full
+   scale 252, kept deliberately because it is what reference screenshots are made of.
+
+The oracle that came with the fix is worth more than the fix: `tb_soc` now keeps the set of
+decodings of every palette entry the design has ever held, and fails on any colour that
+reaches the screen from outside that set. Written first, it failed against the rgb565
+netlist with colours like `08a231`; after the fix, 95 frames pass with every colour an exact
+nibble decoding. It also caught a second bug on the way: Silice slices are `[start,length]`,
+so writing `r4[3,2]` to take the top of a `uint4` reads bit 4, which Silice pads with zero -
+the fill bits came out 0 and every channel landed ~4 counts low (0x4602 gave 32/64/96 instead
+of 32/68/100). A person describing a screen would not have caught that, and neither would I.
+
+Gate: tb_soc 95 frames / 75 rich / 0 errors, tb_top all checks, tb_dbg (tag 1038a),
+tb_write, tb_rom, tb_iv, tb_keys, tb_reset PASS. Build 1038a: no 332049, worst slack
++0.114 ns, 4,278 ALMs (23%), sha256 0694cdae9a... (build/aw/bitstream.rbf_r).
