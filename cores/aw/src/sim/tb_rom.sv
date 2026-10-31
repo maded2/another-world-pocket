@@ -76,7 +76,12 @@ module tb_rom;
     wire [15:0] rom_selftest_cre;
     wire [15:0] rom_selftest_pack0;
 
-    aw_rom dut (
+    // The bitstream censuses the whole 2 MiB (CENSUS_RANGE default); the bench sweeps the
+    // first 32 Ki words, which exercises the same accumulate / compare / report / timeout
+    // path in a few milliseconds instead of 135. See the census block in aw_rom.
+    localparam [21:0] CEN_RANGE = 22'h008000;
+
+    aw_rom #(.CENSUS_RANGE(CEN_RANGE)) dut (
         .clk_core(clk_core), .rst_core(rst_core),
         .mem_in_ready(mem_in_ready), .mem_addr(mem_addr), .vm_running(~rst_core),
         .mem_data(mem_data), .mem_data_available(mem_data_available),
@@ -96,8 +101,21 @@ module tb_rom;
         .rom_selftest_be(rom_selftest_be),
         .rom_selftest_ceneg(rom_selftest_ceneg),
         .rom_selftest_cre(rom_selftest_cre),
-        .rom_selftest_pack0(rom_selftest_pack0)
+        .rom_selftest_pack0(rom_selftest_pack0),
+        .rom_census_sum_r(cen_sum_r), .rom_census_sum_w(cen_sum_w),
+        .rom_census_qmism(cen_qmism), .rom_census_stat(cen_stat)
     );
+
+    // Whole-pack census readouts. The oracle is the model's own array: psram0.mem is what
+    // is in the chip, the census reports what the design thinks it committed and what it
+    // read back, and the three only have to agree, not agree with each other by
+    // construction. +SKIP=<word> withholds one bridge word from the upload - a lost write,
+    // which is the failure this whole instrument exists to catch - and the census must say
+    // so instead of calling the boot healthy.
+    wire [31:0] cen_sum_r, cen_sum_w;
+    wire [3:0]  cen_qmism;
+    wire [2:0]  cen_stat;              // {timeout, done, gap}
+    integer     skip_i = -1;
 
     aw_psram_model psram0 (
         .clk(clk_psram), .a(cram0_a), .dq(cram0_dq),   // the chip's CLK pin is held low by
@@ -116,6 +134,7 @@ module tb_rom;
 
     initial begin
         void'($value$plusargs("PACE=%d", pace));
+        void'($value$plusargs("SKIP=%d", skip_i));
         tripwire = $test$plusargs("TRIPWIRE");
         $display("tb_rom: bridge pace = %0d idle cycles between writes (%0d bytes/s average)",
                  pace, 4 * 74250000 / (pace + 2));
@@ -156,6 +175,7 @@ module tb_rom;
         integer i;
         begin
             for (i = 0; i < PACK_WORDS; i = i + 1) begin
+                if (i == skip_i) continue;   // negative control: this word never arrives
                 bridge_write32(32'h10000000 + i*4,
                                {ref_mem[i*4+3], ref_mem[i*4+2], ref_mem[i*4+1], ref_mem[i*4]});
                 if ((i & 65535) == 0) begin
@@ -552,6 +572,108 @@ module tb_rom;
             end else
                 $display("  ok   pack word 0 readback = %04h matches the file (after %0d cycles)",
                          rom_selftest_pack0, sg);
+        end
+
+        // ---- census: does the chip hold the pack? ------------------------------------
+        // Wait for the sweep (it runs once, after the upload, with the VM still held), then
+        // compare its two numbers against the model's memory over the same range. This is
+        // the check the hardware was missing: 1036a and 1037a both reached C0 with the whole
+        // 2 MiB "written" while dbg_wr_match was only counting addresses in range.
+        begin : cen_chk
+            integer i, w, exp_sum, want_gap, lost, exp_q, qfail;
+            for (i = 0; i < 3000000 && !cen_stat[1]; i = i + 1) @(posedge clk_core);
+            checks = checks + 4;
+            $display("  census: stat=%b sum_r=%08h sum_w=%08h qmism=%0h (after %0d cycles)",
+                     cen_stat, cen_sum_r, cen_sum_w, cen_qmism, i);
+            // Inside the design, because "the report says zero" has at least four different
+            // causes (nothing written, nothing read, the sweep stopped early, the copy
+            // across the clock domains never ran) and only the registers distinguish them.
+            $display("         dut: cw_max=%0d cw_n=%0d cw_sum=%08h | census_last=%0d addr=%0d cr_sum=%08h timed_out=%b",
+                     dut.cw_max, dut.cw_n, dut.cw_sum, dut.census_last, dut.census_addr,
+                     dut.cr_sum, dut.census_to);
+            // Direct, and independent of any summing: a word that still holds the model's
+            // power-up pattern is a word the upload never wrote (unless the file has that
+            // pattern there). This is the check that found the drain consuming a word on the
+            // self-test's write - three words lost every probe round, every round - which no
+            // amount of summing would have named, and which 510 checks had been tolerating.
+            lost = 0;
+            for (i = 0; i < CEN_RANGE; i = i + 1)
+                if (psram0.mem[i] === 16'h5A5A &&
+                    !(ref_mem[i*2] === 8'h5A && ref_mem[i*2+1] === 8'h5A)) begin
+                    if (lost < 6) $display("  FAIL: word %0d never written (file wants %02h%02h)",
+                                           i, ref_mem[i*2+1], ref_mem[i*2]);
+                    lost = lost + 1;
+                end
+            checks = checks + 1;
+            if (lost != 0 && skip_i < 0) begin
+                errors = errors + 1;
+                $display("  FAIL: %0d words of the pack never reached the chip", lost);
+            end else if (skip_i < 0)
+                $display("  ok   every word in the first %0d reached the chip", CEN_RANGE);
+            if (!cen_stat[1]) begin
+                errors = errors + 1;
+                $display("  FAIL: census never finished");
+            end
+            if (cen_stat[2]) begin
+                errors = errors + 1;
+                $display("  FAIL: census timed out - the sweep stopped being served");
+            end
+            // The oracle is the model's own memory over exactly the swept window: what the
+            // chip holds, against what the design says it wrote and what it read back.
+            exp_sum = 0;
+            for (i = 0; i < CEN_RANGE; i = i + 1) exp_sum = exp_sum + psram0.mem[i];
+            want_gap = (skip_i >= 0);
+            if (cen_stat[0] != want_gap) begin
+                errors = errors + 1;
+                $display("  FAIL: census gap flag = %0b, wanted %0b (+SKIP=%0d)",
+                         cen_stat[0], want_gap, skip_i);
+            end
+            if (!want_gap && (cen_sum_r !== exp_sum[31:0] || cen_sum_w !== exp_sum[31:0]
+                              || cen_qmism !== 4'h0)) begin
+                errors = errors + 1;
+                $display("  FAIL: census disagrees with the model - read %08h written %08h model %08h qmism %0h",
+                         cen_sum_r, cen_sum_w, exp_sum[31:0], cen_qmism);
+            end else if (!want_gap)
+                $display("  ok   census: %0d words written, read back and equal (%08h)",
+                         CEN_RANGE, cen_sum_r);
+            // Every quarter must be alive on both sides. This is the check that would have
+            // caught the quarter index being bits [20:19] of a 20-bit address: the sums Z
+            // reports were right, the mismatch flag was right, and two of the four "which part
+            // went bad" buckets were registers tied to zero. A diagnostic that silently cannot
+            // fire is worse than none, because its absence gets read as evidence.
+            checks = checks + 4; qfail = 0;
+            for (i = 0; i < 4; i = i + 1) begin
+                if (skip_i < 0 && (dut.cw_q[i] == 32'd0 || dut.cr_q[i] == 32'd0)) begin
+                    qfail = qfail + 1;
+                    errors = errors + 1;
+                    // one literal: Verilator does not accept adjacent-string concatenation
+                    $display("  FAIL: quarter %0d never accumulated (written %08h read %08h) - the range or the index is wrong",
+                             i, dut.cw_q[i], dut.cr_q[i]);
+                end
+            end
+            // conditional on the loop's own result, because an "ok" printed under two FAILs
+            // is the thing that makes a transcript unreadable
+            if (skip_i < 0 && qfail == 0)
+                $display("  ok   all four quarters accumulated on both sides");
+            // ... and a withheld write must light exactly the quarter that holds it, or the
+            // mask is decoration: +SKIP=100 is in quarter 0 of a 0x8000-word sweep.
+            if (skip_i >= 0 && skip_i < CEN_RANGE) begin
+                exp_q = 1 << (skip_i / (CEN_RANGE / 4));
+                checks = checks + 1;
+                if (cen_qmism !== exp_q[3:0]) begin
+                    errors = errors + 1;
+                    $display("  FAIL: withheld word %0d is quarter %0d, census said mask %0h (want %0d)",
+                             skip_i, skip_i / (CEN_RANGE / 4), cen_qmism, exp_q);
+                end else
+                    $display("  ok   quarter mask %0h names the withheld word %0d",
+                             cen_qmism, skip_i);
+            end
+            if (want_gap && (cen_sum_r === cen_sum_w)) begin
+                errors = errors + 1;
+                $display("  FAIL: a withheld word and the census still says the sums match");
+            end else if (want_gap)
+                $display("  ok   census flags the withheld word %0d (read %08h vs written %08h)",
+                         skip_i, cen_sum_r, cen_sum_w);
         end
 
         $display("");

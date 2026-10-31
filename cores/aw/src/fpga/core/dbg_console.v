@@ -36,6 +36,10 @@ module dbg_console (
     input  wire [19:0]  vid_de_per_frame,    // de pulses in the last complete frame (64000 = fa00)
     input  wire [19:0]  vid_lit_per_frame,   // of those, how many were non-black
     input  wire [31:0]  rom_rd_bytes,        // bytes aw_rom has streamed to the VM
+    input  wire [31:0]  cen_sum_r,           // pack read-back sum, write sum, quarter mask,
+    input  wire [31:0]  cen_sum_w,           // and {timeout, done, gap} - see aw_rom's
+    input  wire [3:0]   cen_qmism,           // census block for what each one rules out
+    input  wire [2:0]   cen_stat,
     input  wire [7:0]   vid_status,          // {saw_hs,saw_vs,inmenu,design_run,video_sel,suppress,_,rom_ready}
     output reg  [7:0]  tx_data,
     output wire        tx_valid,
@@ -58,7 +62,7 @@ localparam MID_UP      = 3'd0,   // "AW 1026a up\n"            console out of re
 // sits in the MSB.
 // The tag in the boot line is the build id - the first thing a hardware session
 // prints, so any capture identifies which bitstream is actually in the FPGA.
-localparam [8*12-1:0]  MSG_UP      = "AW 1038a up\n";   // diag build: also re-sent every ~2 s (tag_cnt)
+localparam [8*12-1:0]  MSG_UP      = "AW 1040a up\n";   // diag build: also re-sent every ~2 s (tag_cnt)
 localparam [8*13-1:0]  MSG_RUN     = "game running\n";
 localparam [8*15-1:0]  MSG_OK      = "pack loaded ok\n";
 localparam [8*21-1:0]  MSG_ERR1    = "ROM ERR: bad trailer\n";
@@ -144,7 +148,7 @@ wire [6:0] pick_mask = (!sending) ? (
 
 reg [3:0] msg_id;
 // 7 bits: the CHK line is 66 bytes (positions 0..65) - 6 bits truncated it to 2
-reg [6:0] pos;
+reg [7:0] pos;                       // 8 bits: the CHK line outgrew 127 characters in 1039a
 reg       sending;
 reg       presenting;                  // tx_valid is high while this is set
 
@@ -203,7 +207,7 @@ end
 
 assign tx_valid = presenting;
 
-reg [6:0] msg_len;
+reg [7:0] msg_len;
 
 always @(*) begin
     case (msg_id)
@@ -215,7 +219,7 @@ always @(*) begin
         MID_ERR3:    msg_len = 6'd25;
         MID_MENUIN:  msg_len = 6'd8;
         MID_MENUOUT: msg_len = 6'd8;
-        MID_CHK:     msg_len = 7'd126;
+        MID_CHK:     msg_len = 8'd148;
         default:     msg_len = 6'd8;
     endcase
 end
@@ -292,7 +296,24 @@ always @(*) begin
             else if (pos == 7'd121) tx_data = 8'h20;                   // ' '
             else if (pos == 7'd122) tx_data = 8'h58;                   // 'X' status
             else if (pos <= 7'd124) tx_data = hxn(vid_status[(7'd124 - pos)*4 +: 4]);
-            else                   tx_data = 8'h0a;                    // '\n'
+            // Z: did the 2 MiB the chip holds survive the round trip? '.' written == read,
+            // '!' mismatch with the quarter mask after it, 'T' the sweep stalled and gave
+            // up, 'P' not run yet (the census finishes ~126 ms after the upload). Then the
+            // read sum and the written sum, so a mismatch can be compared against the file
+            // itself rather than only against our own write.
+            else if (pos == 8'd125) tx_data = 8'h20;                   // ' '
+            else if (pos == 8'd126) tx_data = 8'h5a;                   // 'Z'
+            else if (pos == 8'd127) tx_data = !cen_stat[1] ? 8'h50     // 'P'
+                                  : cen_stat[2]      ? 8'h54           // 'T'
+                                  : (cen_sum_r == cen_sum_w && cen_qmism == 4'd0
+                                     && !cen_stat[0]) ? 8'h2e          // '.'
+                                                      : 8'h21;         // '!'
+            else if (pos == 8'd128) tx_data = hxn(cen_qmism);
+            else if (pos == 8'd129) tx_data = 8'h20;                   // ' '
+            else if (pos <= 8'd137) tx_data = hxn(cen_sum_r[(8'd137 - pos)*4 +: 4]);
+            else if (pos == 8'd138) tx_data = 8'h2f;                   // '/'
+            else if (pos <= 8'd146) tx_data = hxn(cen_sum_w[(8'd146 - pos)*4 +: 4]);
+            else                    tx_data = 8'h0a;                   // '\n'
         end
         MID_UP:      tx_data = MSG_UP      [(11 - pos)*8 +: 8];
         MID_RUN:     tx_data = MSG_RUN     [(12 - pos)*8 +: 8];

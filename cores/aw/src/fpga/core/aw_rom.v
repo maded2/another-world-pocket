@@ -126,6 +126,19 @@ module aw_rom (
     // in the report told those two apart.
     output reg  [31:0] rom_dbg_rd_bytes,
 
+    // Whole-pack census (see the census block). sum_w is the sum of every 16-bit word the
+    // upload wrote; sum_r the sum of the same range read back afterwards; equal means the
+    // chip holds the file. qmism says which quarter(s) disagree, and stat is
+    // {timeout, done, gap} where gap means the writes were not contiguous from word 0.
+    // Worth the silicon because until now the 2 MiB was verified by exactly two reads -
+    // word 0 and the trailer - and dbg_wr_match counted addresses in range, not data
+    // committed. A corrupt region in the middle of the pack looked identical to a working
+    // boot: C0, rom_ready, and a black screen with the VM eating ROM at 9x the normal rate.
+    output wire [31:0] rom_census_sum_w,
+    output wire [31:0] rom_census_sum_r,
+    output wire [3:0]  rom_census_qmism,
+    output wire [2:0]  rom_census_stat,
+
     // PSRAM self-test readbacks (see the selftest block), reported as
     // "D<d> B<b> N<n> R<r> P<p>" on the CHK line. Expected on a living chip:
     //   D : a5a5 - scratch round-trip, normal operation (byte enables asserted on the
@@ -399,20 +412,114 @@ module aw_rom (
     // Probe B's pattern, written with the low byte enabled only, on top of the A5A5
     // probe A put in the same word a moment earlier: the readback must be A55A.
     localparam [15:0] ST_PAT_BE   = 16'h5A5A;
-    localparam [15:0] ST_PERIOD   = 16'd41_250;   // ~450 ms at 92.8125 MHz
+    localparam [15:0] ST_PERIOD   = 16'd41_250;   // ~444 us at 92.8125 MHz (counted in IDLE cycles)
 
     // One round per period: seq 0..3 are scratch round-trips (0 = normal, 1 = the
     // byte-lane/mask probe, 2 = the other die, 3 = CRE high), seq 4 is the pack word 0
     // readback. st_cfg only carries the two flips that live inside aw_psram; probe B is
     // a byte-enable thing and needs none of them.
-    localparam [2:0] ST_SEQ_P0 = 3'd4;
+    localparam [2:0] ST_SEQ_P0 = 3'd4, ST_SEQ_CEN = 3'd5;
+
+    // ================================================================ census ====
+    // Is the 2 MiB in the chip the 2 MiB that was sent?
+    //
+    // The evidence for asking: the first launch after a power-on shows a black screen with
+    // F=fa00 (a full window scanned), L=0 (every pixel decoded black) and Y climbing at
+    // ~4.6 kB per frame against the healthy ~0.55 kB - a VM executing something, but not the
+    // game. Quitting and relaunching works, and the relaunch re-uploads the pack. That is
+    // the shape of "the upload did not commit", which nothing in this design can currently
+    // see: dbg_wr_match counts writes whose ADDRESS is in the pack window, and the only real
+    // read-backs were word 0 (P=0004) and the trailer's 16 bytes (C0). Everything between
+    // those two reads has never been checked as a whole.
+    //
+    // (The other candidate, uninitialized BRAM, was tested and dismissed: tb_soc +FUZZ_BRAM
+    // fills the video pages, the palette and the polygon stack with noise before the game
+    // gets them, and it still boots and renders 87 rich frames.)
+    //
+    // Design: the write side accumulates every 16-bit word it commits below the pack's end,
+    // and remembers the highest address written; the census then reads exactly that range
+    // back through the self-test's sequencer and accumulates again. Comparing the two needs
+    // no knowledge of the file, and a 32-bit sum plus a 32-bit xor over a megabyte of words
+    // is not going to agree by accident. Quarters (four sums per side) say where it went
+    // wrong without a per-word bitmap, which would cost more than the census is worth.
+    //
+    // Range is word 0 up to cw_max, not the full 2 MiB: the last four 32-bit words are
+    // never counted by dbg_wr_match (0x7fffc, not 0x80000) and scanning cells nobody wrote
+    // would turn a harmless tail into a permanent mismatch. If the writes skipped anything,
+    // cw_n != cw_max and the gap bit says so instead of lying about the sums.
+    //
+    // Cost, measured in tb_rom rather than derived: a 32,768-word sweep took 365,169 sequencer
+    // cycles, i.e. 11.1 cycles per word, so the full 1,048,568-word pack is ~11.7 M cycles
+    // = ~126 ms at 92.8125 MHz, once, with the VM still in reset because rom_ready waits on
+    // census_done. A census that stops
+    // making progress abandons itself (census_stall saturates after 2^18 = ~2.8 ms) and reports the
+    // timeout: a hung census must not become a black screen, which is the thing we are
+    // trying to detect.
+    // Swept range, as 16-bit words. Full pack by default - that is what goes in the
+    // bitstream, and a census that samples cannot say "the pack is intact". A testbench may
+    // override it: 1,048,576 back-to-back reads is ~126 ms of simulated time for a check whose
+    // mechanism is identical over 32 Ki words, and both sides of the comparison are gated by
+    // the same parameter so the numbers stay meaningful.
+    parameter [21:0] CENSUS_RANGE = 22'h10_0000;
+    localparam [21:0] CEN_LAST    = CENSUS_RANGE - 22'd1;
+    // Quarter boundary. The slice is `addr[CEN_QSHIFT +: 2]` - `+: ` starts AT the base bit,
+    // so this picks bits [CEN_QSHIFT+1 : CEN_QSHIFT]. It was written `CEN_QSHIFT+1 +: 2`,
+    // which for the default range picks bits [20:19] of a word address that only has bits
+    // [19:0]: the index could then only ever be 0 or 1, quarters 2 and 3 accumulated nothing,
+    // and the whole "which part went bad" half of the census was two live halves plus two
+    // registers tied to zero. Nothing in simulation noticed - the total sums, which are what Z
+    // reports, are unaffected, and a mismatch would still have been flagged, just with the
+    // wrong map. `make check-build` caught it the way it always does: the fitter is the only
+    // tool here that reads the design as built, and it said `cw_q[2][*] - Stuck at GND`.
+    localparam integer CEN_QSHIFT = $clog2(CENSUS_RANGE) - 2;   // quarter boundary
+
+    reg  [21:0] cw_max;          // highest 16-bit word written, plus one
+    reg  [21:0] cw_n;            // how many were written (gap check)
+    reg  [31:0] cw_sum, cw_xor;
+    reg  [31:0] cw_q [0:3];
+    // The sweep's cursor and its last word. Width = the address bits the range can name,
+    // because both were 22 bits and bit 21 is the die-select bit that the pack never reaches
+    // (a 2 MB pack lives in one die): `make check-build` reported census_addr[21] and
+    // census_limit[21] as stuck at GND, and it is right - a register that can only ever hold
+    // zero is not a free width, it is the fitter telling you the range does not need it.
+    // Holding the *last index* rather than a limit is what makes CEN_AW bits enough: a limit
+    // of CENSUS_RANGE itself would need one bit more than the addresses it bounds.
+    localparam integer CEN_AW = $clog2(CENSUS_RANGE);
+    reg  [CEN_AW-1:0] census_addr, census_last;
+    reg  [31:0] cr_sum, cr_xor;
+    reg  [31:0] cr_q [0:3];
+    reg         census_active, census_done, census_to;
+    reg  [17:0] census_stall;
+    reg         vfy_arm;              // clk_core: the pack is in (driven further down)
+    wire        census_done_core;     // census_done synchronised into clk_core (see below).
+                                      // Declared here because rom_ready waits on it, and the
+                                      // C++ simulator wants a declaration before the use in
+                                      // a way iverilog does not.
+
+    // Armed in clk_core when the pack is in; a two-flop synchroniser and an edge detect
+    // make it a one-cycle start in clk_psram. One shot: census_done stops it re-arming, so
+    // a level that stays high (pack_written does) cannot restart a finished sweep.
+    reg  [1:0] vfy_arm_p;
+    wire census_go = vfy_arm_p[0] & ~vfy_arm_p[1] & ~census_done;
+    // A capture is the sequencer's own: the controller serialises accesses, so the read
+    // data that lands while we sit in ST_WAIT with the census cursor is the census's.
+    // census_addr is the right index here (it advances on this same edge), which is also why
+    // it is used instead of rd_addr - the request mux has moved on by the time data returns,
+    // and rd_addr_q exists for exactly that reason elsewhere in this file.
+    wire cen_captured = rd_q_valid & (st_s == ST_WAIT) & census_active;
+
+    always @(posedge clk_psram) begin
+        if (rst_psram) vfy_arm_p <= 2'b00;
+        else           vfy_arm_p <= {vfy_arm_p[0], vfy_arm};
+    end
     wire [1:0] st_cfg = (st_seq == 3'd2) ? 2'd2 :
                         (st_seq == 3'd3) ? 2'd3 : 2'd0;
     // Probe B masks every write else in this design out of the picture: only the LOW
     // lane, so the high byte on readback is proof the earlier write is still there.
     wire [1:0] st_be     = (st_seq == 3'd1) ? 2'b01 : 2'b11;
     wire [15:0] st_wdata = (st_seq == 3'd1) ? ST_PAT_BE : ST_PAT;
-    wire [21:0] st_rd_addr = (st_seq == ST_SEQ_P0) ? ST_ADDR_P0 : ST_ADDR_D0;
+    wire [21:0] st_rd_addr = census_active ? {{(22-CEN_AW){1'b0}}, census_addr}
+                           : (st_seq == ST_SEQ_P0) ? ST_ADDR_P0 : ST_ADDR_D0;
 
     // 3 bits: ST_WAIT is 4 - a 2-bit encoding truncated it to 0 (= ST_IDLE), which
     // made the producer's push gate (st_s != ST_WAIT) drop every read while the
@@ -421,7 +528,7 @@ module aw_rom (
                       ST_RD   = 3'd3, ST_WAIT = 3'd4;
     reg  [2:0] st_s;
     reg  [2:0] st_seq;             // which probe of the round is in flight (0..4)
-    reg  [15:0] st_cnt;
+    reg  [15:0] st_cnt, st_wcnt;
     reg  [2:0] st_gap;
     wire       st_active  = (st_s != ST_IDLE);
     wire       st_rd_take = (st_s == ST_RD);
@@ -429,6 +536,7 @@ module aw_rom (
     always @(posedge clk_psram) begin
         if (rst_psram) begin
             st_s               <= ST_IDLE;
+            st_wcnt            <= 16'd0;
             st_cnt             <= 16'd0;
             st_gap             <= 3'd0;
             st_seq             <= 3'd0;
@@ -437,16 +545,53 @@ module aw_rom (
             rom_selftest_ceneg <= 16'h0000;
             rom_selftest_cre   <= 16'h0000;
             rom_selftest_pack0 <= 16'h0000;
+            // Every census register resets, and not as decoration. Without it Quartus chose
+            // the power-up value of census_done itself: it reported "census_done - Stuck at
+            // VCC", and from that single freedom the whole feature evaporated - census_go
+            // low forever, census_active Stuck at GND, cr_sum's clock_enable tied off, the
+            // report permanently reading zero, and a bitstream that still closed timing while
+            // never sweeping a word. Verilator zero-inits registers, so every simulation passed.
+            // This is the uninitialized-memory trap again, one level up: sim reset is not RTL reset.
+            census_active      <= 1'b0;
+            census_done        <= 1'b0;
+            census_to          <= 1'b0;
+            census_addr        <= {CEN_AW{1'b0}};
+            census_last        <= {CEN_AW{1'b0}};
+            census_stall       <= 18'd0;
+            cr_sum             <= 32'd0;
+            cr_xor             <= 32'd0;
+            cr_q[0]            <= 32'd0;
+            cr_q[1]            <= 32'd0;
+            cr_q[2]            <= 32'd0;
+            cr_q[3]            <= 32'd0;
         end else begin
             case (st_s)
-            ST_IDLE: if (st_cnt == ST_PERIOD - 16'd1) begin
+            ST_IDLE: if (census_go) begin
+                // Read-only pass: no write phase, and the periodic probes wait for it.
+                // The end of the sweep is snapshotted so a late write cannot move the
+                // goalposts: sweep words 0..cw_max-1, or 0..CEN_LAST if the range is smaller.
+                census_active   <= 1'b1;
+                census_addr     <= {CEN_AW{1'b0}};
+                census_last     <= (cw_max == 22'd0) ? {CEN_AW{1'b0}}
+                                   : (cw_max > CENSUS_RANGE) ? CEN_LAST[CEN_AW-1:0]
+                                   : cw_max[CEN_AW-1:0] - {{(CEN_AW-1){1'b0}}, 1'b1};
+                census_stall    <= 18'd0;
+                cr_sum          <= 32'd0;
+                cr_xor          <= 32'd0;
+                cr_q[0]         <= 32'd0;
+                cr_q[1]         <= 32'd0;
+                cr_q[2]         <= 32'd0;
+                cr_q[3]         <= 32'd0;
+                st_seq          <= ST_SEQ_CEN;
+                st_s            <= ST_RD;
+            end else if (st_cnt == ST_PERIOD - 16'd1) begin
                 st_cnt <= 16'd0;
                 st_seq <= 3'd0;                // first probe of the round
                 st_s   <= ST_WR;               // seqs 0..3 have a write phase
             end else begin
                 st_cnt <= st_cnt + 16'd1;
             end
-            ST_WR: if (wr_taken) begin
+            ST_WR: if (st_taken) begin
                 st_gap <= 3'd4;                // let the write access finish first
                 st_s   <= ST_GAP;
             end
@@ -454,12 +599,25 @@ module aw_rom (
                 st_s   <= (st_gap == 3'd0) ? ST_RD : ST_GAP;
                 st_gap <= (st_gap == 3'd0) ? 3'd0 : st_gap - 3'd1;
             end
-            ST_RD: if (rd_taken) st_s <= ST_WAIT;
+            ST_RD: if (rd_taken) begin
+                st_s    <= ST_WAIT;
+                st_wcnt <= 16'd0;      // the timeout starts when the read is on its way
+            end
             // Hold until the readback lands below. Without this explicit item
             // ST_WAIT fell into `default` and cleared itself in one cycle - six
             // cycles too early for rd_q_valid, so the capture could never fire
             // (build 1030a printed T0000 on hardware: the reset value, not a read).
-            ST_WAIT: st_s <= ST_WAIT;
+            // ST_WAIT used to wait forever. The sequencer is shared: the producer is gated
+            // with ~st_active, so a probe whose readback never arrives does not just lose a
+            // probe - it starves the ROM path for the rest of the power cycle, because st_s
+            // never leaves a state that reports st_active. A probe that is not answered in
+            // ~0.7 ms is a failed probe, and the round is abandoned.
+            ST_WAIT: if (&st_wcnt) begin
+                st_s   <= ST_IDLE;
+                st_seq <= 3'd0;
+            end else begin
+                st_wcnt <= st_wcnt + 16'd1;
+            end
             default: st_s <= ST_IDLE;
             endcase
 
@@ -467,7 +625,39 @@ module aw_rom (
             // read is taken is ours - and only ours goes here, never to the stream
             // FIFO (see the producer's push gate). Route it to the probe that owns
             // it, then advance: cfg0 -> cfg1 -> cfg2 -> cfg3 -> pack read -> done.
-            if (rd_q_valid && st_s == ST_WAIT) begin
+            if (cen_captured) begin
+                cr_sum       <= cr_sum + rd_q;
+                cr_xor       <= cr_xor ^ rd_q;
+                cr_q[census_addr[CEN_QSHIFT +: 2]] <=
+                    cr_q[census_addr[CEN_QSHIFT +: 2]] + rd_q;
+                census_stall <= 24'd0;
+                if (census_addr >= census_last) begin
+                    census_active <= 1'b0;
+                    census_done   <= 1'b1;
+                    st_s          <= ST_IDLE;
+                end else begin
+                    census_addr <= census_addr + 1'b1;
+                    st_s        <= ST_RD;
+                end
+            end
+
+            // Watchdog. Without it a census that stops being served holds the sequencer,
+            // rom_ready never rises, and the design we are debugging becomes a black screen
+            // for a different reason. 2^18 cycles is ~2.8 ms at 92.8125 MHz against a read
+            // that completes in twelve (~130 ns): still eighty thousand times the margin,
+            // and short enough that a bench whose PSRAM model never answers - which is what
+            // first showed this to me, tb_write coming back rom_ready=0 with 231 errors -
+            // gets its boot back in a few thousand cycles instead of never.
+            if (census_active && !cen_captured) begin
+                if (&census_stall) begin
+                    census_active <= 1'b0;
+                    census_done   <= 1'b1;
+                    census_to     <= 1'b1;
+                    st_s          <= ST_IDLE;
+                end else census_stall <= census_stall + 18'd1;
+            end
+
+            if (rd_q_valid && st_s == ST_WAIT && !census_active) begin
                 case (st_seq)
                 3'd0: rom_selftest_die0  <= rd_q;
                 3'd1: rom_selftest_be    <= rd_q;
@@ -489,7 +679,21 @@ module aw_rom (
     // write side of the chip, driven straight from the state above; the self-test
     // owns it for one access while in ST_WR
     wire        wr_ready;
-    wire        wr_taken = wr_req & wr_ready;
+    // `wr_taken` is any master's access being accepted, and on its own that is a bug: the
+    // self-test forces wr_req high for its own probe write while the loader's drain sits in
+    // D_RUN, the drain sees wr_taken, and consumes a word whose address and data never went
+    // anywhere. Measured in tb_rom at PACE=10: three 16-bit words lost every ST_PERIOD
+    // (5,520 words = 11,040 bytes apart, matching the 444 us probe period exactly), which is
+    // six bytes of the pack quietly thrown away per probe round in a bench that had been
+    // passing 510 checks for weeks. Each master takes its own acceptance signal now.
+    wire        wr_taken  = wr_req & wr_ready;
+    // ~ld_abort belongs here: it is part of what the drain actually asks for (see the
+    // wr_req mux below), and dropping it is a second bug of the same shape - tb_write, the
+    // bench that exercises the abort path, went rom_ready=0 with "busy never fell" the first
+    // time this was written as d_act & wr_ready.
+    wire        d_taken   = d_act & ~ld_abort & wr_ready;   // the drain's word, and only
+                                                            // when it owns the bus
+    wire        st_taken  = (st_s == ST_WR) & wr_ready;   // the probe's own access
     reg         wr_req;
     reg  [21:0] wr_addr;
     reg  [15:0] wr_wdata;
@@ -505,6 +709,24 @@ module aw_rom (
         end
     end
     assign ld_rd = ld_rd_q;
+
+    // Write side of the census: every 16-bit word committed below the pack's end, counted
+    // as it is taken by the controller (not as it is queued, so a write that never gets
+    // taken cannot make the sums agree). The self-test's own scratch write lives at
+    // ST_ADDR_D0, above CEN_LAST, so it is excluded by range rather than by a case.
+    always @(posedge clk_psram) begin
+        if (rst_psram) begin
+            cw_sum <= 32'd0; cw_xor <= 32'd0;
+            cw_q[0] <= 32'd0; cw_q[1] <= 32'd0; cw_q[2] <= 32'd0; cw_q[3] <= 32'd0;
+            cw_max <= 22'd0; cw_n <= 22'd0;
+        end else if (d_taken && wr_addr <= CEN_LAST) begin
+            cw_sum <= cw_sum + wr_wdata;
+            cw_xor <= cw_xor ^ wr_wdata;
+            cw_q[wr_addr[CEN_QSHIFT +: 2]] <= cw_q[wr_addr[CEN_QSHIFT +: 2]] + wr_wdata;
+            cw_n   <= cw_n + 22'd1;
+            if (wr_addr + 22'd1 > cw_max) cw_max <= wr_addr + 22'd1;
+        end
+    end
 
     always @(posedge clk_psram) begin
         if (rst_psram) begin
@@ -535,7 +757,7 @@ module aw_rom (
             // hold the request up; the controller accepts it whenever it is idle or
             // at the data phase of the access in progress, so this chains at the
             // chip's own rate
-            D_RUN: if (wr_taken) begin
+            D_RUN: if (d_taken) begin
                 if (d_last) begin
                     // The last access of this entry is now in flight. If the next
                     // entry is already queued, start pulling it out on this very
@@ -668,9 +890,34 @@ module aw_rom (
     reg  [2:0]  run_s;
     always @(posedge clk_psram) run_s <= {run_s[1:0], c_run};
     wire p_start = run_s[1] & ~run_s[2];
-    wire p_allow = run_s[2] & (sf_free >= FETCH_HEADROOM) & (sf_level <= LOOKAHEAD);
 
-    // The self-test read preempts while presented (one access, ~500 ms apart); the
+    // Registered, and that is the whole point of the flop. Unregistered, this comparison sat
+    // in front of the PSRAM controller's chip-facing output registers: aw_psram's `take` is
+    // what loads psram_ub_n/psram_lb_n in S_IDLE, and rd_req is one of the two terms of take.
+    // Build 1039a measured the consequence - 4 paths, worst -0.385 ns setup, from
+    // u_sfifo|rptr_sync2[5] through the grey-to-binary conversion, the occupancy subtract and
+    // the compare into u_psram|psram_lb_n, six logic levels with 56 % of the delay in
+    // interconnect, because the fifo lives three columns from the cram0 I/O cells and the
+    // fitter has no reason to pull them together. Putting a flop here ends that comparison in
+    // a register beside the fifo and leaves one level between the flag and the chip bus. It
+    // also contains the asynchronous `sf_level` sample in a single flop instead of letting it
+    // propagate through arithmetic into a chip control register.
+    //
+    // What one cycle of staleness costs: at most one extra accepted read beyond what the live
+    // comparison would have allowed. FETCH_HEADROOM is 7 words and the controller can have two
+    // reads in flight at the very most (a 7-cycle access, data back twelve cycles later), so
+    // the conservative direction still has four words of margin. The flag only ever decides
+    // *when* fetching starts and stops - never what lands where - and the request stays a
+    // level held until the controller takes it, which is the contract aw_psram depends on.
+    reg p_allow_q;
+    always @(posedge clk_psram) begin
+        if (rst_psram) p_allow_q <= 1'b0;
+        else           p_allow_q <= run_s[2] & (sf_free >= FETCH_HEADROOM)
+                                   & (sf_level <= LOOKAHEAD);
+    end
+    wire p_allow = p_allow_q;
+
+    // The self-test read preempts while presented (one access every ~444 us); the
     // producer is paused for that window and must not book its traffic as its own.
     assign rd_req   = st_rd_take | (p_allow & ~st_active);
     assign rd_addr  = st_rd_take ? st_rd_addr : p_addr;
@@ -1083,7 +1330,16 @@ module aw_rom (
             // a fact about this design. (The old ERR_WAIT path is gone - WAIT idles
             // high on the fitted part and was never a handshake; see aw_psram.)
             if (seen_overflow) rom_error <= ERR_OVERFLOW;
-            if (chk_done && !seen_overflow) begin
+            // rom_ready also waits for the census - not for it to agree, on this first cut:
+            // reporting is the point, and a census bug must not become a boot that never
+            // happens. The ordering is what makes the number meaningful: the VM does not
+            // start streaming while the sweep still owns the chip.
+            //
+            // Only when one was armed though. Gating unconditionally is how tb_write came
+            // back rom_ready=0 with 231 errors: that bench never completes an upload, so
+            // nothing arms a census, and a design waiting for a sweep nobody asked for is
+            // indistinguishable from a design waiting forever.
+            if (chk_done && !seen_overflow && (!vfy_arm | census_done_core | cen_budget_out)) begin
                 if (offs_ok) begin
                     rom_ready <= 1'b1;
                     // ERR_TRAILER is a diagnosis of the moment, not a verdict: a check
@@ -1102,6 +1358,60 @@ module aw_rom (
 
     // waiting for a pack, rather than waiting for anything else
     assign rom_loading = ~rom_ready;
+
+    // ============================================================ census out ====
+    // Arm the sweep once the pack is in. pack_written is a level and stays high, which is
+    // fine: census_done in the other domain makes the start a one-shot.
+    always @(posedge clk_core) begin
+        if (rst_core)             vfy_arm <= 1'b0;
+        else if (allc_edge | pack_written) vfy_arm <= 1'b1;
+    end
+
+    // Crossing to clk_core: three single-bit flags get two-flop synchronisers, and the sums
+    // cross as quasi-static data - the accumulators stop changing the cycle census_done
+    // rises, and the flag is two flops old by the time anything downstream is told to
+    // believe them. That is the case the CDC rules allow without a fifo; a wide bus clocked
+    // blind across an async boundary is still not, so these words go to the debug console
+    // and nowhere near control.
+    //
+    // An earlier revision latched them into clk_core registers on the synchronised done
+    // flag, and that copy never ran under the C++ simulator: the condition was true and
+    // observable (flag synchronised, copied flag low, reset low), the generated C++ looked
+    // correct, and the reported sums sat at 00000000 while the accumulator inside the design
+    // held the right number - in two different block layouts. A pipeline stage whose only job
+    // is to move settled numbers is the first thing to delete when it misbehaves: the
+    // alternative is trusting a report you cannot test, and being testable is why the census
+    // exists.
+    // A budget, not a lease: if no census finishes within ~0.67 s of arming (five times the
+    // 135 ms a full sweep needs), boot proceeds without it and the report says so. rom_ready
+    // must never depend on a diagnostic - that is how "add a check" turns into a black screen.
+    reg  [23:0] cen_budget;
+    wire        cen_budget_out = &cen_budget;
+    reg [1:0] cen_done_p, cen_gap_p, cen_to_p;
+    always @(posedge clk_core) begin
+        if (rst_core) cen_budget <= 24'd0;
+        else if (census_done_core) cen_budget <= 24'd0;
+        else if (vfy_arm && !cen_budget_out) cen_budget <= cen_budget + 24'd1;
+    end
+
+    always @(posedge clk_core) begin
+        if (rst_core) begin
+            cen_done_p <= 2'b00;
+            cen_gap_p  <= 2'b00;
+            cen_to_p   <= 2'b00;
+        end else begin
+            cen_done_p <= {cen_done_p[0], census_done};
+            cen_gap_p  <= {cen_gap_p[0],  (cw_n != cw_max)};
+            cen_to_p   <= {cen_to_p[0],   census_to};
+        end
+    end
+    assign census_done_core = cen_done_p[1];
+
+    assign rom_census_sum_r = cr_sum;
+    assign rom_census_sum_w = cw_sum;
+    assign rom_census_qmism = { (cw_q[3] != cr_q[3]), (cw_q[2] != cr_q[2]),
+                                (cw_q[1] != cr_q[1]), (cw_q[0] != cr_q[0]) };
+    assign rom_census_stat  = { cen_to_p[1] | cen_budget_out, census_done_core, cen_gap_p[1] };
 
     // =============================================================== the chip ===
     aw_psram u_psram (

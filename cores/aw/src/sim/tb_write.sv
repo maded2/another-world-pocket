@@ -43,7 +43,11 @@ module tb_write;
     wire        cram0_clk, cram0_adv_n, cram0_cre, cram0_ce0_n, cram0_ce1_n;
     wire        cram0_oe_n, cram0_we_n, cram0_ub_n, cram0_lb_n, cram0_wait;
 
-    aw_rom u_rom (
+    // Sweeps 2 Ki words rather than the whole pack: this bench is not a pack-integrity test,
+    // and a full 1,048,576-read census costs ~135 ms of simulation before rom_ready. The
+    // bitstream uses the default (the whole pack); scripts/sim_rom.sh is the bench that
+    // verifies the mechanism, including with +SKIP=<word> to lose a write on purpose.
+    aw_rom #(.CENSUS_RANGE(22'h000800)) u_rom (
         .clk_core(clk_core), .rst_core(rst_core),
         .mem_addr(mem_addr), .mem_in_ready(mem_in_ready), .mem_data(mem_data),
         .vm_running(~rst_core),

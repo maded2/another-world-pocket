@@ -6,7 +6,9 @@
 
 `default_nettype none
 
-module core_top (
+module core_top
+#(parameter [21:0] CENSUS_RANGE = 22'h10_0000)   // whole pack; benches shrink it (see aw_rom)
+(
 
 //
 // physical connections
@@ -515,6 +517,9 @@ wire [31:0]  rom_dbg_wr_match; // debug: host writes that passed the window filt
 wire [31:0]  rom_dbg_wr_all;   // debug: every bridge write seen
 wire [15:0]  rom_dbg_status;   // debug: {overflow, allc_seen, last_match[23:10]}
 wire [31:0]  rom_dbg_rd_bytes; // debug: ROM bytes streamed to the VM (clk_core)
+wire [31:0]  rom_census_sum_r, rom_census_sum_w;  // whole-pack census (see aw_rom)
+wire [3:0]   rom_census_qmism;
+wire [2:0]   rom_census_stat;  // {timeout, done, gap}
 // debug: PSRAM self-test matrix (see aw_rom) - a5a5 in D/B/N/R names the control
 // assumption that was wrong; P must read 0004 (part1) once reads work at all
 wire [15:0]  rom_selftest_die0;
@@ -835,7 +840,7 @@ M_main u_soc (
     .clock                ( clk_core           )
 );
 
-aw_rom u_rom (
+aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .clk_core             ( clk_core             ),
     .rst_core             ( rst_core             ),
     .mem_in_ready         ( mem_in_ready         ),
@@ -864,6 +869,10 @@ aw_rom u_rom (
     .rom_dbg_wr_all       ( rom_dbg_wr_all       ),
     .rom_dbg_status       ( rom_dbg_status       ),
     .rom_dbg_rd_bytes     ( rom_dbg_rd_bytes     ),
+    .rom_census_sum_r     ( rom_census_sum_r     ),
+    .rom_census_sum_w     ( rom_census_sum_w     ),
+    .rom_census_qmism     ( rom_census_qmism     ),
+    .rom_census_stat      ( rom_census_stat      ),
     .rom_selftest_die0    ( rom_selftest_die0    ),
     .rom_selftest_be      ( rom_selftest_be      ),
     .rom_selftest_ceneg   ( rom_selftest_ceneg   ),
@@ -986,6 +995,10 @@ dbg_console u_cons (
     .vid_de_per_frame( vid_de_last      ),
     .vid_lit_per_frame( vid_lit_last    ),
     .rom_rd_bytes  ( rom_dbg_rd_bytes   ),
+    .cen_sum_r     ( rom_census_sum_r   ),
+    .cen_sum_w     ( rom_census_sum_w   ),
+    .cen_qmism     ( rom_census_qmism   ),
+    .cen_stat      ( rom_census_stat    ),
     .vid_status    ( vid_status         ),
     .tx_data    ( cons_data         ),
     .tx_valid   ( cons_valid        ),

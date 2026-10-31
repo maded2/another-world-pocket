@@ -63,7 +63,11 @@ module tb_top;
     wire cart_pin31_net;
     assign cart_pin31_net = pin31_drv;
 
-    core_top u_core (
+    // The pack census is shrunk here: this bench checks protocol, video, audio, keys and the
+    // boot-check handshake, and a full 1,048,576-word sweep costs ~135 ms of simulation
+    // before rom_ready - longer than this bench is willing to wait. The bitstream uses the
+    // default (the whole pack); scripts/sim_rom.sh is where the mechanism itself is verified.
+    core_top #(.CENSUS_RANGE(22'h000800)) u_core (
         .clk_74a              ( clk_74a          ),
         .clk_74b              ( clk_74b          ),
 

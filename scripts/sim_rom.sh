@@ -73,7 +73,9 @@ if [ -n "${TRACE:-}" ]; then
 fi
 
 echo "=== functional: a plausible sustained load, then read every byte back ==="
-./obj/tb_rom "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" ${TRACE:++TRACE}
+./obj/tb_rom "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" ${TRACE:++TRACE} ${EXTRA:-}
+# EXTRA carries bench plusargs (the positional argument is the pack), e.g.
+#   EXTRA=+SKIP=100 ./docker/run-silice.sh scripts/sim_rom.sh   # census must flag the gap
 rc_fn=$?
 
 exit $(( rc_tw + rc_fn ))

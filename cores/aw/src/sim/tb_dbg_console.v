@@ -107,6 +107,7 @@ module tb_dbg_console;
         .rom_selftest_cre(16'h0), .rom_selftest_pack0(16'h0),
         .vid_frames(24'h0), .vid_de_per_frame(20'h0), .vid_lit_per_frame(20'h0),
         .rom_rd_bytes(32'h0), .vid_status(8'h0),
+        .cen_sum_r(32'h0), .cen_sum_w(32'h0), .cen_qmism(4'h0), .cen_stat(3'b000),
         .tx_data(b_data), .tx_valid(b_valid), .tx_ready(b_ready)
     );
 
@@ -143,6 +144,9 @@ module tb_dbg_console;
         .vid_lit_per_frame(20'h01D4C),
         .rom_rd_bytes(32'h001255D3),
         .vid_status(8'h75),
+        // census: finished, contiguous, written sum equals read sum -> 'Z.0'
+        .cen_sum_r(32'h1A2B3C4D), .cen_sum_w(32'h1A2B3C4D),
+        .cen_qmism(4'h0), .cen_stat(3'b010),
         .tx_data(c_data), .tx_valid(c_valid), .tx_ready(c_ready)
     );
 
@@ -285,7 +289,7 @@ module tb_dbg_console;
 
         // out of reset: boot tag (build id; the device build re-sends it every ~2 s).
         // want_len is chars + 1 (the \n), like every other call in this bench.
-        recv_line("AW 1038a up\n", 12);
+        recv_line("AW 1040a up\n", 12);
 
         // pack loaded, then game running.
         // Events are level-latched by the console every cycle they are high, so
@@ -325,9 +329,9 @@ module tb_dbg_console;
         c_rst_n = 1'b0;
         repeat (5) @(posedge clk);
         c_rst_n = 1'b1;
-        recv_line_c("AW 1038a up\n", 12);
+        recv_line_c("AW 1040a up\n", 12);
         // C<err>:<32 hex chk> W<match>/<all> S<status> - the loader counters
-        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75\n", 126);
+        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75 Z.0 1a2b3c4d/1a2b3c4d\n", 148);
 
         if (errors == 0) $display("tb_dbg_console: -> PASS");
         else             $display("tb_dbg_console: -> FAIL (%0d errors)", errors);

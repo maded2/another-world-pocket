@@ -74,7 +74,10 @@ fi
 # misbehaving when it is the wrapper ignoring the request. Anything documented by the
 # scripts under scripts/ goes through here.
 # PART/SECS/SHOTS/REF_DIR belong to scripts/ref_sim.sh (the golden reference run).
-for _v in TRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS; do
+# EXTRA carries bench plusargs through scripts/sim_soc.sh (e.g. EXTRA=+FUZZ_BRAM=1);
+# it is on this list because the list is an allow-list and an unlisted variable is dropped
+# in silence - the failure mode documented just above.
+for _v in TRACE READTRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS EXTRA WORK; do
     [ -n "${!_v:-}" ] && docker_args+=(-e "$_v")
 done
 
