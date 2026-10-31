@@ -1935,3 +1935,37 @@ what removes it.
   nowhere in `cores/aw`. Scoped, the answer for this build is *no dead logic in the core's own
   modules*, worst slack **0.129 ns**, clocks 24.75 MHz and 92.8125 MHz, every SDC constraint
   matched, no 332049, no negative slack in any corner. Bitstream `5b7ab7d5e7f0d80b…`.
+
+### Gate for 1041a, and the one number that explains the long silence
+
+| step | result |
+|---|---|
+| `sim-write` / `sim-keys` / `sim-rom` / `sim-iv` / `sim-reset` / `sim-top` | PASS (tb_rom 519 checks, 0 errors; `all four quarters accumulated on both sides`) |
+| `sim_soc` **part0**, 25 frames | strip written at frame 14: **1 strip, 63,999 writes, drift=0 value=0 content=0**, 405 restarts, **0 wrong bytes** with the byte index no longer resetting |
+| `sim_soc` **part1** (the intro), 150 frames | **PASS** — 134 non-black, 130 rich, best 16 colours, 0 errors. `TEXT: 0 strips` (the intro draws no text) and **`STREAM: 0 restarts`** |
+| census in sim | `arm=1 done=1 qmism=0`, `written == readback` (`011057d6` for part0's swept range, `024c337f` for part1's) |
+| `make check-build CORE_DIR=cores/aw` | no dead logic in the core's own modules, every SDC constraint matched, worst slack **+0.129 ns**, clocks 24.75 / 92.8125 MHz, no 332049, no negative slack in any corner |
+| bitstream | `5b7ab7d5e7f0d80b…`, installed as `Eddie Chan.AW 1041` (folder == `author.shortname` verified by the installer) |
+
+**`0 restarts` on part1 is the number that matters for "how was this invisible"**: the intro's
+reads are short — `readByte` acceptances of one or two bytes — so the FIFO never drains and the
+recovery never runs. The fault only exists on *long continuous streams*, and in this game there is
+exactly one kind: `op_drawString`. Every part1 run ever done was clean, honestly, because part1
+never asks the question.
+
+### Installer bug, found by its own check and worth keeping
+
+`scripts/sd_install_1041a.sh`'s first run printed `DONE.` having failed two things:
+
+1. the `description` I wrote had continuation lines with no closing quotes → Python
+   `SyntaxError` → `md["shortname"]` was never set, so the card kept the repo's
+   `"Another World"` on a folder named `Eddie Chan.AW 1041`. `folder != author.shortname` is the
+   documented way to ship a core the Pocket cannot launch.
+2. **the script runs with `set -u`, not `set -e`**, so both python blocks failing printed their
+   message and bash walked on — past the identity `FATAL`, through the cache clearing, to `DONE.`
+   A safety check that cannot stop the script is a print statement.
+
+Both fixed: the description is properly quoted, and each block now ends
+`|| { echo "FATAL: …"; exit 1; }`. Re-run end to end afterwards: `core.json updated:
+shortname='AW 1041'`, `identity verified: folder == 'Eddie Chan.AW 1041'`, bitstream sha
+`5b7ab7d5e7f0d80b…`, 8 packs present.

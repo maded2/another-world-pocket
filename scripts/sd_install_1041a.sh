@@ -92,7 +92,11 @@ cp -v "$SRC"/core.json "$SRC"/loader.bin "$SRC"/data.json \
       "$SRC"/video.json "$SRC"/info.txt "$DST"/
 cp -v "$NEWBS" "$DST/bitstream.rbf_r"
 
-python3 - "$DST/core.json" <<'EOF'
+# NOTE the `|| exit 1`: this script runs with `set -u`, not `set -e`, so a failing block used
+# to print its FATAL and carry straight on to "DONE." - which is exactly how 1041a's first
+# install ended up with the repo's shortname ("Another World") on a folder called
+# "Eddie Chan.AW 1041", i.e. folder != author.shortname, i.e. a core the Pocket cannot launch.
+python3 - "$DST/core.json" <<'EOF' || { echo "FATAL: could not rewrite $DST/core.json"; exit 1; }
 import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
@@ -100,16 +104,18 @@ md = d["core"]["metadata"]
 md["shortname"] = "AW 1041"
 md["version"] = "1.0.0"
 md["date_release"] = "2026-10-31"
-md["description"] = ("Another World - build 1041a: fixes the sheared text. The ROM reader's
-                     restart on a stalled word went back to the address the acceptance BEGAN and
-                     re-handed-out bytes the VM had already consumed; op_drawString holds the
-                     request for a whole 320-byte-per-row strip and keeps its own pixel pointer,
-                     so the strip came out as the same 158-byte pattern repeated, each row
-                     starting 320 mod 158 = 4 pixels further along it than the row above. The
-                     restart now resumes at the word containing the next undelivered byte. Also
-                     carries 1040a's whole-pack census, so the CHK line still answers
-                     'is the 2 MiB in the chip the 2 MiB that was sent': Z.0 <sum_r>/<sum_w>,
-                     and dd744c92 for part1.bin.")
+md["description"] = ("Another World - build 1041a: fixes the sheared text. The ROM "
+                     "reader's restart on a stalled word went back to the address the "
+                     "acceptance BEGAN and re-handed-out bytes the VM had already "
+                     "consumed; op_drawString holds the request for a whole "
+                     "320-byte-per-row strip and keeps its own pixel pointer, so the "
+                     "strip came out as the same 158-byte pattern repeated, each row "
+                     "starting 320 mod 158 = 4 pixels further along it than the row "
+                     "above. The restart now resumes at the word containing the next "
+                     "undelivered byte. Also carries 1040a's whole-pack census, so the "
+                     "CHK line still answers 'is the 2 MiB in the chip the 2 MiB that "
+                     "was sent': Z.0 <sum_r>/<sum_w>, and dd744c92 for part1.bin.")
+
 json.dump(d, open(p, "w"), indent=4)
 print("core.json updated: shortname=%r version=%s" % (md["shortname"], md["version"]))
 EOF
@@ -131,7 +137,7 @@ for d in "$CARD/Cores/Eddie Chan.AW "*; do
 done
 
 # Fail here, not on the Pocket: the launch path is built from author.shortname.
-python3 - "$DST/core.json" "$(basename "$DST")" <<'EOF'
+python3 - "$DST/core.json" "$(basename "$DST")" <<'EOF' || exit 1
 import json, sys
 d = json.load(open(sys.argv[1]))
 md = d["core"]["metadata"]
