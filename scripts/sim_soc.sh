@@ -81,6 +81,11 @@ PY
 DEFINES=()
 # verilator takes defines as -D<name>; `--define` is not an option it knows.
 [ -n "${TRACE:-}" ] && DEFINES+=(-DSOC_TRACE)
+# READTRACE=1 turns on aw_rom's own per-access trace (ACCEPT/LAND/TAKE/REWIND). The stream
+# is ~1 kB per frame, so even a 40 frame run prints tens of thousands of lines - cheap
+# enough to keep in the script, and it is the only way to see what the reader did around a
+# single wrong byte.
+[ -n "${READTRACE:-}" ] && DEFINES+=(-DREAD_TRACE)
 
 cd "$WORK"
 # A stale frame directory is worse than no frame directory: the run below fails, the
@@ -111,7 +116,10 @@ echo "pack  : $PACK"
 echo "role  : $role"
 echo "=== run: load, boot, capture $FRAMES frames ==="
 ./obj/tb_soc "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" "+FRAMES=$FRAMES" \
-             "+FRAMEDIR=$FRAMEDIR"
+             "+FRAMEDIR=$FRAMEDIR" ${EXTRA:-}
+# EXTRA carries bench plusargs that are not the pack, e.g.
+#   EXTRA=+FUZZ_BRAM=1 ./docker/run-silice.sh scripts/sim_soc.sh
+# (the positional argument is the pack, so "$@" could not be used for both)
 rc=$?
 
 echo "=== frames ==="

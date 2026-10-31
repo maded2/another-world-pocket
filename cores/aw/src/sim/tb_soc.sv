@@ -78,7 +78,11 @@ reg design_run = 1'b0;
     wire        cram0_wait;
 
     /* verilator lint_off PINCONNECTEMPTY */
-    aw_rom u_rom (
+    // Sweeps 2 Ki words rather than the whole pack: this bench is not a pack-integrity test,
+    // and a full 1,048,576-read census costs ~135 ms of simulation before rom_ready. The
+    // bitstream uses the default (the whole pack); scripts/sim_rom.sh is the bench that
+    // verifies the mechanism, including with +SKIP=<word> to lose a write on purpose.
+    aw_rom #(.CENSUS_RANGE(22'h000800)) u_rom (
         .clk_core            (clk_core),
         .rst_core            (rst_core),
         .mem_in_ready        (mem_in_ready),
@@ -304,6 +308,11 @@ reg design_run = 1'b0;
     integer   stream_base = -1;
     integer   served_k = 0;
     bit       served_prev = 0;
+    // How often the reader had to start its stream over (aw_rom's `rewind`). A wrong byte
+    // with rewinds=0 is a delivered word that did not match its tag's neighbourhood; a wrong
+    // byte next to a rewind is a stream that restarted, which is a different bug.
+    integer   rewinds = 0;
+    always @(posedge clk_core) if (u_rom.rewind) rewinds = rewinds + 1;
     integer   black_frames = 0;
     // "Not black" is not "the game is drawing". Frames 10-13 of the intro are a uniform
     // fill: nonblack=64000 with colours=1. Counting those as success is how a design passes
@@ -318,6 +327,9 @@ reg design_run = 1'b0;
     // small linear scan; a wide search here is per-pixel work and dominates the run.
     reg [23:0] seen [0:63];
     integer   nseen;
+    bit       fuzz_bram = 0;
+    integer   fz_i;
+    reg [31:0] fz_seed;
 
     // ---- colour oracle -----------------------------------------------------------
     // The palette entry is the game's 12-bit format, not rgb565, and the authority on that
@@ -412,6 +424,8 @@ reg design_run = 1'b0;
                      frames, frame_w, frame_h, nseen, nonzero,
                      sum_r / (fbp == 0 ? 1 : fbp), sum_g / (fbp == 0 ? 1 : fbp),
                      sum_b / (fbp == 0 ? 1 : fbp));
+            $display("         writes: vm_pix=%0d rast=%0d blit=%0d  pages=[%0d %0d %0d %0d]",
+                     vm_pix_we, rast_pix_we, blit_we, pg_we[0], pg_we[1], pg_we[2], pg_we[3]);
             if (nseen >= MIN_COLOURS && nonzero > 0) rich_frames = rich_frames + 1;
             if (nseen > max_colours) max_colours = nseen;
             check_colours;
@@ -441,6 +455,45 @@ reg design_run = 1'b0;
     always @(posedge clk_core) begin
         if (mem_in_ready && !mem_data_available) starving = starving + 1;
         else if (mem_data_available) starving = 0;
+    end
+
+    // +ADDRLOG=<n> - the address of every stream acceptance, for diffing against the
+    // reference design's `FILL @addr` trace. The bench sees the same thing the VM asked for,
+    // so this is the one comparison that needs no SIMULATION build of the SoC: the design is
+    // translated for synthesis, which strips the __display lines from vm.si, and only the
+    // reference sim can print opcodes. Addresses are the pack offset (bit 20 set = the
+    // pre-rendered text area that op_drawString seeks to), so a run that draws text has to
+    // show requests up here with bit 20 on - and the run that motivated this showed none.
+    // Pixel-side counters for the missing-text investigation. The VM's direct pixel port
+    // (`vm.pix_wenable`) is the ONLY user of which op_drawString writes -- sprites and
+    // polygons go through the blitter and rasterizer -- so "the game asked for N text pixels"
+    // against "page N saw M writes" separates a dead write path from writes that are being
+    // dropped by the display-page override (our port matches upstream in dropping those, and
+    // dropping them is exactly what a black screen with a happy VM looks like).
+    wire        tr_vm_pix_we   = u_soc._w_vm_pix_wenable;
+    wire        tr_rast_pix_we = u_soc._w_rast_pix_wenable;
+    wire        tr_blit_we     = u_soc._w_blit_dst_wenable;
+    integer     vm_pix_we = 0, rast_pix_we = 0, blit_we = 0;
+    integer     pg_we[0:3] = '{0,0,0,0};
+    always @(posedge clk_core) begin
+        if (tr_vm_pix_we)   vm_pix_we   = vm_pix_we   + 1;
+        if (tr_rast_pix_we) rast_pix_we = rast_pix_we + 1;
+        if (tr_blit_we)     blit_we     = blit_we     + 1;
+        if (u_soc._t__page0_wenable) pg_we[0] = pg_we[0] + 1;
+        if (u_soc._t__page1_wenable) pg_we[1] = pg_we[1] + 1;
+        if (u_soc._t__page2_wenable) pg_we[2] = pg_we[2] + 1;
+        if (u_soc._t__page3_wenable) pg_we[3] = pg_we[3] + 1;
+    end
+
+    integer addrlog = 0, addrlogged = 0;
+    reg     inr_log_q = 1'b0;
+    always @(posedge clk_core) begin
+        inr_log_q <= mem_in_ready;
+        if (addrlog != 0 && design_run && mem_in_ready && !inr_log_q) begin
+            if (addrlogged < addrlog)
+                $display("  ACC @%h", mem_addr);
+            addrlogged = addrlogged + 1;
+        end
     end
 
 `ifdef SOC_TRACE
@@ -625,7 +678,9 @@ reg design_run = 1'b0;
             frame_h = frame_h + 1;
             line_pix = 0;
         end
-        if (mem_data_available) begin
+        // chk_active: while the boot check owns the reader, the bytes coming out are its own
+        // trailer reads (TRAILER_ADDR, repeated) and not the VM's stream.
+        if (mem_data_available && !u_rom.chk_active) begin
             bytes_to_vm = bytes_to_vm + 1;
             // Every byte handed to the VM, checked against the image. When the game draws
             // nothing this is what tells you whether the ROM lied or the VM asked for
@@ -634,16 +689,42 @@ reg design_run = 1'b0;
             if (served_k >= 0 && (stream_base + served_k) < PACK_BYTES) begin
                 if (mem_data !== ref_mem[stream_base + served_k]) begin
                     errors = errors + 1;
-                    if (errors < 25)
-                        $display("  ROM GAVE WRONG BYTE addr=%0h got=%02h image=%02h (k=%0d)",
-                                 stream_base + served_k, mem_data,
-                                 ref_mem[stream_base + served_k], served_k);
+                    if (errors < 400)
+                        $display("  ROM GAVE WRONG BYTE t=%0t addr=%0h got=%02h image=%02h (k=%0d) c_addr=%0h c_tag=%0h n_addr=%0h rewinds=%0d",
+                                 $time, stream_base + served_k, mem_data,
+                                 ref_mem[stream_base + served_k], served_k,
+                                 u_rom.c_addr, u_rom.c_waddr, u_rom.n_addr, rewinds);
                 end
             end
             served_k = served_k + 1;
         end
-        if (mem_in_ready && !served_prev) begin
-            stream_base = mem_addr;           // acceptance: this is where the run starts
+        // Anchor on the design's own acceptance and on nothing else. Two wrong anchors have
+        // now been measured, and in both cases they framed the ROM for a murder it did not
+        // commit:
+        //
+        //  - served_prev was mem_data_available, so a stream that ended with data still
+        //    asserted one cycle into the next request skipped the anchor, and every byte of
+        //    the new stream was compared against the previous stream's base: a tidy
+        //    'got = image[k-1]' cascade that looked exactly like the ROM being a byte behind.
+        //  - "or any address change while the request is low" over-corrected it. The VM moves
+        //    mem_addr one or two cycles BEFORE it raises in_ready, and the last byte of the old
+        //    stream is delivered in between, so the checker re-based on the new address and
+        //    then compared the old stream's final byte against it. Three errors in a 95-frame
+        //    run, every one of them at k=0, and +READ_TRACE showed the design had taken that
+        //    byte legitimately one cycle earlier (c_addr=125a1, tag matched, rewinds=0) with
+        //    its ACCEPT for 0x22dd still one cycle away. The same three errors appear against
+        //    the 1038a netlist, so nothing in the census work caused them: the ROM was right
+        //    and the bench was early.
+        //
+        // accept_vm is the design starting a stream from a new address (reset the count);
+        // rewind is the same stream started over from c_start (reset the count, keep the base).
+        if (u_rom.accept_vm) begin
+            // The pack offset, NOT the address on the wire: aw_rom's map puts the image in a
+            // 2 MB bank and [23:21] select the bank, so every address this design asks for
+            // carries +0x200000. Compared raw, `stream_base + k < PACK_BYTES` was false from
+            // the first byte and the check below -- the one that says 'the ROM lied' rather
+            // than 'the screen is black' -- had never compared a single byte in any run.
+            stream_base = mem_addr & 22'h1F_FFFF;
             served_k    = 0;
             // What the interpreter is really doing. If the game runs its frame loop, the
             // addresses it asks for sweep the bytecode segment and the per-frame acceptance
@@ -655,8 +736,10 @@ reg design_run = 1'b0;
             if (mem_addr < tr_addr_lo) tr_addr_lo = mem_addr;
             if (mem_addr > tr_addr_hi) tr_addr_hi = mem_addr;
 `endif
+        end else if (u_rom.rewind) begin
+            served_k = 0;             // same stream, same base, handed out again from c_start
         end
-        served_prev = mem_data_available;
+        served_prev   = mem_data_available;
         if (game_vs) begin
             if (fbp > 0) begin
 `ifdef SOC_TRACE
@@ -703,12 +786,39 @@ reg design_run = 1'b0;
         void'($value$plusargs("PACE=%d", pace));
         void'($value$plusargs("FRAMES=%d", max_frames));
         void'($value$plusargs("NOINPUT=%d", noinput));
+        void'($value$plusargs("ADDRLOG=%d", addrlog));
         if (!$value$plusargs("FRAMEDIR=%s", framedir)) framedir = "/tmp/awframes";
 
         // Probe sanity check. Everything the diagnosis below rests on is a hierarchical read
         // of a memory inside the generated design; if that read is not looking at the array
         // being written, every conclusion drawn from it is worthless. So write a sentinel and
         // read it back before anything else happens.
+        // Cold-start fidelity. The bench and iverilog both hand the design BRAM that is
+        // zero at t=0, and the .si zeroes the video pages under SIMULATION only; a Cyclone V
+        // comes out of configuration with whatever its memory cells hold, and a *warm* core
+        // relaunch keeps the previous session's contents. The hardware report is exactly
+        // that shape - first launch after power-on black, quit and relaunch fine - so make
+        // the difference testable: +FUZZ_BRAM=1 paints every ram the design leaves
+        // uninitialized with noise before the game gets it. If the boot still works, the
+        // init "fix" would be superstition and the cause is somewhere else.
+        void'($value$plusargs("FUZZ_BRAM=%d", fuzz_bram));
+        if (fuzz_bram) begin
+            fz_seed = 32'h5EED1234;
+            for (fz_i = 0; fz_i < 64000; fz_i = fz_i + 1) begin
+                fz_seed = fz_seed * 32'd1664525 + 32'd1013904223;
+                u_soc.page0.__mem__pixels.buffer[fz_i] = fz_seed[ 3: 0];
+                u_soc.page1.__mem__pixels.buffer[fz_i] = fz_seed[ 7: 4];
+                u_soc.page2.__mem__pixels.buffer[fz_i] = fz_seed[11: 8];
+                u_soc.page3.__mem__pixels.buffer[fz_i] = fz_seed[15:12];
+                if (fz_i < 32)
+                    u_soc.__mem__palette.buffer[fz_i] = {fz_seed[31:16], fz_seed[15:0]};
+                if (fz_i < 64)
+                    u_soc.__mem__polygon.buffer[fz_i] = {fz_seed, ~fz_seed};
+            end
+            $display("tb_soc: FUZZ_BRAM on - pages/palette/polygon filled with noise");
+            $fflush;
+        end
+
         u_soc.page1.__mem__pixels.buffer[123] = 4'hE;
         if (u_soc.page1.__mem__pixels.buffer[123] !== 4'hE)
             $display("tb_soc: PROBE IS BROKEN - cannot round-trip page1's pixel array");
@@ -823,6 +933,30 @@ reg design_run = 1'b0;
         if (vid_errors != 0) begin
             $display("tb_soc: FAIL - %0d APF video protocol violations", vid_errors);
             s1_pass = 0;
+        end
+
+        // Where does a wrong byte live: in the chip, or in the way it gets read out? The
+        // delivered-vs-image check cannot tell those apart and they are different bugs -- one
+        // is the upload, one is the read path -- so compare the model's memory against the
+        // image over the megabyte op_drawString reads. Byte order is the design's: even byte
+        // in [7:0], odd byte in [15:8] (see aw_rom's c_byte mux).
+        begin : psram_image_cmp
+            integer i, bad, firstbad;
+            bad = 0; firstbad = -1;
+            for (i = 0; i < 65536; i = i + 1) begin
+                if (u_mem.mem[22'h8_0000 + i[21:0]] !==
+                    {ref_mem[('h10_0000 + i*2) + 1], ref_mem['h10_0000 + i*2]}) begin
+                    bad = bad + 1;
+                    if (firstbad < 0) firstbad = i;
+                end
+            end
+            if (bad != 0) begin
+                errors = errors + 1;
+                $display("  FAIL: PSRAM disagrees with the image over the text megabyte: %0d words, first at word %0d (holds %04h, image %04h)",
+                         bad, firstbad, u_mem.mem[22'h8_0000 + firstbad[21:0]],
+                         {ref_mem[('h10_0000 + firstbad*2) + 1], ref_mem['h10_0000 + firstbad*2]});
+            end else
+                $display("  ok   PSRAM holds the image across the text megabyte (65536 words)");
         end
 
         // A run that produced only black frames is not a pass, whatever else went right.
