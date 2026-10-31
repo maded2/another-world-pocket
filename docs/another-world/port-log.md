@@ -1607,3 +1607,162 @@ of 32/68/100). A person describing a screen would not have caught that, and neit
 Gate: tb_soc 95 frames / 75 rich / 0 errors, tb_top all checks, tb_dbg (tag 1038a),
 tb_write, tb_rom, tb_iv, tb_keys, tb_reset PASS. Build 1038a: no 332049, worst slack
 +0.114 ns, 4,278 ALMs (23%), sha256 0694cdae9a... (build/aw/bitstream.rbf_r).
+
+## 2026-10-31 (later): 1038a on hardware — first launch black, relaunch fine; and the census that found why
+
+1038a on a Pocket gave the right colours and a new symptom in one go. First launch after
+power-on: black, with
+
+```
+F=fa00  L=0   Y climbing ~4.6 kB/frame   (healthy: a full window scanned, all black, ~0.55 kB)
+```
+
+Quit and relaunch: the game. A VM executing *something*, a full raster, and the picture only
+appears once the pack has been uploaded a second time. Nothing in the design could see the
+difference, because the upload's evidence is `dbg_wr_match` — *addresses* seen in the pack
+window — plus two real read-backs in the whole 2 MiB: word 0 (`P=0004`) and the trailer
+(`C0`). Everything between those two reads had never been checked as a whole.
+
+Two candidates, and the cheap one got tested first: uninitialized BRAM (the palette/pages are
+declared `uninitialized` in `aw_pocket.si`) was ruled out with `tb_soc +FUZZ_BRAM=1`, which
+paints the four video pages, the palette and the polygon stack with noise before the game gets
+them — 87 rich frames, boot unaffected. That left "the upload did not commit", which the
+design cannot currently observe at all.
+
+### The instrument: a whole-pack census in `aw_rom`
+
+The write side accumulates every 16-bit word it *commits* (`d_taken`, not `d_act`) — sum, xor,
+four quarters — and records the high-water word. Once the pack is in, one read-only sweep goes
+back over exactly `0..cw_max` through the self-test's sequencer and accumulates again. Equal
+means the chip holds the file; the quarters say where it does not, without a per-word bitmap.
+11.1 sequencer cycles per word measured (`365,169` cycles for 32,768 words), so the full pack
+is ~11.7 M cycles = **~126 ms with the VM still in reset**, once per power-on. `rom_ready`
+waits on it — but only when one was armed, and only until `cen_budget` (~0.67 s) expires,
+because a diagnostic that can hold boot is a black screen with extra steps.
+
+### What it found before it shipped: six pack bytes lost per self-test probe round
+
+`wr_taken = wr_req & wr_ready` was shared by the two bus masters. The self-test forces `wr_req`
+high for its own probe write while the loader's drain sits in `D_RUN`; the drain saw `wr_taken`,
+advanced, and consumed a word whose address and data never went anywhere. Measured in `tb_rom`
+at PACE=10: **three 16-bit words missing every 5,520 words (11,040 bytes apart), matching
+`ST_PERIOD` = 41,250 cycles ≈ 444 µs exactly.** 510 checks passed it, because none of them read
+the whole pack back. Each master takes its own acceptance now (`d_taken`, `st_taken`); dropping
+`~ld_abort` from `d_taken` in the process was itself a second bug of the same shape and
+`tb_write` caught it (`rom_ready=0`, "busy never fell").
+
+The independent proof is the byte-exactness check in `tb_soc`, which had *never compared a
+single byte in any run* (its anchor carried the `+0x200000` bank bit, so the range test was
+false from byte zero). Fixing the mask, the 1038a netlist serves the VM 9 wrong bytes, one of
+them a run of `5a` — the PSRAM model's power-up pattern, i.e. a region of the chip nobody had
+written. The fixed `aw_rom`: none.
+
+### Second finding: the bench accused the ROM of three errors it did not commit
+
+Those nine became three, all of them at `k=0`, and they were the *bench*. The VM changes
+`mem_addr` one or two cycles before it raises `in_ready`, and the last byte of the old stream is
+delivered in between, so the checker re-based on the new address and compared the old stream's
+final byte against it. `+READ_TRACE` (now `READTRACE=1` in `scripts/sim_soc.sh`) settles it in
+four lines — the design had taken that byte legitimately one cycle earlier, tag matching,
+`rewinds=0`, with its own `ACCEPT addr=0022dd` still one cycle away:
+
+```
+R114300350000 TAKE addr=0125a0 byte=00 cw=0f00 tag=0092d0 lvl=25 n_v=0
+R114300390000 LAND addr=0092d1 word=00ff st=3 want=0092d0 lvl=25
+  ROM GAVE WRONG BYTE t=114300390000 addr=22dd got=00 image=84 (k=0) c_addr=125a1 c_tag=92d0 rewinds=0
+R114300511000 ACCEPT addr=0022dd
+```
+
+The checker now anchors on the design's own `accept_vm` (new stream) and `rewind` (same stream
+from the start again), and ignores `mem_data` while `chk_active` means the bytes are the boot
+check's trailer reads. Anchor to the design's events, not to your model of them.
+
+### Third finding, from the build itself: 1039a failed STA, and the census caused it
+
+```
+Slack -0.385 / TNS -0.682  (Slow 1100mV 85C)  clk_psram (general[2], 10.774 ns)
+  from aw_rom|u_sfifo|rptr_sync2[5]  to  aw_rom|u_psram|psram_lb_n     (6 levels, 56% interconnect)
+```
+
+`p_allow` — the stream FIFO's free-space compare, synchronised pointer → grey-to-binary →
+subtract → compare — was feeding `rd_req`, and `rd_req` is half of aw_psram's `take`, which is
+what loads the chip-facing byte-enable registers. The fifo lives three columns from the cram0
+I/O cells and the fitter has no reason to close that gap. One flop (`p_allow_q`) ends the
+comparison beside the fifo and leaves one level between the flag and the bus. The cycle of
+staleness buys at most one extra accepted read; `FETCH_HEADROOM` is 7 words against at most two
+reads in flight, and the request stays a level held until taken, which is the contract
+`aw_psram` depends on. It also stops letting the asynchronous `sf_level` sample propagate
+through arithmetic into a chip control register. Result: **+1.254 ns** on that clock.
+
+`ST_WAIT` got a timeout in the same pass: the sequencer is shared and `st_active` gates the
+producer, so a probe whose readback never arrives does not lose a probe, it starves the ROM path
+for the rest of the power cycle.
+
+### Gate and build (1040a)
+
+### Then `make check-build` caught two more, both inside the census
+
+```
+map: aw_rom|cw_q[2][*] - Stuck at GND due to stuck port data_in      (64 of these)
+map: aw_rom|census_limit[21], census_addr[21] - Stuck at GND
+```
+
+The quarter index was written `addr[CEN_QSHIFT+1 +: 2]`. `+:` starts **at** the base bit, so
+that is bits [20:19] — and the word address only has bits [19:0]. The index could therefore only
+ever be 0 or 1: quarters 2 and 3 were registers tied to zero, and the "which part of the pack
+went bad" half of the instrument was quietly two halves. Simulation could not have noticed: the
+sums that `Z` reports are computed independently and stayed correct, and a real mismatch would
+still have been flagged — just with a map that could only ever name two of four buckets. The
+total was never in danger; the *resolution* was, which is the kind of defect only a tool that
+reads the design as built sees.
+
+The fix (`addr[CEN_QSHIFT +: 2]`) came with the check that should have had it from the start:
+`tb_rom` now fails if any quarter on either side is still zero after a clean sweep, and the
+`+SKIP=<word>` negative control asserts that the mask names the quarter holding the withheld
+word. Mutation test — putting the `+1` back, same bench:
+
+```
+  FAIL: quarter 2 never accumulated (written 00000000 read 00000000) - the range or the index is wrong
+  FAIL: quarter 3 never accumulated (written 00000000 read 00000000) - the range or the index is wrong
+  tb_rom: 519 checks, 2 errors -> FAIL
+```
+
+The two stuck top bits on the sweep registers were the same class of finding and are gone the
+honest way: the cursor and its end are `$clog2(CENSUS_RANGE)` bits wide and hold the *last index*
+rather than a limit, so nothing in them is unreachable (a 2 MB pack lives in one die, so the
+die-select bit was never going to move). "It costs nothing to keep the width" is wrong when the
+width is the thing the fitter is complaining about.
+
+### Gate and build (1040a)
+
+| step | result |
+|---|---|
+| `scripts/sim_rom.sh` | **519 checks, 0 errors** — census `sum_r == sum_w == 1f4b8fbe` over the swept range, `qmism=0`, all four quarters accumulating; `+SKIP=<word>` still flags a withheld write and the mask names its quarter |
+| `scripts/sim_write.sh` | `rom_ready=1 rom_error=0`, 0 errors |
+| `scripts/sim_soc.sh` (part1) | 95 frames, 82 non-black, 78 rich, **0 errors** with the live per-byte check; `SEGOFFSETS 0,1255d,268f,3aed3` |
+| `sim_iv` / `sim_keys` / `sim_reset` / `sim_dbg` / `sim-top` | PASS (dbg tag `AW 1040a up`) |
+| Quartus 1040a | **no negative slack in any corner** (psram setup +1.217 ns slow-85C, +0.392 fast-0C; worst anywhere +0.126 ns), no 332049, 4,775 ALMs (26%), `make check-build`: *no dead logic in the core's own modules*, every SDC constraint matched something. `build/aw/bitstream.rbf_r` sha256 `888b1c056d70…` |
+
+Netlist regenerated from the committed `aw_pocket.si` and byte-identical to the one the 11:02
+build used, so the palette fix is in this bitstream and was in 1039a's too.
+
+### What 1040a has to say on the wire, and what it settles
+
+The census sums little-endian 16-bit words over exactly the range the upload wrote —
+`0xffff8` words for every part file — so **the expected numbers are known from the file before
+the card is even made**:
+
+```
+AW 1040a up
+C0:000000005d2501008f260000d3ae0300 <match>/<all> Da5a5 Ba55a Na5a5 R0000 P0004
+    V<frames> F<de/frame> L<lit/frame> Y<rom bytes> X<status> Z.0 dd744c92/dd744c92
+```
+
+`dd744c92` = `sum(struct.unpack('<1048568H', open('part1.bin','rb').read())) & 0xffffffff`
+(part0 `3d05a6cb`, part2 `cc836d51`, part3 `06e27bde`, part4 `f0f9552e`, part5 `9cace960`,
+part6 `fccf3bab`, part7 `7213f501`). `Z.` with both sums equal to the file's means the 2 MiB in
+the chip *is* the 2 MiB that was sent, and the black first launch is not the upload: the search
+stays on the boot/VM side. `Z!` with the quarter mask names a 512 KiB range (word bits
+[19:18]). `ZT` is a stalled sweep — the read path is the suspect. `ZP` forever means no upload
+completed. If the first launch is still black while a relaunch works, and Z is `.` on both,
+then the pack is identical in both cases and the difference is in what the VM is released with.

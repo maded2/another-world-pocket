@@ -77,6 +77,18 @@ does not respond at all, suspect pin assignments (`cram0_clk` G10, `cram0_wait` 
 async-mode assumption itself (try driving `psram_clk` from `clk_psram` — one-line change in
 `aw_psram.v`), or the CE# die-select mapping.
 
+**Pack integrity, from 1040a: the `Z` field on the CHK line.** The two counters that used to
+prove the upload (`wr_match`/`wr_all`) count *addresses seen in range*, not data that reached the
+chip, and until 1040a the only read-backs in 2 MiB were word 0 (`P`) and the trailer (`C0`). The
+core now sums every 16-bit word as it commits it, reads the same range back once (~126 ms, VM in
+reset) and sums again, and prints `Z<flag> <quarter> <read_sum>/<written_sum>` at the end of the
+line. For part1.bin both sums should read **`dd744c92`** — that is the file's own word sum, so
+`Z.0 dd744c92/dd744c92` is the statement "the 2 MiB in the chip is the 2 MiB that was sent", and
+nothing below it needs to be re-examined. `!` plus the quarter mask names a 512 KiB range (word
+bits [19:18]); `T` is a stalled sweep (suspect the read path, not the pack); `P` means no upload
+completed, so read the `C`/`S` fields instead. Full legend and the per-part sums:
+`scripts/sd_install_1040a.sh`.
+
 Error codes are sticky once latched, so a colour that appears briefly and is then replaced by the
 game is still a real event worth writing down.
 
