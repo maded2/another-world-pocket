@@ -959,8 +959,12 @@ module aw_rom (
 
     reg  [1:0]  c_state;
     reg  [1:0]  gap;
-    reg  [20:0] c_addr;                 // next byte this reader owes
-    reg  [20:0] c_start;
+    reg  [20:0] c_addr;                 // next byte this reader owes - and the only stream
+                                        // position there is. c_start used to sit next to it and
+                                        // 1041a deleted its last reader (the restart now resumes
+                                        // at c_addr, see below), which left a 21-bit register
+                                        // nobody reads. The fitter calls that dead logic and it
+                                        // is right: keep a register only if something reads it.
     reg         c_served;
     reg         c_v;
     reg  [15:0] c_word, n_word;
@@ -1071,7 +1075,6 @@ module aw_rom (
             rom_dbg_rd_bytes <= 32'd0;
             gap          <= 2'd0;
             c_addr       <= 21'd0;
-            c_start      <= 21'd0;
             start_addr_r <= 22'd0;
             c_v          <= 1'b0;
             c_served     <= 1'b0;
@@ -1092,7 +1095,6 @@ module aw_rom (
             mem_data_available <= 1'b0;
 
             if (accept) begin
-                c_start      <= acc_addr;
                 start_addr_r <= {2'b0, acc_addr[20:1]};
                 c_addr       <= acc_addr;
                 c_v          <= 1'b0;
@@ -1111,8 +1113,28 @@ module aw_rom (
                 // garbage boot), so a real acceptance always came along to clear it.
                 busy_q       <= accept_vm;
             end else if (rewind) begin
-                c_addr       <= c_start;
-                start_addr_r <= {2'b0, c_start[20:1]};
+                // Restart the READ, not the stream. The signal keeps its old name (the benches
+                // probe it) and the name is the wrong word for what has to happen here.
+                //
+                // This used to do `c_addr <= c_start`: back to the address the acceptance began,
+                // handing out again bytes the VM has already consumed. Nothing tells the VM. It
+                // keeps its own position - op_drawString holds in_ready for a whole strip and
+                // advances pix_waddr once per byte - so every re-served byte shifted everything
+                // written after it.
+                //
+                // Measured on the copy-protection screen (build log /tmp/p0c.log): 405 restarts,
+                // every one of them after exactly 158 bytes, because a PSRAM word costs ~140 ns
+                // while the VM eats two bytes every ~80 ns and the prefetch FIFO therefore drains.
+                // The 200-row text strip became the same 158-byte pattern repeated, and since
+                // 320 mod 158 = 4, each row of it began four pixels along from the row above:
+                // the "every line of text is offset to the left" report, to the pixel.
+                //
+                // c_addr already names the next byte the consumer has NOT been given, so the
+                // recovery is to seek the word containing that byte and hand it out. Nothing is
+                // repeated. The boot check benefits the same way - its shift register used to be
+                // re-fed from the trailer start, which is one reason the trailer could fail to
+                // validate however well the chip answered.
+                start_addr_r <= {2'b0, c_addr[20:1]};
                 c_v          <= 1'b0;
                 n_v          <= 1'b0;
                 c_served     <= 1'b0;

@@ -62,7 +62,7 @@ localparam MID_UP      = 3'd0,   // "AW 1026a up\n"            console out of re
 // sits in the MSB.
 // The tag in the boot line is the build id - the first thing a hardware session
 // prints, so any capture identifies which bitstream is actually in the FPGA.
-localparam [8*12-1:0]  MSG_UP      = "AW 1040a up\n";   // diag build: also re-sent every ~2 s (tag_cnt)
+localparam [8*12-1:0]  MSG_UP      = "AW 1041a up\n";   // diag build: also re-sent every ~2 s (tag_cnt)
 localparam [8*13-1:0]  MSG_RUN     = "game running\n";
 localparam [8*15-1:0]  MSG_OK      = "pack loaded ok\n";
 localparam [8*21-1:0]  MSG_ERR1    = "ROM ERR: bad trailer\n";

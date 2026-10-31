@@ -207,6 +207,28 @@ nothing tries to use it.
 - In simulation the same distinction is available as `starving=` in `make sim-soc` output and the
   `rom_error` codes; on device the placeholder colour is the equivalent signal.
 
+## From 1041a: the text is the measurement
+
+`scripts/sd_install_1041a.sh` installs `Eddie Chan.AW 1041`. It is the fix for the report that came
+back from 1040a: *every pixel line of the text is offset to the left*. Cause and proof are in
+port-log ("the text shear"); in one line, the ROM reader's recovery restarted a stalled stream at
+the address the acceptance **began** and re-handed-out bytes the VM had already consumed, and
+`op_drawString` holds one request for a whole 320-byte-per-row strip, so the strip became a
+158-byte pattern repeating with a 4 px per row offset (`320 mod 158 = 4`).
+
+So for this build the answer that matters is on the screen, not on the wire:
+
+- any dialog or caption: are the lines straight now, and do they land where the game puts them?
+- the copy-protection screen (`part0`) is the sharpest test - it is one full-screen 320x200 text
+  strip, and it is the exact case the sim reproduces (drawn at frame 14, 64,000 pixels);
+- the `Z` field still has to say `Z.0 dd744c92/dd744c92` for `part1` - that half is unchanged and
+  a regression there means something else broke, not this.
+
+Known and accepted: the stream still stalls every ~158 bytes on a long strip (the prefetch FIFO
+drains because a PSRAM word costs ~140 ns while the VM eats two bytes every ~80 ns). That is now a
+~140 ns wait rather than corrupt data, and 405 of them across a full-screen strip is ~0.12 ms. If
+text draws visibly *slower* than before on device, that is this, and it is the next thing to fix.
+
 ## What to report back
 
 1. Seconds from file confirm to first picture, for `part1`.

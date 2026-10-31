@@ -312,6 +312,8 @@ reg design_run = 1'b0;
     // with rewinds=0 is a delivered word that did not match its tag's neighbourhood; a wrong
     // byte next to a rewind is a stream that restarted, which is a different bug.
     integer   rewinds = 0;
+    integer   rewind_reissue = 0;   // restarts that happened AFTER bytes were delivered (see below)
+    integer   chk_unchk = 0;        // bytes not comparable (address outside the image window)
     always @(posedge clk_core) if (u_rom.rewind) rewinds = rewinds + 1;
     integer   black_frames = 0;
     // "Not black" is not "the game is drawing". Frames 10-13 of the intro are a uniform
@@ -483,6 +485,118 @@ reg design_run = 1'b0;
         if (u_soc._t__page1_wenable) pg_we[1] = pg_we[1] + 1;
         if (u_soc._t__page2_wenable) pg_we[2] = pg_we[2] + 1;
         if (u_soc._t__page3_wenable) pg_we[3] = pg_we[3] + 1;
+    end
+
+    // ---- text strip monitor -------------------------------------------------------------
+    // op_drawString writes a text strip straight into a page: one byte off the ROM stream is
+    // one destination pixel, and the destination starts at x*8 + y*320 (vm.si:2543), 320 bytes
+    // per row. So the write address MUST advance exactly one per stream byte for the whole
+    // strip. Gain or lose a byte mid-strip and every later row slides sideways - the hardware
+    // symptom "each pixel line of the text is offset to the left" - while a merely wrong byte
+    // value could only speckle the glyphs. A rewind (aw_rom re-serving bytes the VM already
+    // consumed) does exactly that: the VM keeps advancing pix_waddr over data it has seen.
+    // Watch the vm's own write port against the stream and report drift with its row number.
+    localparam integer TXT_GAP = 4000;      // this many cycles with no vm write = new strip
+    reg      txt_in_strip = 0;
+    integer  txt_gap = 0;
+    integer  txt_base = 0;                  // destination pixel of the strip's first write
+    integer  txt_k0 = 0;                    // bytes_to_vm when the strip began
+    integer  txt_off = -1;                  // first (addr - base - k); must stay constant
+    integer  txt_strips = 0, txt_writes = 0, txt_drift = 0, txt_val = 0, txt_rewind = 0;
+    integer  txt_last_row = 0, txt_f0 = 0, txt_f1 = 0;
+    integer  txt_src = 0, txt_cmis = 0;      // source byte of the strip, content mismatches
+    integer  txt_acc = 0;                    // acceptances seen inside the current strip
+    integer  txt_k = 0;                      // bytes the VM has consumed since the strip began
+    reg [7:0] txt_data_d = 8'h0;
+    reg       txt_avail_d = 1'b0;
+    always @(posedge clk_core) begin
+        txt_avail_d <= mem_data_available;
+        txt_data_d  <= mem_data;
+        if (u_rom.rewind && txt_in_strip) txt_rewind = txt_rewind + 1;
+        // The VM's drawString loop sets mem.addr once and then holds in_ready, so an acceptance
+        // in the middle of a strip is the reader restarting. Whether that re-serves old bytes or
+        // picks up at the byte the VM still wants is the whole question, and this says which:
+        // the address on a restart tells it directly.
+        if (u_rom.accept_vm && txt_in_strip) begin
+            txt_acc = txt_acc + 1;
+            if (txt_acc <= 6)
+                $display("  TEXT RE-ACCEPT k=%0d addr=%0h (strip src=%0h, expected next byte address %0h)",
+                         bytes_to_vm - txt_k0, mem_addr, txt_src, txt_src + (bytes_to_vm - txt_k0));
+        end
+        if (tr_vm_pix_we) txt_gap = 0; else txt_gap = txt_gap + 1;
+        if (tr_vm_pix_we && (!txt_in_strip || txt_gap > TXT_GAP)) begin
+            // first write of a strip: the address jumps here, so nothing to compare yet
+            txt_in_strip = 1;
+            txt_base     = u_soc._w_vm_pix_waddr;
+            txt_k0       = bytes_to_vm;
+            txt_src      = stream_base;   // the acceptance this strip's bytes come from
+            // Byte 0 is compared here as well: this branch is the first write's cycle, and the
+            // branch below never sees it. Without this the first pixel of every strip goes
+            // unchecked, which is a strange thing to leave out of a content check.
+            if (txt_avail_d && txt_data_d !== ref_mem[txt_src]) begin
+                txt_cmis = txt_cmis + 1;
+                $display("  TEXT CONTENT strip %0d FIRST byte: got %02h, image byte %02h at %0h",
+                         txt_strips, txt_data_d, ref_mem[txt_src], txt_src);
+            end
+            txt_off      = -1;
+            txt_f0       = frames;
+            txt_strips   = txt_strips + 1;
+            if (txt_strips <= 8)
+                $display("  TEXT strip %0d: dst=%0d (x=%0d y=%0d) at stream byte %0d frame %0d",
+                         txt_strips, txt_base, txt_base % 320, txt_base / 320, bytes_to_vm, frames);
+        end else if (tr_vm_pix_we) begin
+            txt_writes = txt_writes + 1;
+            txt_f1     = frames;
+            begin : txt_chk
+                integer off;
+                txt_k = bytes_to_vm - txt_k0;
+                off = u_soc._w_vm_pix_waddr - txt_base - txt_k;
+                if (txt_off < 0) txt_off = off;
+                else if (off != txt_off) begin
+                    txt_drift = txt_drift + 1;
+                    if (txt_drift <= 8)
+                        $display("  TEXT DRIFT strip %0d write %0d: dst=%0d row %0d col %0d, address moved by %0d for %0d stream bytes (offset now %0d, was %0d) rewinds=%0d",
+                                 txt_strips, txt_writes, u_soc._w_vm_pix_waddr,
+                                 (u_soc._w_vm_pix_waddr - txt_base) / 320,
+                                 (u_soc._w_vm_pix_waddr - txt_base) % 320,
+                                 u_soc._w_vm_pix_waddr - (txt_base + txt_off + txt_k - 1),
+                                 txt_k, off, txt_off, rewinds);
+                end
+            end
+            txt_last_row = (u_soc._w_vm_pix_waddr - txt_base) / 320;
+            // CONTENT, which the address check cannot do: the VM writes byte k of this strip at
+            // base+k, so the byte itself has to be the pack's byte at src+k. A stream restart
+            // hands out bytes the VM already consumed, which leaves the address arithmetic perfect
+            // (drift=0) while the picture painted comes from the wrong offsets - a strip whose rows
+            // are pulled sideways. Compare against the image, not against the design.
+            if (txt_avail_d && (txt_src + txt_k) < PACK_BYTES) begin
+                if (txt_data_d !== ref_mem[txt_src + txt_k]) begin
+                    txt_cmis = txt_cmis + 1;
+                    if (txt_cmis <= 6)
+                        $display("  TEXT CONTENT strip %0d write %0d: pixel %0d (row %0d col %0d) got %02h, image byte %02h at %0h (k=%0d). Image around it: %02h %02h [%02h] %02h %02h. Acceptances since the strip began: %0d",
+                                 txt_strips, txt_writes, u_soc._w_vm_pix_waddr,
+                                 (u_soc._w_vm_pix_waddr - txt_base) / 320,
+                                 (u_soc._w_vm_pix_waddr - txt_base) % 320,
+                                 txt_data_d, ref_mem[txt_src + txt_k], txt_src + txt_k, txt_k,
+                                 ref_mem[txt_src + txt_k - 2], ref_mem[txt_src + txt_k - 1],
+                                 ref_mem[txt_src + txt_k], ref_mem[txt_src + txt_k + 1],
+                                 ref_mem[txt_src + txt_k + 2], txt_acc);
+                end
+            end
+            // Value side: palid = color & byte[0:3], and the write only happens when byte[4]
+            // is set. A write whose byte has bit4 clear, or a colour with bits outside the
+            // byte's nibble, means the enable/colour and the byte are not the same byte.
+            if (txt_avail_d) begin
+                if (((u_soc._w_vm_pix_palid & ~txt_data_d[3:0]) != 4'd0) ||
+                    (txt_data_d[4] == 1'b0)) begin
+                    txt_val = txt_val + 1;
+                    if (txt_val <= 5)
+                        $display("  TEXT VALUE strip %0d write %0d: byte=%h palid=%h dst=%0d (bit4=%b)",
+                                 txt_strips, txt_writes, txt_data_d, u_soc._w_vm_pix_palid,
+                                 u_soc._w_vm_pix_waddr, txt_data_d[4]);
+                end
+            end
+        end
     end
 
     integer addrlog = 0, addrlogged = 0;
@@ -682,10 +796,17 @@ reg design_run = 1'b0;
         // trailer reads (TRAILER_ADDR, repeated) and not the VM's stream.
         if (mem_data_available && !u_rom.chk_active) begin
             bytes_to_vm = bytes_to_vm + 1;
+            if ((stream_base + served_k) >= PACK_BYTES) chk_unchk = chk_unchk + 1;
             // Every byte handed to the VM, checked against the image. When the game draws
             // nothing this is what tells you whether the ROM lied or the VM asked for
             // something strange: 'the byte was wrong' and 'the address was wrong' look
             // identical from a black screen.
+            //
+            // served_k advances on every byte and is reset ONLY by a new acceptance - never by a
+            // restart inside one. That is the whole point. Mirroring the design's restart here is
+            // what let 405 re-served-byte storms read as a clean stream, because a repeated byte
+            // compared against the position the design had just rewound to and matched. The VM
+            // has no such reset, so this is the check that says whether a recovery was lossless.
             if (served_k >= 0 && (stream_base + served_k) < PACK_BYTES) begin
                 if (mem_data !== ref_mem[stream_base + served_k]) begin
                     errors = errors + 1;
@@ -737,7 +858,26 @@ reg design_run = 1'b0;
             if (mem_addr > tr_addr_hi) tr_addr_hi = mem_addr;
 `endif
         end else if (u_rom.rewind) begin
-            served_k = 0;             // same stream, same base, handed out again from c_start
+            // This used to reset served_k, on the reasoning "same stream, same base, handed out
+            // again from c_start". That is what the DESIGN does, and mirroring it made the
+            // checker blind to the one thing that matters: the VM has no idea a restart happened.
+            // It keeps its own position (op_drawString keeps incrementing pix_waddr), so every
+            // byte the reader re-issues after having already handed one out is a byte the VM will
+            // write at the wrong place. The reset was the blind spot, not the truth: measure the
+            // stream the way the consumer sees it, and count a rewind that happens after bytes
+            // have gone out as the design error it is.
+            // A restart is a recovery inside one acceptance: the reader parks and re-seeks.
+            // It is only harmless if it resumes at the byte the VM has not been given, so the
+            // count is printed and the byte check below is what decides: served_k keeps running
+            // across restarts, which is exactly how the VM sees the stream. Before the design
+            // fix, restarts after N bytes produced N-byte repeats here; a green byte count with
+            // restarts nonzero is the proof that a restart costs nothing but time.
+            if (served_k > 0) begin
+                rewind_reissue = rewind_reissue + 1;
+                if (rewind_reissue <= 3)
+                    $display("  STREAM RESTART t=%0t mid-acceptance, after %0d bytes (base=%0h): continuing to compare against src+k, because the VM's position does not reset.",
+                             $time, served_k, stream_base);
+            end
         end
         served_prev   = mem_data_available;
         if (game_vs) begin
@@ -957,6 +1097,47 @@ reg design_run = 1'b0;
                          {ref_mem[('h10_0000 + firstbad*2) + 1], ref_mem['h10_0000 + firstbad*2]});
             end else
                 $display("  ok   PSRAM holds the image across the text megabyte (65536 words)");
+        end
+
+        // ---- text verdict ---------------------------------------------------------------
+        // The strip monitor above is the answer to "each line of text is offset to the left":
+        // op_drawString lays one byte down as one pixel at base+k, so if the vm's write address
+        // and the byte stream disagree, every later row of the strip slides sideways.
+        $display("TEXT  : %0d strips, %0d writes, drift=%0d value=%0d content=%0d rewinds_in_strip=%0d last_row=%0d (last strip frames %0d..%0d)",
+                 txt_strips, txt_writes, txt_drift, txt_val, txt_cmis, txt_rewind, txt_last_row, txt_f0, txt_f1);
+        $display("STREAM: %0d restarts, %0d of them AFTER bytes had already been handed to the VM (the VM keeps its own position; those shift everything after them)",
+                 rewinds, rewind_reissue);
+        if (txt_drift != 0 || txt_val != 0 || txt_cmis != 0) begin
+            $display("        => text is NOT laid down byte-for-byte: wrong content at a correct address means the stream was handed out twice, not that the strip was mis-added.");
+            errors = errors + txt_drift + txt_val + txt_cmis;
+        end
+        if (rewind_reissue != 0)
+            $display("        %0d mid-acceptance restarts: fine while the byte check stays clean (they cost ~140 ns each), fatal the moment the reader re-issues a byte - that is what sheared the text.",
+                     rewind_reissue);
+
+        // ---- pack census (design-side counters, reported the way the CHK line does) ------
+        // aw_rom adds every word it commits and, once per power-on, reads the same range back.
+        // In sim there is no bridge upload, so the bench fakes the handshake and the sweep then
+        // competes with the running VM for the sequencer: report progress, and only insist on
+        // the sums when the sweep actually finished. A quarter mismatch is always real.
+        begin : cen_report
+            $display("CENSUS: arm=%0d active=%0d done=%0d timeout=%0d at word %0d qmism=%0h sum written=%08h readback=%08h",
+                     u_rom.vfy_arm, u_rom.census_active, u_rom.census_done, u_rom.census_to,
+                     u_rom.census_addr, u_rom.rom_census_qmism,
+                     u_rom.rom_census_sum_w, u_rom.rom_census_sum_r);
+            // Only judge it once the sweep is over: in sim the VM keeps the sequencer busy, so
+            // a pending census is normal and says nothing about the pack.
+            if (u_rom.rom_census_qmism != 4'h0) begin
+                $display("        => the design's own census says a 512 KiB quarter differs between write and read-back.");
+                errors = errors + 1;
+            end
+            // {timeout, done, gap}: judge the sums only on a completed sweep with contiguous
+            // writes, the only state where written and readback have to be equal.
+            if (u_rom.rom_census_stat[1] && !u_rom.rom_census_stat[0] &&
+                u_rom.rom_census_sum_w !== u_rom.rom_census_sum_r) begin
+                $display("        => census done without a flagged quarter, yet the two sums differ: a word changed between write and read-back.");
+                errors = errors + 1;
+            end
         end
 
         // A run that produced only black frames is not a pass, whatever else went right.

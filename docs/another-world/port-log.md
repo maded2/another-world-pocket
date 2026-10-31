@@ -1766,3 +1766,172 @@ stays on the boot/VM side. `Z!` with the quarter mask names a 512 KiB range (wor
 [19:18]). `ZT` is a stalled sweep — the read path is the suspect. `ZP` forever means no upload
 completed. If the first launch is still black while a relaunch works, and Z is `.` on both,
 then the pack is identical in both cases and the difference is in what the VM is released with.
+
+---
+
+## 2026-10-31 (late): the text shear — 1041a, and the checker that was mirroring the bug
+
+### The report from the card
+
+1040a ran on hardware with the census reporting the pack intact, and the answer that came back
+was about the screen: **the text renders, but every pixel line of it is offset to the left.**
+
+That sentence is precise, and so is the cause. It cost a day to find because the bench had been
+agreeing with the design about a bug only the consumer could see.
+
+### Why 270 frames of part1 told me nothing
+
+`vm_pix` (the VM's direct pixel port, the only thing `op_drawString` writes through) had been
+`0` in every part1 run. Not a bug: the intro simply does not draw text. The reference trace
+(`build/ref/p1trace/trace.log`) has 1,662 `op_drawString` calls with `skip=0`, the first at
+cycle 76,226,813 — around frame 181 at the reference's 420 k cycles/frame — and our 95-frame run
+was nowhere near it. A 400-frame run reached frame 270 with `vm_pix=0`, `rast=595675`,
+`blit=6400100`: an animating game that had not yet drawn a string.
+
+The fast path to the code is **part0** (the copy-protection screen). Its reference trace shows a
+full-screen strip drawn almost immediately:
+
+```
+[    582808] op_drawString id=  614 x=    0 y=    0 color=65535 start=07ba stop=0882 len=  200 skip=0
+```
+
+`len=200` is 200 rows × 320 bytes = **64,000 pixels in one call**, and in our design that strip is
+written at **frame 14**. Twenty-five frames and the whole text path has been exercised.
+
+### The design fault
+
+`aw_rom`'s stream reader had one recovery for "the word the consumer wants next is not here yet":
+
+```verilog
+wire rewind = (c_state == C_RUN) & want & c_served & ~take & ~handoff;
+...
+end else if (rewind) begin
+    c_addr       <= c_start;      // <-- back to the address the acceptance began
+```
+
+For a one-byte `readByte()` that is nearly harmless. For `op_drawString` it is not: the VM sets
+`mem.addr` once, holds `in_ready` for the whole strip and advances `pix_waddr` once per byte
+(`vm.si`), so **every byte the reader hands out a second time shifts everything written after
+it**. Nothing tells the VM a restart happened — there is no signal for it in `mem_io`.
+
+Measured on part0, 25 frames:
+
+```
+TEXT strip 1: dst=1 (x=1 y=0) at stream byte 12709 frame 14
+STREAM RESTART t=233533241000 mid-acceptance, after 158 bytes (base=19a880)
+STREAM RESTART t=233544877000 mid-acceptance, after 316 bytes (base=19a880)
+STREAM RESTART t=233556513000 mid-acceptance, after 474 bytes (base=19a880)
+TEXT  : 1 strips, 64000 writes, drift=0 value=0 rewinds_in_strip=405
+```
+
+Every restart after **exactly 158 bytes**. That number is the stream FIFO emptying: `SDB=6`, so
+64 words plus the ones already in the pipeline, drained because a PSRAM word costs ~140 ns while
+the VM consumes two bytes every ~80 ns. The producer is slower than this consumer, so on a long
+stream the FIFO always ends up empty and the recovery always runs.
+
+So the 200-row strip became **the same 158-byte pattern repeated**, and the row stride is 320:
+
+```
+320 = 2*158 + 4      -> each row starts 4 bytes further along the pattern than the row above
+```
+
+A leftward drift of ~4 pixels per text line, wrapping every 40 rows. That is what the card
+reported, and it is the only mechanism that produces a *shear* rather than speckle: a wrong byte
+value can only speckle, and a wrong destination address can only misplace a pixel.
+
+### Why the bench defended it
+
+`tb_soc` has had a per-byte ROM check for days, and it said 0 errors throughout. Its rewind
+handler was:
+
+```systemverilog
+end else if (u_rom.rewind) begin
+    served_k = 0;    // same stream, same base, handed out again from c_start
+end
+```
+
+Mirroring the design. A re-served byte then compared against the position the design had just
+rewound to — and matched, every time. **The oracle had been taught the bug's own idea of the
+stream.** `served_k` now advances on every byte and resets only on a new acceptance, which is
+how the VM sees it.
+
+A second oracle was added because address and content are different claims. During a strip the
+bench now checks, per write:
+
+| check | what it pins | catches |
+|---|---|---|
+| `drift` | `pix_waddr − base == bytes consumed` | mis-adding the destination (stride/skew) |
+| `value` | `palid ⊆ byte[3:0]`, and only ever with `byte[4]` set | enable/colour not the same byte as the data |
+| `content` | the byte equals `ref_mem[src + k]` | the stream handing out the wrong bytes |
+
+`content` compares against the **image**, not against anything the design believes.
+
+Writing it also produced the one honest measurement of the VM's own 1-pixel skew: the strip for
+`x=0 y=0` begins at destination `1`. `pix_waddr` is incremented by the same clocked assignment
+that sets `pix_wenable`, so the pixel from byte *k* lands at `base+k+1` — and that is upstream's
+code, compiled by the same Silice, so it is in the reference design too. One pixel, not ours, and
+not a shear.
+
+### The fix
+
+```verilog
+end else if (rewind) begin
+    start_addr_r <= {2'b0, c_addr[20:1]};   // the word containing the byte still owed
+```
+
+`c_addr` already names the next byte the consumer has *not* been given, so re-seeking its word
+loses nothing. `c_start` lost its last reader and is deleted — a 21-bit register nobody reads is
+dead logic, and `make check-build` is right to say so.
+
+The same recovery had been re-feeding the boot check's shift register from the trailer start,
+which is one reason the trailer could fail to validate however well the chip answered.
+
+### After the fix, same 25-frame part0 run
+
+```
+WRONG-BYTE: 0     (with the byte index no longer resetting on restarts)
+TEXT  : 1 strips, 63999 writes, drift=0 value=0 content=0 rewinds_in_strip=405
+CENSUS: arm=1 active=0 done=1 timeout=0 at word 2047 qmism=0 sum written=011057d6 readback=011057d6
+```
+
+Accounting for every number rather than admiring them:
+
+- **405 restarts still happen** — the throughput deficit is not gone, it just stopped being a
+  data fault. Each costs a re-seek (~140 ns), ~0.12 ms over the whole strip: invisible.
+- **63,999 counted writes** for a 64,000-byte strip: the monitor's strip-start branch handles the
+  first write's cycle and does not fall through to the counter. Byte 0 is now content-checked in
+  that branch too, so nothing in the strip goes unexamined. Every byte of the region has `bit4`
+  set (`part0` offset `0x19a880` starts `10 10 10 10 11 11 11 11`), so 64,000 opaque pixels is
+  exactly right.
+- **0 wrong bytes with 405 restarts** is the proof that a restart is now lossless: the byte
+  counter never stopped, and never disagreed.
+
+### Negative control: new oracle, old design
+
+`git show HEAD:cores/aw/src/fpga/core/aw_rom.v` (the pre-1041a reader, which restarts at
+`c_start`) dropped under the *new* tb_soc, part0, 25 frames:
+
+```
+ROM GAVE WRONG BYTE t=233538614000 addr=19a922 got=11 image=10 (k=162)
+                                c_addr=19a885 c_tag=cd442 n_addr=cd442 rewinds=1
+TEXT CONTENT strip 1 write 162: pixel 163 (row 0 col 162) got 11, image byte 10 at 19a922 (k=162)
+wrong-byte lines: 399 (the print cap)   content lines: 6
+```
+
+One line carries the whole mechanism: the VM is at byte `0x19a922` while the reader's `c_addr` is
+`0x19a885` — **158 bytes apart**, exactly one pattern, starting at the first restart and never
+recovering. The same tree with the fix reports 0. So the check does see the fault, and 1041a is
+what removes it.
+
+### Two things this leaves open, said plainly
+
+- **The throughput deficit is untouched.** The stream FIFO still drains every ~158 bytes on a
+  long strip because the producer (1 word / ~140 ns) is slower than this consumer (2 bytes /
+  ~80 ns). It is now a stall instead of a corruption, and 405 stalls cost ~0.12 ms, but the
+  asymmetry is real and a faster read cycle would remove the stalls entirely.
+- **`make check-build` must be scoped**: `make check-build CORE_DIR=cores/aw`. With no scope it
+  also audits `cores/core-template`'s own Quartus reports and reports its
+  `vidout_skip`/`vidout_rgb` stuck bits, which are not our netlist at all — `vidout_*` appears
+  nowhere in `cores/aw`. Scoped, the answer for this build is *no dead logic in the core's own
+  modules*, worst slack **0.129 ns**, clocks 24.75 MHz and 92.8125 MHz, every SDC constraint
+  matched, no 332049, no negative slack in any corner. Bitstream `5b7ab7d5e7f0d80b…`.
