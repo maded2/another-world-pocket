@@ -2177,11 +2177,34 @@ the whole two-consumer theory is built on, and they cost a minute each to re-con
 If either behaves differently now, this build's result is not interpretable, and the hash table —
 not the label — is how that gets settled.
 
-**1043 should therefore not be another behaviour fix.** Three fields, all cheap, all of them
-things this session had to do without: a page-swap counter (the only field separating playing from
-frozen), a restart counter split by resume policy (proof the fix is doing work on hardware, and the
-measurement that would tell us whether `PREFILL_MARGIN = 8` is enough or merely delays the failure),
-and a `BUILD_ID`-derived banner so the UART corroborates identity instead of contradicting it.
+Three hardware fields were proposed for a 1043 at this point: a page-swap counter (the only field
+separating playing from frozen), a restart counter split by resume policy, and a `BUILD_ID`-derived
+banner. **Decided later the same day: two of them are dropped, one is deferred, and this is why.**
+
+* **Dropped: the counters.** The argument for them was that only the card could see this bug, and
+  that is false. 1041's policy froze at frame 553 in simulation with `AW_STALL` undefined and
+  nothing forced, and the fill-buffer oracle named the byte (`fill[27] = c8`, belonging at
+  `base+32`). For anything in the ROM stream, sim is the sharper instrument; hardware telemetry
+  would have been a worse version of what already exists, aimed at a fault class that is now fixed
+  and verified on the device. The `PREFILL_MARGIN` question measures frequency rather than
+  correctness: the per-consumer resume holds 0 shifted fills out of 102,114 across 1,911 forced
+  restarts, so a too-small margin is survivable by construction.
+  **Trigger to revisit:** the first symptom that is *both* hardware-only *and* stream-shaped — then
+  add `W%h` (the swap pulse), because at that point we would know it is the right instrument rather
+  than a general-purpose hedge.
+* **Deferred to the next build anyway: the banner.** `dbg_console.v:65` `MSG_UP = "AW 1041a up\n"`
+  is printed by 1040, 1041 and 1042 alike, and it already bought a false suspicion about a fresh
+  install. Fix is a string bump; `"AW 1043a up\n"` is still 12 characters, so no `msg_len` or `pos`
+  thresholds move and the 148-char `MID_CHK` framing is untouched. Not worth a build on its own —
+  fold it into whatever build happens next.
+
+If the two counters are ever wanted, the mechanics are: wire the page-swap pulse (the signal
+`tb_soc` already counts) and two counters for `stream_restarts` split by `resume_from_start` into
+`dbg_console`'s port list, extend `msg_len` past 148 and shift every `pos` threshold after the
+insertion point, update the expected strings in `tb_dbg_console.v` (it asserts on `MSG_UP` today,
+so a banner bump edits that file too), keep the line short enough for the existing framing, then
+`make sim` plus a scoped `check-build CORE_DIR=cores/aw` — whose dead-logic check is the tripwire
+that stops a new counter being optimised away unread.
 
 ### Card state, 2026-11-01 17:35: only `Eddie Chan.AW 1042` remains
 
