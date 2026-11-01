@@ -421,7 +421,14 @@ module aw_rom (
     // What is left here is the rest of the "or is something else wrong" question, one
     // assumption per probe, plus a pack-word-0 readback that only matches the file if
     // the UPLOAD committed.
-    localparam [21:0] ST_ADDR_D0  = 22'h100000; // die 0, first word past the pack (it ends at word 0xFFFF7)
+    // Probe word moved to DIE 1, and it had to move: it used to be 22'h100000, "the first word
+    // past the pack", which was true only while a pack was 2 MiB. With the upload window at 4 MiB a
+    // paged image writes words up to 0x177FFF, so the periodic probe - which WRITES A5A5 and then
+    // 5A5A every ~444 us - would have scribbled over frame 64 of any pool that ever got loaded.
+    // Nothing failed today only because a single 2 MiB pack still ends below it. Die 1 is free by
+    // construction: a 4 MiB window tops out at word 0x1FFFFF, so bit 21 is never set by an upload,
+    // and aw_psram already selects the die from that bit (and the CE-inverted probe exercises it).
+    localparam [21:0] ST_ADDR_D0  = 22'h3F_FFFF; // die 1, top word: never an upload target
     localparam [21:0] ST_ADDR_P0  = 22'h000000; // pack word 0 - written by the upload, never by us
     localparam [15:0] ST_PAT      = 16'hA5A5;
     // Probe B's pattern, written with the low byte enabled only, on top of the A5A5

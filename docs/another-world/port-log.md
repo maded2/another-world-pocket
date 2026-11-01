@@ -2231,3 +2231,35 @@ and was left alone.
 second entry in the menu. It now costs a reinstall. If a future symptom ever looks like the shear
 or the freeze again, the first move is to reinstall the relevant control, not to reason from
 memory about what it did.
+
+### Paging work in flight: what is true, and what `check-build` rightly refuses (2026-11-01)
+
+`99405ee` adds `scripts/build_combined_image.py`: eight packs become a **2.938 MiB** paged image
+(93 frames of 32 KiB; one zero frame carries 307 pages; 14 frames shared by all eight parts), and
+for every part reassembling its table reproduces `partN.bin` **byte for byte**. `--selftest`
+corrupts the image five ways and requires rejection; two of the five are invisible to the view
+comparison and only the pool sums catch them.
+
+`16fe39d` adds the core side: upload window 2 MiB → 4 MiB, and a view page table mapping
+`psram_word = {page[7:0], word[13:0]}`. The whole unit suite is green and `tb_rom` is up to 550
+checks, 28 of them paging — identity, remap page 4 onto 7, neighbours undisturbed, 24 reads across
+the remapped boundary byte-exact, restore. That test found a design flaw worth stating: the table
+RAM had no defined reset value, so writing one entry silently re-pointed the other 63 pages at page
+0 (188 bank-alias mismatches). Fixed by giving the RAM power-up identity, which also deleted the
+`tbl_loaded` mux — an unloaded core does the identity map because that is what the RAM *contains*,
+not because a case branch says so, and a partial load can no longer disagree with a status bit.
+The self-test probe then had to move: `ST_ADDR_D0 = 22'h100000` was "the word past the pack" only
+while a pack was 2 MiB, and with a 4 MiB window it is inside the pool, so the periodic A5A5/5A5A
+probe would have scribbled on frame 64 of any pool ever loaded. It lives on die 1 now, which a
+4 MiB window can never address.
+
+**This is not a shippable build, and `make check-build CORE_DIR=cores/aw` says so: three findings —
+`tbl_rdat[6,7]` stuck at GND, `p_addr[21]` lost fanout, and `pgtbl` uninferred ("inappropriate RAM
+size", 64×8 becomes registers/MLAB, not M10K). All three follow from one thing: the load port is
+tied to 0 in `core_top` because the directory loader is task #18.** So the bitstream this source
+produces is functionally 1042 with an identity map, and its slack (worst 0.117 ns here) is *not*
+evidence about the timing of real paging hardware. Reading it as such would be the same mistake as
+trusting a short clean part1 run. The refusal is the tool doing its job — a table that cannot be
+written compiles, places, routes, closes timing and never does anything — and it is recorded here so
+the next person does not read a red `check-build` as a regression rather than as a half-built
+feature. Nothing was installed on the card from this source; `AW 1042` remains the only build on it.
