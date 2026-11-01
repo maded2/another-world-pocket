@@ -2182,3 +2182,29 @@ things this session had to do without: a page-swap counter (the only field separ
 frozen), a restart counter split by resume policy (proof the fix is doing work on hardware, and the
 measurement that would tell us whether `PREFILL_MARGIN = 8` is enough or merely delays the failure),
 and a `BUILD_ID`-derived banner so the UART corroborates identity instead of contradicting it.
+
+### Card state, 2026-11-01 17:35: only `Eddie Chan.AW 1042` remains
+
+By the user's decision the two comparison builds were removed from the card once 1042 was confirmed
+playing. `Cores/` now holds one folder, `Eddie Chan.AW 1042`, bitstream `579746d33d45b594`, all ten
+core files, `Assets/anotherworld/common/part0..7.bin` untouched, and the catalog caches
+(`cores_cache`, `corelist_cache`, `core_viewby_platform`, `platforms_cache`,
+`platform_viewby_category`) deleted so the Pocket re-enumerates instead of showing ghosts.
+
+This supersedes the instruction repeated through this session — *keep 1040 and 1041 on the card as
+the controls*. They are not lost, and nothing here is one-way:
+
+| control | bitstream | recover with |
+|---|---|---|
+| `AW 1040` | `888b1c056d70ec4a` | `build/bitstreams/Eddie_Chan.AW_1040.rbf_r` (verified byte-identical to the card copy before deletion) + `scripts/sd_install_1040a.sh`; source-era commit `0596839` |
+| `AW 1041` | `5b7ab7d5e7f0d80b` | `build/bitstreams/Eddie_Chan.AW_1041.rbf_r` (byte-identical) + `scripts/sd_install_1041a.sh`; source-era commits `aff690e`/`3d44da4` |
+
+Whole folders (configs included) archived to `build/sd/removed-20261101-173500/AW-1040-1041-folders.tgz`,
+`/System` backed up to `build/sd/system-backup-pre-delete-20261101-173551` first. `Saves/` was empty
+and was left alone.
+
+**The consequence to remember:** the control re-confirmation that this entry flagged as outstanding
+— launch 1040, see it shear; launch 1041, see it freeze — can no longer be done by tapping a
+second entry in the menu. It now costs a reinstall. If a future symptom ever looks like the shear
+or the freeze again, the first move is to reinstall the relevant control, not to reason from
+memory about what it did.
