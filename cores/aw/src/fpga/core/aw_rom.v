@@ -169,6 +169,22 @@ module aw_rom (
     input  wire [7:0]  tbl_wval,
     output wire        rom_tbl_loaded,   // 0 = identity map, i.e. a single plain pack
 
+    // ---- paged-image directory (task #18) -------------------------------------
+    // The part is chosen by a write to 0x00F0_00xx, where bits [4:2] ARE the part number and the
+    // data written is ignored. Address-selected rather than value-selected on purpose: it makes the
+    // decode independent of the 32-bit byte order, which is the one thing about this bridge that
+    // cannot be settled from the docs (the loader's byte order is a declaration we make by tying
+    // bridge_endian_little, and interact writes are a different writer). Eight `action` variables
+    // in interact.json, one per part, drive it; see the note in core_top about why the value is
+    // honoured at boot and not mid-session.
+    output wire        rom_dir_valid,    // an AWP1 directory was read and its table installed
+    output wire        rom_dir_bad,      // the magic was there and the table was not usable
+    output wire [2:0]  rom_part,         // the part the installed table describes
+    output wire [6:0]  rom_dir_err,      // 0 clean; bit0 no magic; bit1+entry an entry out of range;
+                                         // bit6 the sweep was not served in time
+    output wire        rom_dir_busy,     // a sweep owns the chip right now
+    output wire        rom_part_late,    // a part write arrived after the first byte: next launch
+
     // ---- the chip ----
     output wire [5:0]  cram0_a,
     inout  wire [15:0] cram0_dq,
@@ -512,6 +528,40 @@ module aw_rom (
     reg  [31:0] cr_q [0:3];
     reg         census_active, census_done, census_to;
     reg  [17:0] census_stall;
+    // Both sweeps are armed by the same event (the upload finished) and there is one controller,
+    // so one of them would lose the start pulse. Losing the census is how a build reported a
+    // census of zero while closing timing, so neither is allowed to depend on catching an edge:
+    // each has a pending latch, and the directory wins the START, not the census's existence.
+    reg         cen_pend, dir_pend;
+    // "Read the directory again" crosses here as a four-phase level handshake, NOT as a toggle.
+    // It was a toggle, with a comment saying two events landing between samples collapse into one,
+    // "which is fine here" - and then tb_dir proved it is not fine at all: the upload-complete arm
+    // and a part-write arm really do land in the same window, the toggle collapsed to no change, and
+    // the sweep silently installed the OLD part while reporting dir_valid=1 err=00. The collapse is
+    // not a bench artefact either: the framework writes persisted interact values immediately before
+    // Reset Exit, which is exactly the neighbourhood of an upload-complete edge.
+    //
+    // A level that is only cleared after an acknowledge cannot lose a request: a second event during
+    // an in-flight handshake re-arms afterwards, and coalescing two arms into one sweep is correct
+    // anyway, because the sweep is idempotent and always reads the newest held part.
+    reg  [1:0]  arm_req_s;
+    reg         arm_ack;
+    reg         dir_installed;                     // a table is installed for part_latched
+    reg  [2:0]  part_latched;
+    // aw_fifo is NOT first-word-fallthrough: rd_q belongs to the cycle AFTER rd_en, which is why the
+    // loader consumes it through rd_q_valid. Sampling part_fw in the same cycle as the pop read the
+    // PREVIOUS word instead - 0 out of reset - so the sweep ran, installed cleanly and reported no
+    // error whatsoever, and gave you part 0 however many parts you had written. That is the nastiest
+    // shape of bug this port keeps meeting: a feature that works, is silent, and is wrong.
+    localparam [1:0] P_IDLE = 2'd0, P_WAIT = 2'd1;
+    reg  [1:0] p_state;
+    reg  [2:0] part_val;
+    reg        part_held;
+    reg  [7:0] p_wcnt;
+    reg  [6:0]  dir_err_code;
+    reg         dir_bad;                 // a directory was expected and was not usable
+    reg  [11:0] dir_stat;                // {installed, bad, part[2:0], err[6:0]} for the console
+    reg         dir_stat_tog;
     reg         vfy_arm;              // clk_core: the pack is in (driven further down)
     wire        census_done_core;     // census_done synchronised into clk_core (see below).
                                       // Declared here because rom_ready waits on it, and the
@@ -523,6 +573,59 @@ module aw_rom (
     // a level that stays high (pack_written does) cannot restart a finished sweep.
     reg  [1:0] vfy_arm_p;
     wire census_go = vfy_arm_p[0] & ~vfy_arm_p[1] & ~census_done;
+
+    // The arm crosses into this clock in the sequencer below (arm_req_s / arm_ack). Writing the
+    // declaration and not the synchroniser is a mistake worth recording: an earlier version declared
+    // dir_tog_s and never drove it, so it held its reset value forever, the directory sweep NEVER
+    // RAN, and every symptom downstream looked like a paging bug - dir_valid=0 err=00 (a sweep that
+    // reports nothing has not run; one that found no magic would have said err bit0) and reads
+    // landing on the identity page instead of the mapped one.
+
+    // ---- part select: clk_bridge -> async FIFO -> the sweep's clock --------------------------
+    // Three bits, which is precisely the case the CDC rules refuse to hand-roll: a multi-bit signal
+    // sampled asynchronously can be caught mid-transition, and the answer is a FIFO or a handshake,
+    // never a flip-flop chain. aw_fifo already does this crossing for the loader (clk_bridge in,
+    // clk_psram out), so the request rides the same proven module at 1/512th the size.
+    //
+    // The write is address-selected, so bridge_wr_data is never read here. The byte order of an
+    // interact write is not something the docs settle (the loader's order is a declaration WE make,
+    // by tying bridge_endian_little=0), and a decode that ignores the data cannot be wrong about it.
+    reg  [1:0] streamed_s = 2'b00;
+    reg        part_push = 1'b0;   // explicit power-up: a 1 here would push a garbage request
+    reg  [2:0] part_din    = 3'd0;
+    always @(posedge clk_bridge) begin
+        streamed_s <= {streamed_s[0], streamed_q};
+        part_push  <= 1'b0;
+        // Honoured until the VM has taken its first byte, and not after. That boundary is chosen
+        // rather than rom_ready: the framework writes persisted interact values "immediately before
+        // Reset Exit", which can be AFTER the upload-complete sweep, so a rom_ready gate would drop
+        // the part the user actually picked. Nothing has been streamed at that point, because the VM
+        // is held off. After the first acceptance a switch could not work anyway - the VM's reset
+        // pin is tied to 0 inside the generated netlist (see core_top), so the game would keep
+        // running over another part's bytes - and `part_late` says so out loud instead of failing
+        // as a wrong-looking picture. The variable is persisted, so it arrives again next boot.
+        if (bridge_wr && bridge_addr[31:12] == 20'h00F00 && !streamed_s[1]) begin
+            part_push <= 1'b1;
+            part_din  <= bridge_addr[4:2];
+        end else if (bridge_wr && bridge_addr[31:12] == 20'h00F00) begin
+            part_late <= 1'b1;      // refused: bytes were already flowing. Reported, not fixed.
+        end
+    end
+
+    wire [2:0] part_fw;
+    wire       part_empty;
+    wire       part_rv;             // rd_q belongs to THIS cycle, one after rd_en
+    reg        streamed_q;          // clk_psram: the VM has taken at least one byte
+    reg        part_late = 1'b0;    // clk_bridge: a request was refused, for the console
+    reg        part_pop;
+    /* verilator lint_off PINCONNECTEMPTY */
+    aw_fifo #(.DW(3), .AW(2)) u_partfifo (
+        .wr_clk(clk_bridge), .wr_rst(rst_bridge), .wr_en(part_push), .wr_data(part_din),
+        .wr_full(), .wr_free(),
+        .rd_clk(clk_psram), .rd_rst(rst_psram), .rd_en(part_pop), .rd_q_valid(part_rv),
+        .rd_q(part_fw), .rd_level(), .rd_empty(part_empty)
+    );
+    /* verilator lint_on PINCONNECTEMPTY */
     // A capture is the sequencer's own: the controller serialises accesses, so the read
     // data that lands while we sit in ST_WAIT with the census cursor is the census's.
     // census_addr is the right index here (it advances on this same edge), which is also why
@@ -540,7 +643,10 @@ module aw_rom (
     // lane, so the high byte on readback is proof the earlier write is still there.
     wire [1:0] st_be     = (st_seq == 3'd1) ? 2'b01 : 2'b11;
     wire [15:0] st_wdata = (st_seq == 3'd1) ? ST_PAT_BE : ST_PAT;
+    // The directory sweep reads image page 0 (physical word = image word, since the directory IS
+    // physical page 0): words 0 and 1 for the magic, then the 64 entries of the selected part.
     wire [21:0] st_rd_addr = census_active ? {{(22-CEN_AW){1'b0}}, census_addr}
+                           : dir_active    ? {12'd0, dir_word}
                            : (st_seq == ST_SEQ_P0) ? ST_ADDR_P0 : ST_ADDR_D0;
 
     // 3 bits: ST_WAIT is 4 - a 2-bit encoding truncated it to 0 (= ST_IDLE), which
@@ -549,11 +655,36 @@ module aw_rom (
     localparam [2:0] ST_IDLE = 3'd0, ST_WR = 3'd1, ST_GAP = 3'd2,
                       ST_RD   = 3'd3, ST_WAIT = 3'd4;
     reg  [2:0] st_s;
+    wire       dir_start = (st_s == ST_IDLE) & dir_pend;
     reg  [2:0] st_seq;             // which probe of the round is in flight (0..4)
     reg  [15:0] st_cnt, st_wcnt;
     reg  [2:0] st_gap;
     wire       st_active  = (st_s != ST_IDLE);
     wire       st_rd_take = (st_s == ST_RD);
+
+    // ---- directory sweep, sharing the sequencer (and therefore the arbitration and the
+    // watchdog) with the self-test and the census.
+    //
+    // It shares rather than runs beside them for the reason in the plan: every read here goes
+    // through one serialised controller, and a second master would need its own answer to "who owns
+    // the chip". 66 reads at ~12 cycles is under a microsecond, so it costs the boot nothing, and
+    // it inherits the census's watchdog instead of inventing a way to hang rom_ready forever.
+    //
+    // Order inside a round is magic, then entries - and it must be magic first, because a plain
+    // 2 MB pack has real data at image words 0 and 1 (part1.bin starts 0004) and installing its
+    // bytes as a page table would be the worst possible failure mode: every page pointed at frame
+    // 4-ish, a plausible picture, and a checksum that still matches because the data is genuinely
+    // there. Reading the magic first turns "is this a pool" into two reads instead of a search.
+    localparam [15:0] DIR_MAGIC0 = 16'h5741;             // "AW"
+    localparam [15:0] DIR_MAGIC1 = 16'h3150;             // "P1"
+    localparam [2:0]  ST_SEQ_DIR = 3'd6;
+    wire dir_captured = rd_q_valid & (st_s == ST_WAIT) & dir_active;
+    // An entry names a physical page in 1..127. 0 is the directory and >=128 is die 1, so an
+    // out-of-range entry is not "slightly wrong", it is the corrupted-table case the whole page-0
+    // layout exists to make harmless: refuse the whole install and go back to identity.
+    wire dir_val_ok   = (rd_q[7:0] >= 8'd1) && (rd_q[7:0] <= 8'd127);
+    assign dir_install = dir_captured && (dir_ph >= 7'd2) && dir_val_ok;
+    assign rom_dir_busy = dir_active | clr_active;
 
     always @(posedge clk_psram) begin
         if (rst_psram) begin
@@ -577,6 +708,32 @@ module aw_rom (
             census_active      <= 1'b0;
             census_done        <= 1'b0;
             census_to          <= 1'b0;
+            cen_pend           <= 1'b0;
+            // dir_done resets HIGH, and that is load-bearing rather than sloppy: an unloaded chip
+            // has an identity table, which is a map the VM may legitimately read. "No sweep has run
+            // yet, so the map is not ready" is how a census gate once turned tb_write into
+            // rom_ready=0 with 231 errors - waiting for a sweep nobody asked for is
+            // indistinguishable from waiting forever. This way there is no third gate condition, no
+            // arming budget, and no deadlock to reason about at 2 a.m.
+            dir_active         <= 1'b0;
+            dir_done           <= 1'b1;
+            dir_to             <= 1'b0;
+            dir_pend           <= 1'b0;
+            dir_ph             <= 7'd0;
+            dir_part           <= 3'd0;
+            dir_stall          <= 18'd0;
+            dir_err_code       <= 7'd0;
+            part_latched       <= 3'd0;
+            part_pop           <= 1'b0;
+            p_state            <= P_IDLE;
+            part_val           <= 3'd0;
+            part_held          <= 1'b0;
+            p_wcnt             <= 8'd0;
+            arm_req_s          <= 2'b00;
+            arm_ack            <= 1'b0;
+            dir_installed      <= 1'b0;
+            clr_active         <= 1'b0;
+            clr_i              <= 6'd0;
             census_addr        <= {CEN_AW{1'b0}};
             census_last        <= {CEN_AW{1'b0}};
             census_stall       <= 18'd0;
@@ -587,8 +744,40 @@ module aw_rom (
             cr_q[2]            <= 32'd0;
             cr_q[3]            <= 32'd0;
         end else begin
+            // Take the request when the controller can honour it, and hold the acknowledge until the
+            // sweep that was asked for has actually finished - dir_pend is set on taking it, so the
+            // acknowledge condition below cannot be satisfied by the request that has not run yet.
+            if (arm_req_s[1] && !dir_pend && !dir_active) dir_pend <= 1'b1;
+            if (arm_req_s[1] && !dir_pend && !dir_active && dir_done) arm_ack <= 1'b1;
+            else if (!arm_req_s[1]) arm_ack <= 1'b0;
+            if (dir_start) dir_pend <= 1'b0;
+            // The census arms the same way. It used to start on the raw census_go edge, and once a
+            // second sweep shared this controller that edge could arrive in a cycle the controller
+            // was not idle in - and then the census simply never ran, which is the failure this
+            // latch exists to prevent: tb_rom came back "census never finished", read sum 00000000
+            // against 1f4b8fbe written, with a bitstream that still closed timing.
+            if (census_go) cen_pend <= 1'b1;
+
             case (st_s)
-            ST_IDLE: if (census_go) begin
+            ST_IDLE: if (dir_pend) begin
+                // Directory first, always, and ahead of the census: the boot check reads the
+                // trailer through the page table, so a check that runs before the table is
+                // installed reads frame body bytes, fails off0 == 0, paints ERR_TRAILER and holds
+                // rom_ready low forever. The sweep is 66 reads; the census is a million.
+                dir_active    <= 1'b1;
+                dir_done      <= 1'b0;
+                dir_to        <= 1'b0;
+                dir_ph        <= 7'd0;
+                dir_stall     <= 18'd0;
+                // The part comes from the FIFO if one is waiting, otherwise this is a re-read of
+                // the same part (a retry, or an upload that finished while the sweep was already
+                // armed) - never a silent fall back to part 0, which would replay part 1's intro
+                // under a menu that says part 4.
+                dir_part      <= part_held ? part_val : part_latched;
+                part_held     <= 1'b0;      // consumed, whether or not the install then succeeds
+                st_seq        <= ST_SEQ_DIR;
+                st_s          <= ST_RD;
+            end else if (cen_pend) begin
                 // Read-only pass: no write phase, and the periodic probes wait for it.
                 // The end of the sweep is snapshotted so a late write cannot move the
                 // goalposts: sweep words 0..cw_max-1, or 0..CEN_LAST if the range is smaller.
@@ -597,6 +786,7 @@ module aw_rom (
                 census_last     <= (cw_max == 22'd0) ? {CEN_AW{1'b0}}
                                    : (cw_max > CENSUS_RANGE) ? CEN_LAST[CEN_AW-1:0]
                                    : cw_max[CEN_AW-1:0] - {{(CEN_AW-1){1'b0}}, 1'b1};
+                cen_pend        <= 1'b0;
                 census_stall    <= 18'd0;
                 cr_sum          <= 32'd0;
                 cr_xor          <= 32'd0;
@@ -670,6 +860,81 @@ module aw_rom (
             // and short enough that a bench whose PSRAM model never answers - which is what
             // first showed this to me, tb_write coming back rom_ready=0 with 231 errors -
             // gets its boot back in a few thousand cycles instead of never.
+            // The sweep's own capture. Note it re-arms st_s <= ST_RD exactly as the census does:
+            // the case statement above has already been evaluated against the CURRENT st_s
+            // (ST_WAIT), so this neither double-issues nor skips the gap the controller wants.
+            if (dir_captured) begin
+                dir_stall <= 18'd0;
+                if (dir_ph < 7'd2) begin
+                    if (rd_q !== ((dir_ph == 7'd0) ? DIR_MAGIC0 : DIR_MAGIC1)) begin
+                        // Not a pool. A plain 2 MB pack is the normal case here, so this is not an
+                        // error - but the table must be walked back to identity rather than left as
+                        // the previous install, because a stale pool table aimed at a fresh plain
+                        // pack reads another part's bytes and looks exactly like a bad upload.
+                        dir_active    <= 1'b0;
+                        dir_done      <= 1'b1;
+                        clr_active    <= 1'b1;
+                        clr_i         <= 6'd0;
+                        dir_err_code  <= 7'd1;             // bit0: no magic
+                        dir_installed <= 1'b0;
+                        dir_bad       <= 1'b0;             // a plain pack is not an error
+                        st_s          <= ST_IDLE;
+                    end else begin
+                        dir_ph <= dir_ph + 7'd1;
+                        st_s   <= ST_RD;
+                    end
+                end else if (!dir_val_ok) begin
+                    dir_active    <= 1'b0;
+                    dir_done      <= 1'b1;
+                    clr_active    <= 1'b1;
+                    clr_i         <= 6'd0;
+                    // bit1 = an entry was out of range; bits[5:0] = which one, so the console names
+                    // it instead of reporting "bad"
+                    dir_err_code  <= 7'h02 | {1'b1, dir_ph[5:0]};
+                    dir_bad       <= 1'b1;
+                    dir_installed <= 1'b0;
+                    st_s          <= ST_IDLE;
+                end else if (dir_ph == 7'd65) begin
+                    dir_active    <= 1'b0;
+                    dir_done      <= 1'b1;
+                    dir_err_code  <= 7'd0;
+                    dir_bad       <= 1'b0;
+                    dir_installed <= 1'b1;
+                    part_latched  <= dir_part;             // what the table now describes
+                    st_s          <= ST_IDLE;
+                end else begin
+                    dir_ph <= dir_ph + 7'd1;
+                    st_s   <= ST_RD;
+                end
+            end
+
+            if (dir_active && !dir_captured) begin
+                if (&dir_stall) begin
+                    dir_active    <= 1'b0;
+                    dir_done      <= 1'b1;
+                    dir_to        <= 1'b1;
+                    dir_err_code  <= 7'h41;               // bit6: not served in time
+                    dir_bad       <= 1'b1;
+                    dir_installed <= 1'b0;
+                    st_s          <= ST_IDLE;
+                end else dir_stall <= dir_stall + 18'd1;
+            end
+
+            // One cycle after the status registers settle, so the toggle a other clock domain
+            // waits on always arrives with the data behind it stable - the source-domain-data-plus-
+            // toggle pattern, which is the only safe way to move a multi-bit status word without a
+            // second FIFO. err[6] is kept inside the 12 bits rather than dropped: "sweep not served"
+            // and "entry 12 out of range" are different faults with the same symptom otherwise.
+            // Status for the console, moved across clocks the only defensible way: the 12-bit word
+            // is written first, and the toggle flips on the NEXT change of that word, so a consumer
+            // that samples on a toggle edge is always reading a settled value. "err[6]" is kept
+            // rather than dropped - "sweep not served" and "entry 12 out of range" would otherwise
+            // share one code, and they want different fixes.
+            if ({dir_installed, dir_bad, part_latched, dir_err_code} !== dir_stat) begin
+                dir_stat     <= {dir_installed, dir_bad, part_latched, dir_err_code};
+                dir_stat_tog <= ~dir_stat_tog;
+            end
+
             if (census_active && !cen_captured) begin
                 if (&census_stall) begin
                     census_active <= 1'b0;
@@ -679,7 +944,7 @@ module aw_rom (
                 end else census_stall <= census_stall + 18'd1;
             end
 
-            if (rd_q_valid && st_s == ST_WAIT && !census_active) begin
+            if (rd_q_valid && st_s == ST_WAIT && !census_active && !dir_active) begin
                 case (st_seq)
                 3'd0: rom_selftest_die0  <= rd_q;
                 3'd1: rom_selftest_be    <= rd_q;
@@ -981,6 +1246,32 @@ module aw_rom (
     integer pgtbl_i;
     initial for (pgtbl_i = 0; pgtbl_i < (1 << PGTBL_AW); pgtbl_i = pgtbl_i + 1)
         pgtbl[pgtbl_i] = pgtbl_i[7:0];
+    // Install writers, one mux, priority order stated because two of them can be simultaneously
+    // true and the choice is a behaviour: the bench port first (it is the only thing that can test
+    // a table the boot logic would reject), then the identity walk-back, then the sweep's entries.
+    reg                  clr_active;                     // walk the whole table back to identity
+    reg  [5:0]           clr_i;
+    wire                 dir_install;
+    reg                  dir_active, dir_done, dir_to;
+    reg  [6:0]           dir_ph;                         // 0,1 = magic words; 2..65 = table entries
+    reg  [2:0]           dir_part;                       // part sampled at sweep start
+    reg  [17:0]          dir_stall;
+    reg  [9:0]           dir_base;                       // first table word of dir_part, in words
+    always @(*) begin
+        case (dir_part)
+            3'd0:      dir_base = 10'd16;
+            3'd1:      dir_base = 10'd88;
+            3'd2:      dir_base = 10'd160;
+            3'd3:      dir_base = 10'd232;
+            3'd4:      dir_base = 10'd304;
+            3'd5:      dir_base = 10'd376;
+            3'd6:      dir_base = 10'd448;
+            default:   dir_base = 10'd520;
+        endcase
+    end
+    wire [9:0] dir_word = (dir_ph <= 7'd1) ? {3'b0, dir_ph[6:0]}
+                                           : (dir_base + {3'b0, dir_ph[6:0]} - 10'd2);
+
     reg  [7:0]           tbl_rdat;                       // synchronous (M10K) read result
     reg  [PGTBL_AW-1:0]  tbl_rdat_idx;                   // ... and which page it belongs to
     reg                  tbl_loaded;                     // 0 = identity, a single plain pack
@@ -1005,6 +1296,13 @@ module aw_rom (
             if (tbl_wr) begin
                 pgtbl[tbl_widx] <= tbl_wval;
                 tbl_loaded      <= 1'b1;
+            end else if (clr_active) begin
+                pgtbl[clr_i] <= {2'b0, clr_i};
+                if (clr_i == 6'd63) clr_active <= 1'b0;
+                else                clr_i <= clr_i + 6'd1;
+            end else if (dir_install) begin
+                pgtbl[dir_ph[5:0] - 6'd2] <= rd_q[7:0];
+                tbl_loaded <= 1'b1;
             end
         end
     end
@@ -1209,6 +1507,59 @@ module aw_rom (
 `endif
 
     wire take    = take_raw;
+
+    // The request level crosses into this clock here, and the acknowledge crosses back in the
+    // sequencer. Written as its own process because arm_req_s is read there and driven here - and
+    // "declared it, never drove it" is the second time that exact mistake has cost this feature a
+    // silent no-op, so the synchroniser is deliberately the first thing after the FIFO it feeds.
+    always @(posedge clk_psram) arm_req_s <= {arm_req_s[1:0], arm_req};
+
+    // Drain the request FIFO into part_val as soon as one is waiting and nothing has streamed, so a
+    // sweep start finds a HELD part instead of racing a registered FIFO output. Own process, one
+    // driver; the timeout is here because a read side that never answers must not leave this in
+    // P_WAIT forever - the census watchdog's reasoning, one level down.
+    always @(posedge clk_psram) begin
+        if (rst_psram) begin
+            p_state   <= P_IDLE;
+            part_pop  <= 1'b0;
+            part_val  <= 3'd0;
+            part_held <= 1'b0;
+            p_wcnt    <= 8'd0;
+        end else begin
+            part_pop <= 1'b0;
+            case (p_state)
+            P_IDLE: if (!part_empty && !streamed_q) begin
+                        part_pop <= 1'b1;
+                        p_wcnt   <= 8'd0;
+                        p_state  <= P_WAIT;
+                    end
+            P_WAIT: if (part_rv) begin
+                        part_val  <= part_fw;
+                        part_held <= 1'b1;
+                        p_state   <= P_IDLE;
+                    end else if (&p_wcnt) begin
+                        p_state <= P_IDLE;        // never answered: drop it, never wedge
+                    end else p_wcnt <= p_wcnt + 8'd1;
+            default: p_state <= P_IDLE;
+            endcase
+        end
+    end
+
+    // The one-way gate on part requests. Once the VM has taken a byte, re-pointing the page table
+    // would swap the bytes under a running game, and the game cannot be restarted from here: the
+    // VM's reset pin is tied to constant 0 inside the generated netlist (see the reset section of
+    // core_top), which is upstream's choice - its ROM was SPI flash, readable from the first clock.
+    // Own process, own reset, one driver: the multiple-constant-driver failure in this module is
+    // documented once already by the boot check's chk_cnt.
+    // accept_vm, NOT take. take is "the stream advanced a word" and the consumer runs ahead of the
+    // host, so gating on it closed the part-select window before the VM had read a single byte -
+    // tb_dir's second run reported streamed=1 late=1 with no reads at all, and the select was
+    // refused for a reason that had nothing to do with the game running. The event meant here is the
+    // rising edge of the VM's in_ready: the first byte genuinely asked for.
+    always @(posedge clk_psram) begin
+        if (rst_psram) streamed_q <= 1'b0;
+        else if (accept_vm) streamed_q <= 1'b1;
+    end
     wire [7:0] c_byte = c_addr[0] ? c_word[15:8] : c_word[7:0];
     wire exhausted  = take & c_addr[0];
 
@@ -1558,7 +1909,13 @@ module aw_rom (
             chk_kick <= 1'b0;
             chk_done <= 1'b0;
 
-            if (allc_edge | pack_written) chk_pending <= 1'b1;
+            // Armed by the directory sweep finishing, NOT by the upload edge. That ordering is the
+            // whole point of this block: the boot check reads the trailer through the page table, so
+            // a check that runs while the table is still identity reads frame body bytes, fails
+            // off0 == 0, paints ERR_TRAILER and holds rom_ready low forever on every paged image.
+            // dir_done_rise also covers the un-armed case - dir_done resets high, so the first sync
+            // produces a rise and a check runs, which is what a plain pack has always done.
+            if (dir_done_rise) chk_pending <= 1'b1;
 
             // The VM outranks this diagnostic. The check is idempotent and will be
             // requested again; a swallowed acceptance hangs the VM forever, because its
@@ -1593,6 +1950,93 @@ module aw_rom (
             end
         end
     end
+
+    // ---- directory arming and status, seen from clk_core --------------------------------------
+    // Three events ask for the directory to be read: an upload finished, the retry timer expired,
+    // and a part write landed in the interact window. All three toggle, and the sweep's clock
+    // watches the toggle change rather than a level - see the arming note in the sequencer.
+    // Three events ask for the directory: an upload finished, the retry timer expired, and a part
+    // write landed in the interact window. They set a sticky pending, and the handshake below is the
+    // only thing that clears it - after the far side has acknowledged. An event that arrives while a
+    // handshake is in flight sets pending again and gets its own sweep, which is the property the
+    // collapsed toggle did not have.
+    reg arm_pending, arm_req;
+    reg [1:0] arm_ack_s, arm_phase;
+    reg pack_written_d;
+    // EDGES only. pack_written is a level that stays high for as long as the trailer has been written
+    // and the bridge has gone quiet - which is forever - and feeding it to a re-triggerable handshake
+    // armed a sweep, which finished, was armed again, and again, forever. rom_ready could then only
+    // rise in the gap between two sweeps, and tb_top's "rom_ready rose after the trailer check" timed
+    // out at 27 ms while every other bench kept passing, because the others do not watch for rom_ready
+    // staying up. The old code fed the same level to a one-shot chk_pending, where it was harmless -
+    // which is exactly how a level/edge mistake survives a refactor of the block around it.
+    // ... and only until the VM has taken its first byte, which is the same rule the part select
+    // uses and for the same reason: after that the answer cannot change, because a switch is refused
+    // and a re-read of the same directory installs the same table. Without this gate the sweep runs
+    // again about ten milliseconds after the upload (pack_written rises when the bridge goes quiet,
+    // which is AFTER the boot check passed and the VM started), steals the chip for a microsecond
+    // from a streaming VM, and tb_soc then loses the anchor of one legitimate 64-byte fill - 64
+    // writes "with no acceptance open", whose bytes are in fact correct (found at 0x10dc of
+    // part0.bin, one word past where the bench had recorded the acceptance). The design was right
+    // and the measurement was disturbed, which is a bad trade for a diagnostic that must be trusted.
+    wire arm_evt = (allc_edge | (pack_written & ~pack_written_d) | (&retry_cnt)) & ~streamed_c;
+    always @(posedge clk_core) begin
+        if (rst_core) begin
+            arm_pending <= 1'b0;
+            arm_req     <= 1'b0;
+            arm_ack_s      <= 2'b00;
+            arm_phase      <= 2'd0;
+            pack_written_d <= 1'b0;
+        end else begin
+            arm_ack_s      <= {arm_ack_s[0], arm_ack};
+            pack_written_d <= pack_written;
+            if (arm_evt) arm_pending <= 1'b1;
+            case (arm_phase)
+            2'd0: if (arm_pending) begin arm_req <= 1'b1; arm_phase <= 2'd1; end
+            2'd1: if (arm_ack_s[1]) begin
+                      arm_req <= 1'b0;
+                      arm_phase <= 2'd2;
+                      // only consumed if nothing new arrived in this same cycle
+                      if (!arm_evt) arm_pending <= 1'b0;
+                  end
+            2'd2: if (!arm_ack_s[1]) arm_phase <= 2'd0;   // wait for the drop before re-asserting
+            default: arm_phase <= 2'd0;
+            endcase
+        end
+    end
+
+    reg  [1:0]  streamed_c;      // streamed_q in clk_core: the directory is frozen after this
+    reg  [1:0]  dd_s;
+    reg  [11:0] dir_stat_c;
+    reg         dir_stat_tog_c;
+    reg  [2:0]  late_s;
+    always @(posedge clk_core) begin
+        if (rst_core) begin
+            dd_s            <= 2'b00;
+            dir_stat_c      <= 12'd0;
+            dir_stat_tog_c  <= 1'b0;
+            late_s          <= 3'd0;
+            streamed_c      <= 2'b00;
+        end else begin
+            dd_s <= {dd_s[0], dir_done};
+            // Sampled on the edge, never continuously: the producer writes the word first and flips
+            // the toggle after, so an edge-sampled read cannot see a half-updated status.
+            if (dir_stat_tog !== dir_stat_tog_c) begin
+                dir_stat_tog_c <= dir_stat_tog;
+                dir_stat_c     <= dir_stat;
+            end
+            late_s     <= {late_s[1:0], part_late};  // single bit: a chain is the right tool here
+            streamed_c <= {streamed_c[0], streamed_q};
+        end
+    end
+    wire dir_done_core = dd_s[1];
+    wire dir_done_rise = dd_s[1] & ~dd_s[0];
+
+    assign rom_dir_valid = dir_stat_c[11];
+    assign rom_dir_bad   = dir_stat_c[10];
+    assign rom_part      = dir_stat_c[9:7];
+    assign rom_dir_err   = dir_stat_c[6:0];
+    assign rom_part_late = late_s[2];
 
     assign rom_chk_data = chk_data;
 
@@ -1629,7 +2073,13 @@ module aw_rom (
             // back rom_ready=0 with 231 errors: that bench never completes an upload, so
             // nothing arms a census, and a design waiting for a sweep nobody asked for is
             // indistinguishable from a design waiting forever.
-            if (chk_done && !seen_overflow && (!vfy_arm | census_done_core | cen_budget_out)) begin
+            // A sweep in flight drops rom_ready, and the check re-raises it (the sweep's completion
+            // arms the check above). That is what makes a boot-time part select honest: the trailer
+            // that was validated is the trailer under the table now installed, not the one that
+            // happened to be readable when the upload finished.
+            if (!dir_done_core) rom_ready <= 1'b0;
+            if (chk_done && !seen_overflow && dir_done_core
+                && (!vfy_arm | census_done_core | cen_budget_out)) begin
                 if (offs_ok) begin
                     rom_ready <= 1'b1;
                     // ERR_TRAILER is a diagnosis of the moment, not a verdict: a check

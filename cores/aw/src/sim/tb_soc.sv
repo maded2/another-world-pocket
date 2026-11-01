@@ -416,7 +416,13 @@ reg design_run = 1'b0;
     always @(posedge clk_core) begin
         if (u_soc.vm.__mem__data.in_wenable) begin
             fill_writes = fill_writes + 1;
-            if (!acc_open) fill_unbased = fill_unbased + 1;
+            if (!acc_open) begin
+                fill_unbased = fill_unbased + 1;
+                if (fill_unbased <= 3)
+                    $display("  UNBASED fill write #%0d addr=%0d data=%02h t=%0t dir_active=%b",
+                             fill_unbased, u_soc.vm.__mem__data.in_addr,
+                             u_soc.vm.__mem__data.in_wdata, $time, u_rom.dir_active);
+            end
             else if ((acc_base + u_soc.vm.__mem__data.in_addr) < PACK_BYTES) begin
                 if (u_soc.vm.__mem__data.in_wdata !== ref_mem[acc_base + u_soc.vm.__mem__data.in_addr]) begin
                     fill_shift = fill_shift + 1;

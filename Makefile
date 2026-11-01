@@ -159,6 +159,12 @@ sim-write:
 sim-rom:
 	@$(SILICE) scripts/sim_rom.sh $(if $(PACK),$(PACK),)
 
+# The paged-image directory: one upload carrying every part, a part chosen by an address write,
+# and the plain-pack case that must fall back to identity. Needs its own sim because the part
+# select is closed once the VM has taken a byte - see the header of tb_dir.sv.
+sim-dir:
+	@$(SILICE) scripts/sim_dir.sh $(if $(PACK),$(PACK),)
+
 # The Pocket controller word -> vm.si jstick mapping, on its own. tb_soc drives the SoC's jstick
 # port directly, so without this the whole cont1_key mapping had no coverage - which is how it
 # stayed wrong (wrong Analogue bit numbers, fire/right swapped) while every sim was green.
