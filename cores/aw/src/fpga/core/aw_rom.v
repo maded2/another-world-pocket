@@ -836,9 +836,22 @@ module aw_rom (
     wire [SDB:0]      sf_level;
     wire [SWIDTH-1:0] sf_q;
 
-    // A held acceptance must not gap once it has started. 32 words covers the 63 the
-    // preload asks for, with a byte to spare.
-    localparam [SDB:0] PREFILL_WORDS = 1 << 5;
+    // A held acceptance must not gap once it has started, and this number is what decides
+    // whether it can afford not to. 32 words = 64 bytes covers the 63 a preload asks for, but
+    // with ZERO margin: an acceptance that starts on an odd byte address spends half of its
+    // first word, and the reader's delivery rhythm (pop a word, hand out two bytes, one word
+    // every two core cycles) has no slack either, so the last byte of a fill depends on a
+    // handoff that had nothing left in reserve. Measured on hardware that is exactly where the
+    // stream loses a cycle - and a lost cycle inside a fill is not a stall, it moves every later
+    // write (see c_start).
+    //
+    // 40 words = 80 bytes: the 63 asked for, plus 17 bytes that cannot be spent no matter how
+    // the acceptance lands. LOOKAHEAD is already 40, so the producer was ALWAYS willing to run
+    // this far ahead; the gate simply never asked. The cost is prefill latency on held
+    // acceptances - part1 runs about 4.8 of them per frame, and 8 extra words is ~1.1 us, which
+    // is nothing against 16.7 ms - and it is what keeps `resume_addr` from ever being needed.
+    localparam [SDB:0] PREFILL_WORDS = 1 << 5;   // 32 -> see below
+    localparam [SDB:0] PREFILL_MARGIN = 8;       // 40 words buffered before the first byte
     // Stop fetching a little past a fill. FETCH_HEADROOM covers the reads already in
     // flight, so the producer can be left running while the consumer uses what it has.
     localparam [SDB:0] LOOKAHEAD      = (1 << 5) + 8;
@@ -959,12 +972,26 @@ module aw_rom (
 
     reg  [1:0]  c_state;
     reg  [1:0]  gap;
-    reg  [20:0] c_addr;                 // next byte this reader owes - and the only stream
-                                        // position there is. c_start used to sit next to it and
-                                        // 1041a deleted its last reader (the restart now resumes
-                                        // at c_addr, see below), which left a 21-bit register
-                                        // nobody reads. The fitter calls that dead logic and it
-                                        // is right: keep a register only if something reads it.
+    reg  [20:0] c_addr;                 // next byte this reader owes
+    // The address the CURRENT acceptance began at. Deleted in 1041a when its last reader went
+    // away, and back by demand of hardware: the two consumers of this bus want OPPOSITE resume
+    // points, so the reader has to know both (see `resume_addr` below).
+    //
+    //   bytecode fill (vm.si:491) holds in_ready for 63 bytes and writes them with
+    //       data.addr = data.wenable ? (data.addr + 1) : 0
+    //   so a cycle without data_available sends ITS write pointer back to 0. Continuing such a
+    //   stream at the next byte owed hands the byte for base+0x2c to fill[0]: every later byte
+    //   lands shifted, the interpreter executes ROM data as opcodes, and the Pocket stops with
+    //   opcode 0x80 and no more page swaps ~10 s into the intro. Confirmed in sim - build 1041's
+    //   policy under a forced gap shifts 121 of 282 fill writes and the design never swaps a
+    //   page again, while the c_start policy shifts nothing.
+    //
+    //   op_drawString (vm.si:935) holds pix_waddr across gaps, so it survives a gap perfectly
+    //   well and is destroyed by being RE-SERVED: that is the 4-px-per-row text shear build 1040
+    //   showed. It wants the next byte owed.
+    reg  [20:0] c_start;                // first byte of this acceptance - the fill's continuation
+    reg  [6:0]  acc_cnt;                // bytes delivered since `accept`, saturating at 64:
+                                        // how deep into the acceptance a restart would land
     reg         c_served;
     reg         c_v;
     reg  [15:0] c_word, n_word;
@@ -1009,11 +1036,81 @@ module aw_rom (
     // perfectly the chip answered (that is what held this design in reset once the read
     // stopped being faster than the consumer). Prefilling costs the check about 4 us
     // and every holder of a held stream needs it anyway.
-    wire prefill_ok = ~host_rdy | (sf_level >= PREFILL_WORDS);
+    // Held acceptances wait for PREFILL_WORDS + PREFILL_MARGIN; a pulsed one (readByte) never
+    // waits at all, because by the time any memory can answer its in_ready is long gone and
+    // host_rdy is already low.
+    wire prefill_ok = ~host_rdy | (sf_level >= (PREFILL_WORDS + PREFILL_MARGIN));
     wire want       = c_run & (host_rdy | ~c_served);
 
-    wire word_ok = c_v & (c_waddr == want_word);
-    wire take    = (c_state == C_RUN) & want & word_ok & (c_served | prefill_ok);
+    // ~stall_block here (and only here) is the simulation knob making the wanted word ABSENT,
+    // which is what the chip does when the successor misses its landing cycle. Gating `take`
+    // instead was wrong and made the knob lie: it blocked a take whose word was present, so the
+    // reader tore down a stream it could have continued and the experiment measured the knob.
+    wire word_ok = c_v & (c_waddr == want_word) & ~stall_block;
+    wire take_raw = (c_state == C_RUN) & want & word_ok & (c_served | prefill_ok);
+
+`ifdef AW_STALL
+    // "A byte would go out THIS cycle if nothing were in the way" - deliberately independent of
+    // stall_block, so the counter below keeps its own time and the stimulus is identical in every
+    // variant of this file that scripts/ab_resume_policy.sh patches. Declared INSIDE the ifdef:
+    // a wire nothing reads in the synthesised netlist is exactly the dead logic
+    // `make check-build CORE_DIR=cores/aw` is there to catch, and a simulation knob should not be
+    // able to produce that report.
+    wire stall_tick = (c_state == C_RUN) & want & c_v & (c_waddr == want_word)
+                    & (c_served | prefill_ok) & ~chk_active;
+    // Simulation-only: force the condition the modelled PSRAM never produces.
+    //
+    // Why this exists: on the Pocket, part1's streams DO drain and the reader DOES restart, and
+    // that is the only place a restart-address change can bite. Measured on hardware: the c_start
+    // policy plays the intro with sheared text, the c_addr policy plays it straight and freezes
+    // at ~10 s, same place every launch. In sim the modelled chip answers fast enough that part1
+    // shows 0 restarts, so every policy delivers a byte-identical stream and the bench cannot
+    // tell them apart - the mistake recorded in memory: prove the changed path executes in the
+    // run being compared, or the A/B is measuring nothing.
+    //
+    // So stop waiting for the failure and schedule it: make the wanted word absent for ONE cycle
+    // every STALL_EVERY delivered bytes, which is exactly what twelve cycles of tAA at the pins
+    // does when the successor misses its landing cycle.
+    //
+    // The one-cycle-wide clearing is the whole shape of this thing, and the first version got it
+    // wrong: it updated stall_block only `else if (take_raw)`, while stall_block itself forces
+    // take_raw low - so once it went high it could never come back, and the run that appeared to
+    // show "31 restarts then the machine kept streaming" was NOT this code (it predates the
+    // word_ok change by three minutes). A stimulus that can only be raised and never dropped is
+    // not a stall, it is a dead design, and it will be blamed on whatever it is testing.
+    //
+    // -DSTALL_EVERY=<n> defines a PREPROCESSOR macro, so read it with a backtick into a
+    // localparam: a bare STALL_EVERY token makes verilator look for a variable of that name and
+    // the build dies with "Can't find definition of variable".
+    `ifdef STALL_EVERY
+        localparam integer STALL_N_BYTES = `STALL_EVERY;
+    `else
+        localparam integer STALL_N_BYTES = 64;
+    `endif
+    integer stall_n = 0;
+    reg     stall_block = 1'b0;
+    always @(posedge clk_core) begin
+        if (rst_core) begin
+            stall_n     <= 0;
+            stall_block <= 1'b0;
+        end else begin
+            // Always droppable, exactly one cycle wide.
+            if (stall_block) stall_block <= 1'b0;
+            // Never inside the boot check: its 16-byte trailer read is a held acceptance whose
+            // whole point is a gapless prefill, and stalling it hangs the design at frame 0 -
+            // which is NOT the hardware symptom (the Pocket animates for ~10 s first), so it
+            // would have sent me chasing a different bug.
+            else if (stall_tick) begin
+                stall_n <= (stall_n == STALL_N_BYTES - 1) ? 0 : stall_n + 1;
+                if (stall_n == STALL_N_BYTES - 1) stall_block <= 1'b1;
+            end
+        end
+    end
+`else
+    wire stall_block = 1'b0;
+`endif
+
+    wire take    = take_raw;
     wire [7:0] c_byte = c_addr[0] ? c_word[15:8] : c_word[7:0];
     wire exhausted  = take & c_addr[0];
 
@@ -1029,13 +1126,42 @@ module aw_rom (
     // late arrival has to count too. Without it the reader rewinds every other word on
     // any continuous stream, which is how the boot check's sixteen bytes degenerated
     // into four repeated zeros.
-    wire late_handoff = (c_state == C_RUN) & want & c_served & ~take
-                       & landing & (land_addr == next_word);
-    wire handoff    = exhausted & (n_keep | (landing & (land_addr == next_word)))
-                       | late_handoff;
-    // wanted a byte, cannot deliver one: the VM's fill pointer is about to reset, so
-    // this reader restarts at the address the acceptance began
-    wire rewind     = (c_state == C_RUN) & want & c_served & ~take & ~handoff;
+    wire late_handoff = (c_state == C_RUN) & want & c_served & ~take_raw
+                       & landing & (land_addr == next_word) & ~stall_block;
+    wire handoff    = (exhausted & (n_keep | (landing & (land_addr == next_word)))
+                       | late_handoff) & ~stall_block;
+    // Wanted a byte and cannot deliver one. `& ~word_ok` keeps this from firing when the word IS
+    // in hand and something else held the take (the prefill gate: `take` also requires
+    // `c_served | prefill_ok`, and a held acceptance with a low FIFO level blocks a byte that is
+    // sitting right there). Restarting in that case throws away the word the restart needs, then
+    // re-aims the producer through the two-flop synchroniser and drains stale FIFO words before
+    // it can arrive again - which is why a frequent restart freezes the machine while a rare one
+    // recovers. Do not restart if you can hand the byte out; wait for the gate instead.
+    wire rewind     = (c_state == C_RUN) & want & c_served & ~take & ~handoff & ~word_ok;
+
+    // ---- where a restarted stream picks up, decided by WHO is waiting ----------------
+    // There is no single right answer, and the year of symptoms in this file is what proves it:
+    // build 1040 resumed at the acceptance's first byte and played the intro with sheared text;
+    // build 1041 resumed at the next byte owed and played it straight, then froze at ~10 s. Each
+    // half was correct for one consumer and fatal for the other, so the reader has to tell them
+    // apart instead of choosing. It can, exactly and cheaply:
+    //
+    //   * op_drawString and the boot-header read ask for data with address bit 20 set - vm.si
+    //     builds them as `(1<<20) | (start<<8) + (start<<6)` and `(1<<21) - 32` (op_drawString
+    //     935, header 366). Both hold their own write position across a gap, so they must NOT be
+    //     served a byte twice: that is the shear.
+    //   * A bytecode fill asks for an address in the low megabyte (segBytecode is one of the four
+    //     segment offsets and the boot check requires off0 == 0, so a fill is always a bytecode
+    //     offset), and its write pointer is the thing a gap resets. It must be restarted from the
+    //     top - not because that is where the VM is, but because that is where ITS pointer went.
+    //   * A palette load (vm.si:763) also sits below the megabyte and DOES hold its position, so
+    //     this rule re-serves it after a gap and shifts that palette. That is the one knowingly
+    //     imperfect corner: it is cosmetic, it needs a gap inside a 64-byte read, and the
+    //     PREFILL_MARGIN above is what makes it rare - whereas the alternative corner is a dead
+    //     machine. It is written here rather than hidden because it will be the first thing a
+    //     reader wants to argue with.
+    wire resume_from_start = ~c_start[20] & (acc_cnt < 7'd64);
+    wire [20:0] resume_addr = resume_from_start ? c_start : c_addr;
 
     // Between streams the FIFO is drained, so a check can never serve a word left
     // over from the previous stream (its seek would terminate on the stale entry).
@@ -1075,6 +1201,8 @@ module aw_rom (
             rom_dbg_rd_bytes <= 32'd0;
             gap          <= 2'd0;
             c_addr       <= 21'd0;
+            c_start      <= 21'd0;
+            acc_cnt      <= 7'd0;
             start_addr_r <= 22'd0;
             c_v          <= 1'b0;
             c_served     <= 1'b0;
@@ -1096,6 +1224,8 @@ module aw_rom (
 
             if (accept) begin
                 start_addr_r <= {2'b0, acc_addr[20:1]};
+                c_start      <= acc_addr;   // who is asking, and from where: see resume_addr
+                acc_cnt      <= 7'd0;
                 c_addr       <= acc_addr;
                 c_v          <= 1'b0;
                 n_v          <= 1'b0;
@@ -1134,12 +1264,48 @@ module aw_rom (
                 // repeated. The boot check benefits the same way - its shift register used to be
                 // re-fed from the trailer start, which is one reason the trailer could fail to
                 // validate however well the chip answered.
-                start_addr_r <= {2'b0, c_addr[20:1]};
-                c_v          <= 1'b0;
-                n_v          <= 1'b0;
-                c_served     <= 1'b0;
-                c_state      <= C_GAP;
-                gap          <= 2'd2;
+                // Keep a prefetch that IS the word the restart needs. This is the whole fix:
+                // the word containing c_addr routinely lands in the prefetch slot one cycle before
+                // the stall (measured in build/logs/rt-stall200.log: LAND addr=00008b while
+                // want=00008a, then REWIND from=000116, whose word is 00008b). Clearing n_v there
+                // discarded it, and getting it back costs the full teardown: producer re-aim
+                // through the two-flop synchroniser, then popping every stale word still queued
+                // behind it before the re-read surfaces (the trace shows want=00008b held while
+                // LANDs run 00008c..0000a2 and the level falls 24->14). Adopting it instead costs
+                // one register load and no bus traffic at all.
+                //
+                // The position moves to resume_addr - and this line is the whole difference
+                // between "the intro plays with straight text" and two symptoms that have now
+                // been chasing each other through four builds. The first version of this fix
+                // declared resume_addr, described it at length, let tb_soc probe it - and left the
+                // rewind resuming at c_addr anyway, which the A/B caught in one run: 121 shifted
+                // fills, identical to build 1041. A wire nothing consumes is not a policy.
+                //
+                //   * resuming at c_addr (a strip, or anything past a fill's budget): nothing is
+                //     repeated, which is what a consumer that keeps its own pixel pointer needs.
+                //   * resuming at c_start (a bytecode fill): bytes the VM has already had are
+                //     handed out AGAIN, and that is right here, because the gap reset the fill's
+                //     write pointer to 0 - its byte 0 is the next byte it will write, whatever
+                //     the reader thinks it owes. Self-healing too: if the re-served stream gaps
+                //     again, the pointer is already 0 and it restarts from 0 again.
+                if (n_v && n_addr == {1'b0, resume_addr[20:1]}) begin
+                    c_word  <= n_word;
+                    c_waddr <= n_addr;
+                    c_v     <= 1'b1;
+                    n_v     <= 1'b0;
+                    c_addr  <= resume_addr;
+                    acc_cnt <= resume_from_start ? 7'd0 : acc_cnt;
+                    c_state <= C_RUN;      // no gap, no seek, no producer re-aim
+                end else begin
+                    c_addr       <= resume_addr;
+                    acc_cnt      <= resume_from_start ? 7'd0 : acc_cnt;
+                    start_addr_r <= {2'b0, resume_addr[20:1]};
+                    c_v          <= 1'b0;
+                    n_v          <= 1'b0;
+                    c_served     <= 1'b0;
+                    c_state      <= C_GAP;
+                    gap          <= 2'd2;
+                end
             end else if (c_state == C_GAP) begin
                 // Always to C_SEEK, never cancelled by the caller having dropped
                 // in_ready: readByte() raises it for one cycle and then waits for busy,
@@ -1178,6 +1344,10 @@ module aw_rom (
             // byte out
             if (take) begin
                 mem_data <= c_byte;
+                // How deep into this acceptance we are, saturating at 64: the only evidence the
+                // reader has that a fill's 63-byte budget is spent and the waiter can no longer
+                // be one (see resume_addr).
+                if (acc_cnt != 7'h7f) acc_cnt <= acc_cnt + 7'd1;
                 // count the bytes the VM got, not the boot check's own reads
                 if (!chk_active) rom_dbg_rd_bytes <= rom_dbg_rd_bytes + 32'd1;
                 c_served <= 1'b1;

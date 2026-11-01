@@ -368,6 +368,19 @@ reg design_run = 1'b0;
     reg       acc_open    = 1'b0;
     reg [20:0] acc_base   = 21'd0;
 
+    // An acceptance that restarted FROM ITS OWN START is not a positional stream any more, and
+    // the delivery oracle has to know that. aw_rom does this deliberately for the bytecode fill
+    // (see resume_addr): the fill's write pointer reset to 0 on the gap, so the only coherent
+    // continuation is from the acceptance's first byte, and the VM's fill loop is about to write
+    // those bytes at 0, 1, 2... again. Comparing that against base+k calls correct behaviour
+    // wrong - 36,531 times, in the run that proved the mechanism. So the byte oracle stands aside
+    // for such an acceptance and SAYS so in a counted number, rather than either crying wolf or
+    // being deleted. The fill-shift oracle below still checks every byte, because it checks the
+    // address the VM actually wrote to.
+    reg       acc_reserve = 1'b0;
+    integer   n_reserve   = 0;      // acceptances that re-served bytes on purpose
+    integer   reserve_bytes = 0;    // bytes delivered while the positional oracle stood aside
+
     integer   n_fill_acc  = 0;      // acceptances that wrote the fill buffer: the intolerant ones
     integer   n_fill_bad  = 0;      // of those, ones with a gap that could move a later write
     integer   fill_gap_cycles = 0, fill_gap_early = 0;
@@ -487,8 +500,14 @@ reg design_run = 1'b0;
             acc_gaps_early = 0;
             acc_gap_pos    = 0;
             acc_base       = mem_addr & 21'h1F_FFFF;  // 2 MB pack window, same mask as byte check
+            acc_reserve    = 1'b0;
         end else if (acc_open) begin
+            if (u_rom.rewind && u_rom.resume_from_start && !acc_reserve) begin
+                acc_reserve = 1'b1;
+                n_reserve   = n_reserve + 1;
+            end
             if (mem_data_available) begin
+                if (mem_in_ready && acc_reserve) reserve_bytes = reserve_bytes + 1;
                 if (mem_in_ready) acc_bytes = acc_bytes + 1;
             end else if (mem_in_ready && acc_bytes > 0) begin
                 if (acc_gaps == 0) acc_gap_pos = acc_fw;
@@ -1012,7 +1031,7 @@ reg design_run = 1'b0;
             // what let 405 re-served-byte storms read as a clean stream, because a repeated byte
             // compared against the position the design had just rewound to and matched. The VM
             // has no such reset, so this is the check that says whether a recovery was lossless.
-            if (served_k >= 0 && (stream_base + served_k) < PACK_BYTES) begin
+            if (served_k >= 0 && (stream_base + served_k) < PACK_BYTES && !acc_reserve) begin
                 chk_compared = chk_compared + 1;
                 if (mem_data !== ref_mem[stream_base + served_k]) begin
                     errors = errors + 1;
@@ -1361,6 +1380,11 @@ reg design_run = 1'b0;
         $display("tb_soc: diagnostics - bytes to VM %0d (compared %0d, outside window %0d), restarts %0d (mid-acceptance %0d), frame swaps %0d (last at frame %0d)",
                  bytes_to_vm, chk_compared, chk_unchk, rewinds, rewind_reissue, swaps,
                  last_swap_frame);
+        // Standing aside is a counted, visible act: "the oracle compared nothing" and "the oracle
+        // correctly declined to compare a stream that is not positional" must never be the same
+        // silence. See acc_reserve above.
+        $display("tb_soc: delivery oracle stood aside for %0d acceptances that re-served from their own start (%0d bytes; the fill-shift oracle still checks every byte the VM writes)",
+                 n_reserve, reserve_bytes);
         // The consumer-side view of the same traffic. A short held acceptance is the bytecode
         // fill, and a gap inside one shifts the fill (vm.si:496); a long one is a string strip,
         // which survives gaps. `pulsed` is readByte, whose bytes always land with in_ready low
