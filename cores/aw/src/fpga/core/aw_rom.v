@@ -724,16 +724,9 @@ module aw_rom (
             dir_stall          <= 18'd0;
             dir_err_code       <= 7'd0;
             part_latched       <= 3'd0;
-            part_pop           <= 1'b0;
-            p_state            <= P_IDLE;
-            part_val           <= 3'd0;
-            part_held          <= 1'b0;
-            p_wcnt             <= 8'd0;
-            arm_req_s          <= 2'b00;
-            arm_ack            <= 1'b0;
+            arm_ack            <= 1'b0;   // driven here; arm_req_s belongs to its own process
             dir_installed      <= 1'b0;
-            clr_active         <= 1'b0;
-            clr_i              <= 6'd0;
+            clr_req            <= 1'b0;
             census_addr        <= {CEN_AW{1'b0}};
             census_last        <= {CEN_AW{1'b0}};
             census_stall       <= 18'd0;
@@ -751,6 +744,7 @@ module aw_rom (
             if (arm_req_s[1] && !dir_pend && !dir_active && dir_done) arm_ack <= 1'b1;
             else if (!arm_req_s[1]) arm_ack <= 1'b0;
             if (dir_start) dir_pend <= 1'b0;
+            if (clr_req && clr_active) clr_req <= 1'b0;   // the RAM process has it from here
             // The census arms the same way. It used to start on the raw census_go edge, and once a
             // second sweep shared this controller that edge could arrive in a cycle the controller
             // was not idle in - and then the census simply never ran, which is the failure this
@@ -773,8 +767,10 @@ module aw_rom (
                 // the same part (a retry, or an upload that finished while the sweep was already
                 // armed) - never a silent fall back to part 0, which would replay part 1's intro
                 // under a menu that says part 4.
+                // part_held is READ here and cleared by its own process (a single driver per
+                // register, per the chk_cnt note below - the sequencer writing it as well is the
+                // multiple-constant-driver error Quartus elaborates on and Verilator never shows).
                 dir_part      <= part_held ? part_val : part_latched;
-                part_held     <= 1'b0;      // consumed, whether or not the install then succeeds
                 st_seq        <= ST_SEQ_DIR;
                 st_s          <= ST_RD;
             end else if (cen_pend) begin
@@ -873,8 +869,7 @@ module aw_rom (
                         // pack reads another part's bytes and looks exactly like a bad upload.
                         dir_active    <= 1'b0;
                         dir_done      <= 1'b1;
-                        clr_active    <= 1'b1;
-                        clr_i         <= 6'd0;
+                        clr_req       <= 1'b1;
                         dir_err_code  <= 7'd1;             // bit0: no magic
                         dir_installed <= 1'b0;
                         dir_bad       <= 1'b0;             // a plain pack is not an error
@@ -886,8 +881,7 @@ module aw_rom (
                 end else if (!dir_val_ok) begin
                     dir_active    <= 1'b0;
                     dir_done      <= 1'b1;
-                    clr_active    <= 1'b1;
-                    clr_i         <= 6'd0;
+                    clr_req       <= 1'b1;
                     // bit1 = an entry was out of range; bits[5:0] = which one, so the console names
                     // it instead of reporting "bad"
                     dir_err_code  <= 7'h02 | {1'b1, dir_ph[5:0]};
@@ -1185,7 +1179,7 @@ module aw_rom (
     wire        rd_q_valid;
     wire [TW-1:0] rd_addr_q;
 
-    reg  [21:0] start_addr_r;   // word address of the current stream; written at the
+    reg  [19:0] start_addr_r;   // word address of the current stream; written at the
                                 // acceptance and unchanged while c_run is low
     reg  [2:0]  run_s;
     always @(posedge clk_psram) run_s <= {run_s[1:0], c_run};
@@ -1233,7 +1227,12 @@ module aw_rom (
     // With no table installed the map is the IDENTITY, so a plain 2 MiB pack reads exactly as it
     // did before this code existed. That is what makes the change falsifiable against the benches
     // that already pass instead of needing new ones to be believed.
-    reg  [21:0] p_addr;                                  // view word address of the next fetch
+    // 20 bits, not 22. The view is 1 Mi words (2 MiB) and since the page map went in, the fetch
+    // address is {page_phys, p_addr[13:0]} - so p_addr[21] had no fanout at all and check-build said
+    // so. Leaving a register bit that can only ever hold zero is not free (see the census_addr note
+    // above: the fitter is telling you the range does not need the width), and this one is a width my
+    // own change made dead, so it is mine to remove rather than to explain.
+    reg  [19:0] p_addr;                                  // view word address of the next fetch
     localparam integer PGTBL_AW = 6;                     // 64 view pages of 32 KiB
     reg  [7:0] pgtbl [0:(1<<PGTBL_AW)-1];                // view page -> physical 32 KiB page
     // Power-up identity, and that is a safety property rather than tidiness: without it the RAM
@@ -1251,6 +1250,8 @@ module aw_rom (
     // a table the boot logic would reject), then the identity walk-back, then the sweep's entries.
     reg                  clr_active;                     // walk the whole table back to identity
     reg  [5:0]           clr_i;
+    reg                  clr_req;                        // the sequencer's ask; owned by IT, and the
+                                                         // only thing it may drive here (see below)
     wire                 dir_install;
     reg                  dir_active, dir_done, dir_to;
     reg  [6:0]           dir_ph;                         // 0,1 = magic words; 2..65 = table entries
@@ -1290,6 +1291,8 @@ module aw_rom (
             tbl_loaded   <= 1'b0;
             tbl_rdat     <= 8'd0;
             tbl_rdat_idx <= {PGTBL_AW{1'b0}};
+            clr_active   <= 1'b0;
+            clr_i        <= 6'd0;
         end else begin
             tbl_rdat     <= pgtbl[p_view_page];
             tbl_rdat_idx <= p_view_page;
@@ -1300,6 +1303,9 @@ module aw_rom (
                 pgtbl[clr_i] <= {2'b0, clr_i};
                 if (clr_i == 6'd63) clr_active <= 1'b0;
                 else                clr_i <= clr_i + 6'd1;
+            end else if (clr_req) begin
+                clr_active <= 1'b1;
+                clr_i      <= 6'd0;
             end else if (dir_install) begin
                 pgtbl[dir_ph[5:0] - 6'd2] <= rd_q[7:0];
                 tbl_loaded <= 1'b1;
@@ -1331,14 +1337,17 @@ module aw_rom (
     // The tag is the VIEW word address, never the physical one: the consumer matches it against
     // c_addr[20:1], and a paged read that tagged where the byte physically lived would look like
     // a stream that skipped. Separating tag from address is why paging costs the consumer nothing.
-    wire [TW-1:0] rd_tag_w = st_rd_take ? st_rd_addr[TW-1:0] : p_addr[TW-1:0];
+    // The tag keeps its 21-bit width - the consumer's match is the most load-bearing comparison in
+    // this file and is not being changed to tidy a register. Bit 20 is simply a constant now, fed by
+    // the concatenation instead of by a register that could never set it.
+    wire [TW-1:0] rd_tag_w = st_rd_take ? st_rd_addr[TW-1:0] : {1'b0, p_addr};
 
     wire        rd_taken   = rd_req & rd_ready;
     wire        prod_taken = rd_taken & ~st_rd_take;
 
     always @(posedge clk_psram) begin
         if (rst_psram) begin
-            p_addr   <= 22'd0;
+            p_addr   <= 20'd0;
             sf_wr    <= 1'b0;
             sf_wdata <= {SWIDTH{1'b0}};
         end else begin
@@ -1346,7 +1355,7 @@ module aw_rom (
             if (p_start) begin
                 p_addr <= start_addr_r;
             end else if (prod_taken) begin
-                p_addr <= p_addr + 22'd1;
+                p_addr <= p_addr + 20'd1;
             end
             if (rd_q_valid && st_s != ST_WAIT) begin
                 sf_wr    <= 1'b1;
@@ -1512,7 +1521,10 @@ module aw_rom (
     // sequencer. Written as its own process because arm_req_s is read there and driven here - and
     // "declared it, never drove it" is the second time that exact mistake has cost this feature a
     // silent no-op, so the synchroniser is deliberately the first thing after the FIFO it feeds.
-    always @(posedge clk_psram) arm_req_s <= {arm_req_s[1:0], arm_req};
+    always @(posedge clk_psram) begin
+        if (rst_psram) arm_req_s <= 2'b00;
+        else           arm_req_s <= {arm_req_s[1:0], arm_req};
+    end
 
     // Drain the request FIFO into part_val as soon as one is waiting and nothing has streamed, so a
     // sweep start finds a HELD part instead of racing a registered FIFO output. Own process, one
@@ -1527,6 +1539,7 @@ module aw_rom (
             p_wcnt    <= 8'd0;
         end else begin
             part_pop <= 1'b0;
+            if (dir_start) part_held <= 1'b0;   // consumed at the sweep start, right or wrong part
             case (p_state)
             P_IDLE: if (!part_empty && !streamed_q) begin
                         part_pop <= 1'b1;
@@ -1672,7 +1685,7 @@ module aw_rom (
             mem_data_available <= 1'b0;
 
             if (accept) begin
-                start_addr_r <= {2'b0, acc_addr[20:1]};
+                start_addr_r <= acc_addr[20:1];
                 c_start      <= acc_addr;   // who is asking, and from where: see resume_addr
                 acc_cnt      <= 7'd0;
                 c_addr       <= acc_addr;
@@ -1748,7 +1761,7 @@ module aw_rom (
                 end else begin
                     c_addr       <= resume_addr;
                     acc_cnt      <= resume_from_start ? 7'd0 : acc_cnt;
-                    start_addr_r <= {2'b0, resume_addr[20:1]};
+                    start_addr_r <= resume_addr[20:1];
                     c_v          <= 1'b0;
                     n_v          <= 1'b0;
                     c_served     <= 1'b0;
