@@ -1969,3 +1969,173 @@ Both fixed: the description is properly quoted, and each block now ends
 `|| { echo "FATAL: …"; exit 1; }`. Re-run end to end afterwards: `core.json updated:
 shortname='AW 1041'`, `identity verified: folder == 'Eddie Chan.AW 1041'`, bitstream sha
 `5b7ab7d5e7f0d80b…`, 8 packs present.
+
+## 2026-11-01: the two consumers — why no single resume address can fix both (1042a)
+
+Four builds chased two symptoms that turned out to be one mechanism with two faces. The hardware
+table that started it, measured on one Pocket:
+
+| build | resume a stalled stream at | text | intro |
+|---|---|---|---|
+| 1040 | `c_start`, the acceptance's first address | **sheared** ~4 px/row | **plays** |
+| 1041 | `c_addr`, the next byte the VM owes | **straight** | **freezes ~10 s**, same place every launch |
+
+Reading 1041 as a regression of 1040 (or the reverse) was the wrong frame. Both are correct for
+one consumer and fatal for the other, and the two consumers are in the same file:
+
+```
+vm.si:491   // the 64-byte bytecode fill loop
+    while (data.addr != 63) {
+      data.addr = data.wenable ? (data.addr + 1) : 0;   // <-- a gap RESETS the write pointer
+      data.wdata   = mem.data;
+      data.wenable = mem.data_available;
+    }
+vm.si:935   // op_drawString
+    pix_waddr = mem.data_available ? pix_waddr+1 : pix_waddr;   // holds its place across a gap
+```
+
+So a cycle without `data_available` in the middle of a fill sends the *consumer's* write pointer
+back to 0, and continuing the stream at the next byte owed hands the byte for `base+0x2c` to
+`fill[0]`. Every later byte lands shifted, the interpreter executes the tail of the buffer as
+opcodes, and the machine stops with opcode `0x80` and no further page swaps — while the delivery
+is byte-exact the whole time. `op_drawString` does not care about gaps at all, but it is destroyed
+by being served a byte twice: that is the shear, and 320 mod 158 = 4 px/row is its fingerprint.
+
+### The oracle that could see it (a8b93c5)
+
+Every check up to now anchored on the delivery, and the delivery is correct. tb_soc now watches
+the consumer's own write port — `u_soc.vm.__mem__data` (module `M_vm_M_main_vm_mem_data`, 64 x 8
+bits) — and requires each write to equal the pack byte at `acceptance_base + write_address`.
+`data.wenable` is written in exactly one place in vm.si, so every write to that BRAM is a fill
+byte and is attributable. Clean part1, 115 frames:
+
+```
+tb_soc: diagnostics - bytes to VM 48236 (compared 48232, outside window 4), restarts 0, frame swaps 34 (last at frame 114)
+tb_soc: acceptances - bytecode-fill 554 (0 waited for a byte before finishing, 0 early gap cycles of 553 total), tolerant 10405 [5 gap cycles], pulses landing with in_ready low 11518
+tb_soc: fill buffer - 35456 writes, 0 landed on the wrong byte of the pack, 0 with no acceptance open
+-> PASS
+```
+
+Two counters died getting there, both measured rather than argued:
+
+* **"a `data_available` pulse landed while `in_ready` was low" is not a lost byte.** 29904 of
+  part1's 121834 bytes were counted that way, and it *gated* the S1 verdict. `readByte` (vm.si:56)
+  raises `in_ready` for one cycle and then takes `mem.data` when `busy` falls — it never reads
+  `data_available`. That counter was counting the design's most common correct behaviour.
+* **"a gap inside a short held acceptance" is not the fault either.** Classified by *length* it
+  fired on 558 of 559 fills of the healthy run above — the gap is the tail cycle after the fill
+  has finished writing. Classified by what the acceptance **did** (writing the fill buffer is what
+  makes an acceptance gap-intolerant) and counted only where a gap could still move a write, the
+  same run reports 0. The block stays in the file, disabled, so nobody re-arms it.
+
+### The A/B, with the stimulus proven present
+
+The modelled PSRAM answers fast enough that part1 shows **zero** restarts, so in a normal run every
+policy delivers identical bytes and the comparison is a rerun. `STALL=N` makes the wanted word
+absent for one core cycle every N delivered bytes — what twelve cycles of tAA does when a successor
+misses its landing cycle. `scripts/ab_resume_policy.sh`, part1, `STALL=64`:
+
+| variant | restarts | fill writes / shifted | page swaps | verdict |
+|---|---|---|---|---|
+| 1040 (`c_start`) | 1919 | 102,370 / **0** | 57, last at frame 175 | FAIL — 105 wrong bytes where the consumer really is positional |
+| 1041 (`c_addr`) | 5 | 282 / **121** | **0, ever** | FAIL — no rich frame, 3.27 MB streamed to a spinning VM |
+| **1042** | 1911 | 102,114 / **0** | 57, last at frame 175 | **PASS** — 155 rich frames |
+
+1041's first shifted write, spelled out by the bench:
+
+```
+FILL SHIFT t=84767208000 fill base=0: the VM wrote fill[0] = 00 but the pack byte at base+0 is 04
+(the byte it put there lives at base+50; accepted so far 44, gaps so far 128, rewinds 1, c_addr=2d)
+```
+
+That is the freeze: 44 bytes in, one missing cycle, and the byte for `base+0x2c` lands at `fill[0]`.
+
+The middle row of that table was also the check on my own fix. The first version declared
+`resume_addr`, documented it, let tb_soc probe it — and left the `rewind` branch resuming at
+`c_addr` anyway. Under the same stimulus it produced 121 shifted writes, byte-for-byte 1041's
+result. A wire nothing consumes is not a policy, and this is the second time this week a test
+caught me describing a change instead of making it.
+
+### The fix (e812baa)
+
+```verilog
+wire resume_from_start = ~c_start[20] & (acc_cnt < 7'd64);
+wire [20:0] resume_addr = resume_from_start ? c_start : c_addr;
+```
+
+`op_drawString` and the boot-header read ask for data with **address bit 20 set** — vm.si builds
+them as `(1<<20) | (start<<8) + (start<<6)` and `(1<<21) - 32` — and both hold their own position,
+so they continue at the next byte owed and are never served a byte twice. A bytecode fill asks for
+a bytecode offset (segBytecode is `off0`, and the boot check requires `off0 == 0`, so it is always
+below the megabyte), and its pointer went to 0, so it continues from 0 — where the re-served bytes
+are exactly the ones it will write next. Self-healing too: if the restarted fill gaps again its
+pointer is already 0, so it restarts from 0 again rather than shifting.
+
+Second half, which is what keeps the rule from ever being needed: `PREFILL_WORDS` was 32 words =
+64 bytes for a 63-byte fill — zero margin, none at all for an odd-address start, and the delivery
+rhythm (one word per two core cycles, registered pop, handoff bypass) has no slack to absorb a
+late arrival. It is 40 now; `LOOKAHEAD` was *already* 40, so the producer had always been willing
+to run this far ahead and the gate simply never asked. Cost is ~1.1 us of prefill on the ~4.8 held
+acceptances a frame. Measured effect on the copy-protection screen: **405 restarts → 326**.
+
+Clean runs after the fix are unchanged where they should be, which is the check that the margin
+costs nothing on the healthy path:
+
+* part1: PASS, same numbers as before the change (48,236 bytes, 0 wrong, 35,456 fill writes / 0
+  shifted, page swaps continuing to the last frame).
+* part0: PASS, kind=text — 1 strip, 63,999 writes, `drift=value=content=0`, 326 restarts, 37,504
+  fill writes / 0 shifted, and **0 wrong bytes**, because a strip is bit-20 and was not re-served.
+
+tb_soc stands aside from the positional byte check for an acceptance that deliberately re-serves
+from its own start — that repeat *is* the correct continuation for a fill, and calling it wrong
+cost 36,531 phantom errors before the oracle learned the difference. Standing aside is counted and
+printed (`stood aside for 759 acceptances ... 38030 bytes`), never silent, and the fill oracle
+still checks every byte.
+
+### Said out loud, so the next reader does not find it alone
+
+* **A palette load also sits below the megabyte and does hold its position** (`vm.si:763` keeps
+  `n`), so a gap inside one is now re-served and shifts that palette. Cosmetic, needs a gap inside
+  a 64-byte read, and the margin is what makes it rare. The alternative corner is a dead machine.
+  If the Pocket shows wrong colours and no freeze, this is the cause.
+* `check-build` would call the simulation knob's `stall_tick` dead logic, so it moved inside the
+  `ifdef AW_STALL`. A test hook that produces a report the flow is there to produce is a bug.
+* `da_not_accepted` is still printed, because the older logs count it and it is the size of the
+  pulsed-read population. It gates nothing.
+* Telemetry (restarts / resume-at-start / held-gap cycles on real hardware) was cut from 1042a on
+  purpose to keep its diff and timing risk to the thing it tests. It is task #13 for 1043, and
+  until it exists the margin value 8 is a judgement rather than a measurement.
+
+### Gate for 1042a — what the sim and the toolchain answered
+
+Bitstream `build/aw/bitstream.rbf_r`, sha256 `579746d33d45b594…`. Identities it replaces on the
+card are archived: 1040 = `888b1c056d70ec4a…`, 1041 = `5b7ab7d5e7f0d80b…` (both also still on the
+card on purpose, under `scripts/sd_install_1042a.sh`, which refuses to install if the bitstream it
+is given is either of those two).
+
+| step | result |
+|---|---|
+| `make sim` (unit suite) | `tb_write` PASS · `tb_keys` 13 checks 0 errors · `tb_rom` 519 checks 0 errors, tripwire fired · `tb_iv` 24 accesses 0 X cycles on DQ · `tb_reset_gen` PASS · `tb_top` PASS (59 frame boundaries, MCLK 122880 edges/10 ms, LRCK 480 rises/10 ms) |
+| `sim_soc` part1, clean, 115 frames | **PASS** — 103 non-black, 99 rich (best 16 colours), 48,236 bytes to the VM, 48,232 compared, 0 wrong, 35,456 fill writes / **0 shifted**, 34 page swaps with the last in the final frame |
+| `sim_soc` part0, clean, 80 frames | **PASS** (kind=text) — 1 strip, 63,999 writes, `drift=value=content=0`, 326 restarts all inside the strip, **0 wrong bytes**, 37,504 fill writes / **0 shifted**, and `stood aside for 0 acceptances`: a strip is bit-20, so nothing was re-served |
+| `sim_soc` part1 with `STALL=64`, 175 frames | **PASS** — 1911 restarts, 102,114 fill writes / **0 shifted**, 57 page swaps last at frame 175, oracle stood aside for 759 re-serving acceptances (38,030 bytes) |
+| same stimulus, 1041's policy | 282 fill writes / **121 shifted**, **0 page swaps ever**, 3.27 MB streamed to a spinning VM |
+| same stimulus, 1040's policy | 102,370 fill writes / 0 shifted, but **105 wrong bytes** where the consumer is positional |
+| `make build CORE_DIR=cores/aw` | 0 errors; `Fitter (171000) was successful`, `Assembler (11888)`, `STA (335001)` all successful |
+| `make check-build CORE_DIR=cores/aw` (scoped) | **worst slack +0.135 ns** (1041a's baseline was +0.129 ns — it got better, not worse), `no dead logic in the core's own modules`, `every SDC constraint in compile.log matched something`, clocks 24.75 / 92.8125 MHz |
+| sim knob out of the netlist | `stall_block` / `stall_tick` appear nowhere in `compile.log` or the map report — `AW_STALL` is simulation-only, and `stall_tick` was moved inside the `ifdef` so it cannot become the dead logic check-build exists to find |
+
+Still open, and not hidden here:
+
+* **The hardware answers the two real questions** (intro past a minute; captions straight). Sim
+  cannot see the natural-case restarts at all — every clean run above reports `0 early gap cycles`,
+  which is exactly why the forced-gap column exists and why the card still carries 1040 and 1041.
+* **`PREFILL_MARGIN = 8` is a judgement, not a measurement.** part0's restarts going 405 → 326 is
+  the only evidence; without telemetry on the device (task #13) there is no way to tell a margin
+  that is enough from one that merely delays the failure.
+* **The bench's frame accounting is inconsistent and I did not chase it.** `FRAMES=60` reported 115
+  frames, `FRAMES=25` reported 80, but `FRAMES=120` once reported 17 while still PASSing, and the
+  600-frame run has passed 695. `run_until_frames` waits on `frames < max_frames`, so the budget is
+  evidently not what bounded the short run. Harmless for these verdicts (each is self-consistent),
+  but "just run it longer" is how a late freeze gets found, so it needs understanding before it is
+  relied on.
