@@ -86,6 +86,11 @@ DEFINES=()
 # enough to keep in the script, and it is the only way to see what the reader did around a
 # single wrong byte.
 [ -n "${READTRACE:-}" ] && DEFINES+=(-DREAD_TRACE)
+# STALL=N forces the stream reader to lose the word it needs every N delivered bytes, so the
+# restart path runs on schedule instead of never. The modelled PSRAM answers fast enough that
+# part1 shows 0 restarts in sim, which is exactly why the bench reported 1040 and 1041 as
+# identical while the Pocket froze at 10 s on one and played the intro on the other.
+[ -n "${STALL:-}" ] && DEFINES+=(-DAW_STALL -DSTALL_EVERY="$STALL")
 
 cd "$WORK"
 # A stale frame directory is worse than no frame directory: the run below fails, the
@@ -107,16 +112,26 @@ if ! verilator --binary -j 4 --timing --top-module tb_soc \
     exit 1
 fi
 
+# `role` is prose for the log; `kind` is what the bench grades on. They must agree, and the
+# reason is a false alarm that ran for weeks: part0 is near-black in the REFERENCE simulator as
+# well, so demanding rich frames from it fails a correct design. The bench now skips the
+# rich/black tests only for kind=text and demands a strip instead, so neither kind can be
+# satisfied by a design that renders nothing. Override with PACK_KIND=rich|text.
 case "$PACK" in
-    *part0.bin) role="copy-protection screen (near-black by design; the reference sim is too)" ;;
-    *part1.bin) role="intro - the S1 target, upstream's make simul1" ;;
-    *)          role="unknown part; see ports/another-world/packs/packs.txt" ;;
+    *part0.bin) role="copy-protection screen (near-black by design; the reference sim is too)"
+                kind="text" ;;
+    *part1.bin) role="intro - the S1 target, upstream's make simul1"
+                kind="rich" ;;
+    *)          role="unknown part; see ports/another-world/packs/packs.txt"
+                kind="rich" ;;
 esac
+kind="${PACK_KIND:-$kind}"
 echo "pack  : $PACK"
 echo "role  : $role"
+echo "kind  : $kind (what the verdict is graded on)"
 echo "=== run: load, boot, capture $FRAMES frames ==="
 ./obj/tb_soc "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" "+FRAMES=$FRAMES" \
-             "+FRAMEDIR=$FRAMEDIR" ${EXTRA:-}
+             "+FRAMEDIR=$FRAMEDIR" "+PACK_KIND=$kind" ${EXTRA:-}
 # EXTRA carries bench plusargs that are not the pack, e.g.
 #   EXTRA=+FUZZ_BRAM=1 ./docker/run-silice.sh scripts/sim_soc.sh
 # (the positional argument is the pack, so "$@" could not be used for both)

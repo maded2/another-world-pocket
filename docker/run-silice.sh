@@ -77,7 +77,13 @@ fi
 # EXTRA carries bench plusargs through scripts/sim_soc.sh (e.g. EXTRA=+FUZZ_BRAM=1);
 # it is on this list because the list is an allow-list and an unlisted variable is dropped
 # in silence - the failure mode documented just above.
-for _v in TRACE READTRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS EXTRA WORK; do
+# STALL forces aw_rom's restart path (scripts/ab_stall_repro.sh) and FRAMEDIR chooses where the
+# pictures go; both were absent from this allow-list, so asking for them did nothing at all --
+# the exact silence this comment block warns about, rediscovered while trying to reproduce a
+# hardware-only freeze.
+# PACK_KIND tells tb_soc what the pack is supposed to render (part0 is black by design); it went
+# on this list the same afternoon it was invented, for the same reason as the two above.
+for _v in TRACE READTRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS EXTRA WORK STALL FRAMEDIR PACK_KIND; do
     [ -n "${!_v:-}" ] && docker_args+=(-e "$_v")
 done
 

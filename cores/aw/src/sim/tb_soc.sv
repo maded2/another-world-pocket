@@ -257,6 +257,13 @@ reg design_run = 1'b0;
     // ---- memory image, for the bridge loader
     reg [7:0] ref_mem [0:PACK_BYTES-1];
     string    pack_hex;
+    // What this pack is supposed to put on screen, from scripts/sim_soc.sh. Not cosmetic:
+    // part0 IS the copy-protection screen and is near-black in the REFERENCE simulator too, so
+    // a verdict that demands rich frames fails the design for drawing what the pack says - and
+    // nobody reads a gate that cries wolf. "rich" = an ordinary intro/gameplay pack (a flat or
+    // black screen is a fault); "text" = the copy-protection screen, whose real oracles are the
+    // op_drawString strip and the census, and where "no strip was ever written" is the fault.
+    string    pack_kind = "rich";
     string    framedir;
     // Pace of the modelled bridge. Measured on this design, one 32-bit write every ten
     // 74.25 MHz cycles (~25 MB/s) is absorbed; every eight (~31 MB/s) overruns the drain
@@ -314,7 +321,205 @@ reg design_run = 1'b0;
     integer   rewinds = 0;
     integer   rewind_reissue = 0;   // restarts that happened AFTER bytes were delivered (see below)
     integer   chk_unchk = 0;        // bytes not comparable (address outside the image window)
+    // Pulses the consumer did not take, kept because the older logs count it and because it is
+    // the size of the pulsed-read population. It is NOT a fault and no longer gates the verdict:
+    // `take` raises mem_data_available one core cycle after deciding, and readByte (vm.si:56)
+    // has already dropped in_ready by then, so every single-byte read lands here. Part1 counted
+    // 29904 of 121834 bytes this way with nothing lost -- the first version of this check made
+    // the S1 target unpassable by counting the design's most common correct behaviour.
+    integer   da_not_accepted = 0;
+    always @(posedge clk_core) begin
+        if (mem_data_available && !mem_in_ready && !u_rom.chk_active)
+            da_not_accepted = da_not_accepted + 1;
+    end
+
+    // ---- consumer-side acceptance monitor ---------------------------------------------
+    // Of the four things that read this bus, only ONE punishes a missing cycle:
+    //
+    //   readByte      (vm.si:56)  in_ready for ONE cycle, then waits for busy and takes
+    //                             mem.data. Never looks at data_available -> a gap is free.
+    //   bytecode fill (vm.si:491) holds in_ready for ~64 bytes and runs
+    //                             `data.addr = data.wenable ? (data.addr + 1) : 0`
+    //                             so A CYCLE WITHOUT data_available RESETS THE FILL WRITE
+    //                             POINTER: the next byte lands at fill address 0 and the
+    //                             interpreter runs the rest of the buffer shifted. That is the
+    //                             Pocket's freeze - opcode 0x80 (not a VM op), page swaps stop,
+    //                             same place every launch, ~10 s in.
+    //   op_setPalette (vm.si:763) holds in_ready for 64 bytes but keeps `n` across gaps.
+    //   op_drawString (vm.si:935) holds in_ready for len*384 bytes and keeps pix_waddr across
+    //                             gaps (which is why IT is the consumer that cares about bytes
+    //                             being RE-SERVED rather than about gaps - the text shear).
+    //
+    // An acceptance is therefore classified by what it DID, not by how long it was: writing the
+    // fill buffer is what makes an acceptance gap-intolerant. (The first version classified by
+    // LENGTH and reported "1 gap in 558 of 559 fills" on a run that was healthy - restarts 0,
+    // intro rendering, fill oracle clean. Those gaps were the tail cycle after the fill had
+    // finished writing, and length cannot see that. Position and identity can, so this counts
+    // writes and counts a gap only where it could still move one.)
+    localparam integer FILL_WRITES = 63;   // bytes one bytecode fill writes: the loop runs while
+                                           // data.addr != 63 (vm.si:494). Confirmed by measurement
+                                           // - 35456 fill writes over 559 fill acceptances.
+
+    integer   acc_bytes   = 0;      // accepted pulses (data_available & in_ready) this acceptance
+    integer   acc_fw      = 0;      // writes THIS acceptance made to the VM's fill buffer
+    integer   acc_gaps    = 0;      // cycles the consumer waited with nothing to take
+    integer   acc_gaps_early = 0;   // of those, ones that fell before the fill finished writing
+    integer   acc_gap_pos = 0;      // write index the FIRST gap fell at (position decides all)
+    reg       acc_open    = 1'b0;
+    reg [20:0] acc_base   = 21'd0;
+
+    integer   n_fill_acc  = 0;      // acceptances that wrote the fill buffer: the intolerant ones
+    integer   n_fill_bad  = 0;      // of those, ones with a gap that could move a later write
+    integer   fill_gap_cycles = 0, fill_gap_early = 0;
+    integer   n_tol_acc   = 0;      // tolerant acceptances: pulsed reads, palette, header, strips
+    integer   tol_gap_cycles = 0;
+    integer   last_bad_base = 0, last_bad_len = 0, last_bad_gaps = 0, last_bad_pos = 0;
+
+    // ---- where the VM's fill bytes actually LAND (the oracle that was missing) ----------
+    // Everything above measures the wire. The wire can be byte-exact - part1: 121,830 of
+    // 121,834 bytes compared, zero wrong - and the game still freeze on hardware, because the
+    // bytecode fill loop writes what it receives into its own 64-byte buffer and its write
+    // pointer is NOT the stream position:
+    //
+    //   vm.si:495   data.addr = data.wenable ? (data.addr + 1) : 0;
+    //
+    // A cycle without data_available sends that pointer back to 0, so the next byte lands at
+    // fill address 0 and everything after it is shifted. The interpreter then executes the tail
+    // of the buffer as opcodes - which is exactly what the Pocket shows when it stops: opcode
+    // 0x80, not a VM op, page swaps frozen, same place every launch. No address-anchored check
+    // on the delivery side can see this, because the delivery is correct; only the landing
+    // addresses are not.
+    //
+    // So check the consumer's own writes. `data` is the fill buffer (module
+    // M_vm_M_main_vm_mem_data, 64 x 8 bits) and vm.si writes data.wenable in ONE place - the
+    // fill loop at 493-501 (grep: nothing else in vm.si touches data.wenable) - so every write
+    // to this BRAM belongs to a fill, and its address must equal the byte's offset from the
+    // acceptance base. That makes the check per-byte, exact, and immune to the classification
+    // guesswork above.
+    integer   fill_writes   = 0;
+    integer   fill_shift    = 0;      // writes that landed where the pack says another byte lives
+    integer   fill_unbased  = 0;      // writes with no acceptance open (should be impossible)
+    integer   last_shift_at = 0;      // the fill address the VM chose, for the verdict line
+    always @(posedge clk_core) begin
+        if (u_soc.vm.__mem__data.in_wenable) begin
+            fill_writes = fill_writes + 1;
+            if (!acc_open) fill_unbased = fill_unbased + 1;
+            else if ((acc_base + u_soc.vm.__mem__data.in_addr) < PACK_BYTES) begin
+                if (u_soc.vm.__mem__data.in_wdata !== ref_mem[acc_base + u_soc.vm.__mem__data.in_addr]) begin
+                    fill_shift = fill_shift + 1;
+                    last_shift_at = u_soc.vm.__mem__data.in_addr;
+                    if (fill_shift <= 20)
+                        $display("  FILL SHIFT t=%0t fill base=%0h: the VM wrote fill[%0d] = %02h but the pack byte at base+%0d is %02h (the byte it put there lives at base+%0d; accepted so far %0d, gaps so far %0d, rewinds %0d, c_addr=%0h) - the fill loop's write pointer reset on a cycle without data_available (vm.si:495)",
+                                 $time, acc_base, u_soc.vm.__mem__data.in_addr,
+                                 u_soc.vm.__mem__data.in_wdata, u_soc.vm.__mem__data.in_addr,
+                                 ref_mem[acc_base + u_soc.vm.__mem__data.in_addr],
+                                 find_byte_in_pack(u_soc.vm.__mem__data.in_wdata, acc_base, acc_bytes),
+                                 acc_bytes, acc_gaps, rewinds, u_rom.c_addr);
+                end
+            end
+        end
+    end
+
+    // Neighbourhood search for the diagnostic above: where in the pack does this byte value
+    // occur near the stream position? Only ever a hint (a byte value repeats constantly), but
+    // "the byte for base+120 landed at base+0" is the sentence that makes a shift obvious.
+    function [31:0] find_byte_in_pack;
+        input [7:0] val;
+        input [20:0] base;
+        input integer near;
+        integer k, j;
+        begin
+            find_byte_in_pack = 32'hffff_ffff;
+            for (k = 0; k < 16; k = k + 1) begin
+                j = near + 8 - k;
+                if (find_byte_in_pack == 32'hffff_ffff && j >= 0 &&
+                    (base + j) < PACK_BYTES && ref_mem[base + j] === val)
+                    find_byte_in_pack = j[31:0];
+            end
+        end
+    endfunction
+
+    task close_acceptance;
+        begin
+            if (acc_open) begin
+                if (acc_fw > 0) begin
+                    // This acceptance filled the bytecode buffer: it is the one consumer whose
+                    // landing addresses a missing cycle can move.
+                    n_fill_acc      = n_fill_acc + 1;
+                    fill_gap_cycles = fill_gap_cycles + acc_gaps;
+                    fill_gap_early  = fill_gap_early + acc_gaps_early;
+                    if (acc_gaps_early > 0) begin
+                        n_fill_bad = n_fill_bad + 1;
+                        if (n_fill_bad <= 5)
+                            $display("  FILL GAP t=%0t base=%0h: %0d of the %0d cycles this fill waited for a byte fell BEFORE its last write (it had written %0d of %0d, first gap at write %0d, %0d restarts) - a gap there moves the fill's later writes",
+                                     $time, acc_base, acc_gaps_early, acc_gaps, acc_fw,
+                                     FILL_WRITES, acc_gap_pos, rewinds);
+                        last_bad_base = acc_base; last_bad_len = acc_fw;
+                        last_bad_gaps = acc_gaps_early; last_bad_pos = acc_gap_pos;
+                    end
+                end else begin
+                    // Tolerant by construction: readByte, the palette load, the boot header read
+                    // or a string strip. Their gaps are reported, never failed.
+                    n_tol_acc      = n_tol_acc + 1;
+                    tol_gap_cycles = tol_gap_cycles + acc_gaps;
+                end
+            end
+            acc_open = 1'b0;
+        end
+    endtask
+
+    always @(posedge clk_core) begin
+        // Counted here rather than in the oracle block so that the write count and the gap count
+        // for one cycle are produced by the same statement order: two always blocks on the same
+        // edge have no defined order, and "did the gap come before this write" is exactly the
+        // kind of question that cannot be answered across a race.
+        if (u_soc.vm.__mem__data.in_wenable && acc_open) acc_fw = acc_fw + 1;
+
+        if (u_rom.chk_active) begin
+            // The boot check owns the reader here; its trailer read is not the VM's stream.
+            close_acceptance;
+        end else if (u_rom.accept_vm) begin
+            close_acceptance;
+            acc_open       = 1'b1;
+            acc_bytes      = 0;
+            acc_fw         = 0;
+            acc_gaps       = 0;
+            acc_gaps_early = 0;
+            acc_gap_pos    = 0;
+            acc_base       = mem_addr & 21'h1F_FFFF;  // 2 MB pack window, same mask as byte check
+        end else if (acc_open) begin
+            if (mem_data_available) begin
+                if (mem_in_ready) acc_bytes = acc_bytes + 1;
+            end else if (mem_in_ready && acc_bytes > 0) begin
+                if (acc_gaps == 0) acc_gap_pos = acc_fw;
+                acc_gaps = acc_gaps + 1;
+                if (acc_fw < FILL_WRITES) acc_gaps_early = acc_gaps_early + 1;
+            end
+        end
+    end
+    integer   chk_compared = 0;     // bytes actually compared: if this is 0 while bytes flowed,
+                                    // the oracle compared nothing and '0 errors' means nothing
+                                    // (that is what part1's PASS had been saying)
     always @(posedge clk_core) if (u_rom.rewind) rewinds = rewinds + 1;
+    // Did the game keep swapping frames? A design can hold 60 Hz video, keep streaming ROM
+    // bytes and never paint a new picture again: op_blitFramebuffer (vm.si:852) is the only
+    // thing that flips pages, so counting its pulses tells 'running' apart from 'displaying'.
+    // A 900-frame part1 run passed on the checks above while the last swap happened at frame
+    // 553 and nothing after it ever reached the screen.
+    integer   swaps = 0;
+    integer   last_swap_frame = 0;
+    reg       swap_q = 1'b0;
+    // Edge, not level: `page_swap` is a TOGGLE (vm.si:874 does `page_swap <= ~page_swap`), so
+    // counting cycles it is high counted 15,801,905 "swaps" in an 80-frame run and the
+    // stopped-presenting check below could never have fired. A counter that cannot fail is
+    // decoration.
+    always @(posedge clk_core) begin
+        swap_q <= u_soc._w_vm_page_swap;
+        if (u_soc._w_vm_page_swap !== swap_q) begin
+            swaps           = swaps + 1;
+            last_swap_frame = frames;
+        end
+    end
     integer   black_frames = 0;
     // "Not black" is not "the game is drawing". Frames 10-13 of the intro are a uniform
     // fill: nonblack=64000 with colours=1. Counting those as success is how a design passes
@@ -808,6 +1013,7 @@ reg design_run = 1'b0;
             // compared against the position the design had just rewound to and matched. The VM
             // has no such reset, so this is the check that says whether a recovery was lossless.
             if (served_k >= 0 && (stream_base + served_k) < PACK_BYTES) begin
+                chk_compared = chk_compared + 1;
                 if (mem_data !== ref_mem[stream_base + served_k]) begin
                     errors = errors + 1;
                     if (errors < 400)
@@ -845,7 +1051,9 @@ reg design_run = 1'b0;
             // carries +0x200000. Compared raw, `stream_base + k < PACK_BYTES` was false from
             // the first byte and the check below -- the one that says 'the ROM lied' rather
             // than 'the screen is black' -- had never compared a single byte in any run.
-            stream_base = mem_addr & 22'h1F_FFFF;
+            stream_base = mem_addr & 21'h1F_FFFF;   // 2 MB image window, NOT 22'h1F_FFFF: bit 21 kept the
+                                       // +0x200000 base and made the byte check vacuous for
+                                       // every part1 address (0x20269d..0x20d51e)
             served_k    = 0;
             // What the interpreter is really doing. If the game runs its frame loop, the
             // addresses it asks for sweep the bytecode segment and the per-frame acceptance
@@ -926,6 +1134,7 @@ reg design_run = 1'b0;
         void'($value$plusargs("PACE=%d", pace));
         void'($value$plusargs("FRAMES=%d", max_frames));
         void'($value$plusargs("NOINPUT=%d", noinput));
+        void'($value$plusargs("PACK_KIND=%s", pack_kind));
         void'($value$plusargs("ADDRLOG=%d", addrlog));
         if (!$value$plusargs("FRAMEDIR=%s", framedir)) framedir = "/tmp/awframes";
 
@@ -1140,27 +1349,94 @@ reg design_run = 1'b0;
             end
         end
 
+        // The acceptance in flight when the run ends still has to be tallied, or the last stream
+        // of every run is missing from these counts.
+        close_acceptance;
+
+        // Diagnostics print UNCONDITIONALLY, before the verdict chain. Twice now a check that
+        // only fired inside the chain was outranked by an earlier branch and stayed silent: the
+        // vacuous-oracle guard sat after `errors != 0`, and the unaccepted-pulse count sat after
+        // `rich_frames == 0`, so the one number that explains a black screen never appeared while
+        // the run was being read. A number you have to be unlucky enough to see is not a number.
+        $display("tb_soc: diagnostics - bytes to VM %0d (compared %0d, outside window %0d), restarts %0d (mid-acceptance %0d), frame swaps %0d (last at frame %0d)",
+                 bytes_to_vm, chk_compared, chk_unchk, rewinds, rewind_reissue, swaps,
+                 last_swap_frame);
+        // The consumer-side view of the same traffic. A short held acceptance is the bytecode
+        // fill, and a gap inside one shifts the fill (vm.si:496); a long one is a string strip,
+        // which survives gaps. `pulsed` is readByte, whose bytes always land with in_ready low
+        // and are therefore also what `da_not_accepted` counts.
+        $display("tb_soc: acceptances - bytecode-fill %0d (%0d waited for a byte before finishing, %0d early gap cycles of %0d total), tolerant %0d [%0d gap cycles], pulses landing with in_ready low %0d",
+                 n_fill_acc, n_fill_bad, fill_gap_early, fill_gap_cycles, n_tol_acc,
+                 tol_gap_cycles, da_not_accepted);
+        // THE consumer-side verdict: every byte the VM wrote into its own 64-byte bytecode fill
+        // buffer, checked against where the pack says that byte lives. This is the quantity the
+        // Pocket's freeze depends on, and nothing above it measures it.
+        $display("tb_soc: fill buffer - %0d writes, %0d landed on the wrong byte of the pack, %0d with no acceptance open",
+                 fill_writes, fill_shift, fill_unbased);
+
         // A run that produced only black frames is not a pass, whatever else went right.
         // s1_pass is what decides the process exit status (see the end of this initial block):
         // until now the verdict was print-only, so a failing design still exited 0 and
         // `make sim-soc` reported success. Proven by fault injection, see the commit note.
-        if (frames < 4) begin
+        // This one goes FIRST on purpose. It sat after `errors != 0` for a run, where an
+        // unrelated failure reached it first and a vacuous oracle was still hidden: the
+        // chain's order is the difference between 'this run says nothing' and 'this run
+        // says nothing but something else also went wrong'.
+        if (bytes_to_vm > 1000 && chk_compared == 0) begin
+            // The oracle must never be silently vacuous. Every byte fell outside the window it
+            // compares, so '0 errors' was produced by comparing nothing at all.
+            $display("tb_soc: FAIL - %0d bytes reached the VM and the byte oracle compared 0 of them (%0d outside the window); this run says nothing about ROM correctness",
+                     bytes_to_vm, chk_unchk);
+            s1_pass = 0;
+        end else if (frames < 4) begin
             $display("tb_soc: FAIL - only %0d frames; the video never framed anything", frames);
             s1_pass = 0;
-        end else if (rich_frames == 0) begin
+        end else if (pack_kind == "text" && txt_strips == 0) begin
+            // part0's screen is dark in the reference too, so its content claim is the strip:
+            // op_drawString has to lay its ~64,000-byte strip down. Streaming bytes while the
+            // page stays untouched is not "drawing the copy-protection screen", it is drawing
+            // nothing - which is exactly what this branch is for, since the rich-frame test
+            // below cannot say anything true about a pack that is black by design.
+            $display("tb_soc: FAIL - pack kind is %s and %0d bytes reached the VM, but op_drawString never laid down a single strip in %0d frames",
+                     pack_kind, bytes_to_vm, frames);
+            s1_pass = 0;
+        end else if (pack_kind != "text" && rich_frames == 0) begin
             $display("tb_soc: FAIL - %0d frames, no rich frame (best %0d colours, %0d non-black, %0d bytes to the VM); a uniform fill is not a rendering",
                      frames, max_colours, frames - black_frames, bytes_to_vm);
             s1_pass = 0;
-        end else if (black_frames == frames) begin
+        end else if (pack_kind != "text" && black_frames == frames) begin
             $display("tb_soc: FAIL - %0d frames, every one of them black (%0d bytes reached the VM)",
                      frames, bytes_to_vm);
             s1_pass = 0;
         end else if (errors != 0) begin
             $display("tb_soc: FAIL - %0d errors", errors);
             s1_pass = 0;
+        end else if (fill_shift != 0) begin
+            // The consumer-side check. The delivery oracle above can be green while this is
+            // red, and that difference IS the hardware bug: right bytes, wrong addresses.
+            $display("tb_soc: FAIL - %0d of %0d fill-buffer writes landed where the pack says a DIFFERENT byte lives (last at fill[%0d], %0d restarts). The bytecode fill's write pointer resets on any cycle without data_available (vm.si:495), so a mid-fill gap shifts the rest of the buffer and the interpreter executes ROM data as opcodes - the Pocket's freeze",
+                     fill_shift, fill_writes, last_shift_at, rewinds);
+            s1_pass = 0;
+        end else if (fill_unbased != 0) begin
+            $display("tb_soc: FAIL - %0d fill-buffer writes happened with no acceptance open; the bench's acceptance anchor is wrong and this run cannot attribute them", fill_unbased);
+            s1_pass = 0;
+        end else if (n_fill_bad > n_fill_acc / 2 && 0) begin
+            // DEMOTED, deliberately, and the reason is the whole point of the run that produced
+            // it: a clean part1 run with ZERO restarts and a working intro had exactly one gap in
+            // 558 of 559 fill-class acceptances. So "a gap happened" is not the fault - it is the
+            // normal shape of this bus (the fill loop's own multi-cycle body, or the prefill
+            // boundary). What matters is whether a gap MOVED A WRITE, which the fill-shift oracle
+            // above measures directly. This branch stays here, disabled, so nobody re-arms a
+            // counter that has been measured to fire on a working design.
+        end else if (frames > 200 && swaps > 10 && (frames - last_swap_frame) > 120) begin
+            // Video still counts, bytes still flow, but the page has not flipped for 2 seconds:
+            // the picture on screen is a photograph of the last swap.
+            $display("tb_soc: FAIL - %0d swaps but the last one was frame %0d of %0d; the game stopped presenting %0d frames (%0d bytes still streamed to the VM)",
+                     swaps, last_swap_frame, frames, frames - last_swap_frame, bytes_to_vm);
+            s1_pass = 0;
         end else begin
-            $display("tb_soc: %0d frames, %0d non-black, %0d rich (best %0d colours), %0d bytes to the VM -> PASS",
-                     frames, frames - black_frames, rich_frames, max_colours, bytes_to_vm);
+            $display("tb_soc: %0d frames, %0d non-black, %0d rich (best %0d colours), %0d bytes to the VM, %0d compared, %0d frame swaps (last at %0d), kind=%s, %0d fill writes / %0d shifted -> PASS",
+                     frames, frames - black_frames, rich_frames, max_colours, bytes_to_vm, chk_compared, swaps, last_swap_frame, pack_kind, fill_writes, fill_shift);
             s1_pass = 1;
         end
 
