@@ -205,3 +205,34 @@ switch: latch new part_sel → load table → generation++ → pulse core reset 
 5. Hardware gate; ship as its own identity, keep 1042.
 6. **Then** P2 (switch trigger), as its own plan with its own evidence — informed by what the
    reference simulator says about end-of-part.
+
+## Ordering constraint found while wiring the loader (2026-11-01)
+
+The boot check reads the trailer at **view** `0x1fffe0`, and with paging that address goes *through*
+the table. So on a combined image the sequence is:
+
+1. upload finishes; table is still identity;
+2. boot check reads view `0x1fffe0` = physical page 63 identity = some frame's mid-body bytes;
+3. `off0 == 0` fails → `ERR_TRAILER` → `rom_ready` stays low → black screen, forever.
+
+Therefore **the directory sweep must complete before the trailer check is kicked**, not alongside
+it. `chk_pending` gets set by the sweep's completion rather than by the upload edge directly. The
+retry timer keeps re-arming both, which is what makes a mid-upload sample survivable: the directory
+is the first thing the host writes, so the table can install from a partial upload and the trailer
+check simply keeps failing until the upload actually ends.
+
+Two consequences worth having written down:
+
+* `rom_ready` gains a third prerequisite (`dir_done`) and inherits the census lesson verbatim — gate
+  it `!dir_arm | dir_done | dir_budget_out`, because a design that waits for a sweep nobody armed is
+  indistinguishable from one that waits forever (that exact mistake turned tb_write into
+  `rom_ready=0` with 231 errors once already).
+* A pool image and a plain 2 MiB pack are told apart by the `AWP1` magic in image words 0 and 1 —
+  `0x5741`, `0x3150`. No magic means "plain pack": restore all 64 entries to identity rather than
+  leaving whatever the previous install left, because a stale pool table aimed at a fresh 2 MiB pack
+  reads another part's bytes and looks like a corrupt upload.
+
+Directory offsets the RTL reads (little-endian, image word = byte/2): header 32 bytes
+(`4sHHHHIIIII`), then 8 part records of 144 bytes (`64HIIII`) at byte `32 + N*144`, so part N's 64
+table entries occupy image **words** `16 + N*72` through `16 + N*72 + 63` — contiguous, stride 72,
+all inside physical page 0, which is why the sweep is 66 reads and not a search.
