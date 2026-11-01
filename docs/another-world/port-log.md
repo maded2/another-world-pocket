@@ -2143,3 +2143,42 @@ Still open, and not hidden here:
   evidently not what bounded the short run. Harmless for these verdicts (each is self-consistent),
   but "just run it longer" is how a late freeze gets found, so it needs understanding before it is
   relied on.
+
+### Hardware verdict, 2026-11-01: 1042 plays. Reported from the device, by eye.
+
+`Eddie Chan.AW 1042` — bitstream `579746d33d45b594`, `aw_rom.v` from commit `e812baa` — **works:
+the intro plays and the text is straight.** Both symptoms that the two predecessors each traded
+against the other are gone, so the per-consumer resume policy is the right axis, and this is the
+first build of this port that plays at all.
+
+What that verdict rests on, stated honestly, because two of the three legs are not mine:
+
+* **The measurement is the user's eyes, not my telemetry.** That is the correct instrument here,
+  not a fallback: the `C0:` status line has **no page-swap counter**, and the freeze we chased is
+  precisely "swaps stop while video keeps ticking at 60 Hz and the VM keeps burning bytes". A
+  frozen 1041 and a playing 1042 look identical on UART. So "it is working" could not have come
+  from the port, and anyone who reads `V`/`Y` climbing as proof of gameplay is reading a field
+  that cannot go wrong.
+* **The UART did not, and cannot, confirm which build ran.** `dbg_console.v:65` still hardcodes
+  `MSG_UP = "AW 1041a up\n"` — never bumped, so 1040, 1041 and 1042 all print `AW 1041a up`. The
+  banner that the comment calls "tag = build id" has been lying since 1041 shipped. Identity in
+  this entry is therefore the folder launched plus the hash the installer verified: 1040
+  `888b1c056d70ec4a`, 1041 `5b7ab7d5e7f0d80b`, 1042 `579746d33d45b594`.
+* **What the 94 s of capture does support:** `V` 3660 → 9300 = 60.0 frames/s monotonic with no
+  core reload, `Y` 2.57 MB → 7.23 MB, `err 0`, `R 0000` (no CRE errors), selftest `Da5a5 Ba55a
+  Na5a5`, `Z.` (the 2 MiB survived the round trip), `P0004` = part1, and `inmenu` asserting at
+  16:59:27 when the game was left. 826 bytes/frame is inside sim's own range for part1 (419 early,
+  1267 later), so the device VM and the simulated VM are reading at the same rate. Nothing
+  contradicts a healthy run; nothing proves one either.
+
+**Not re-run today, and it should be:** the two controls. The entries `1040 = text shears, intro
+plays` and `1041 = text straight, intro freezes ~10 s` come from earlier sessions. They are what
+the whole two-consumer theory is built on, and they cost a minute each to re-confirm on this card.
+If either behaves differently now, this build's result is not interpretable, and the hash table —
+not the label — is how that gets settled.
+
+**1043 should therefore not be another behaviour fix.** Three fields, all cheap, all of them
+things this session had to do without: a page-swap counter (the only field separating playing from
+frozen), a restart counter split by resume policy (proof the fix is doing work on hardware, and the
+measurement that would tell us whether `PREFILL_MARGIN = 8` is enough or merely delays the failure),
+and a `BUILD_ID`-derived banner so the UART corroborates identity instead of contradicting it.
