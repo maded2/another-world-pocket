@@ -2122,6 +2122,9 @@ is given is either of those two).
 | `sim_soc` part1, clean, **655 frames** (~11 s of design time, past the frame 553 where the hardware freeze was first seen in sim) | **PASS** — 636 non-black, 632 rich (best 16 colours), 829,810 bytes to the VM, 827,667 compared, 0 wrong, **31 restarts on the natural path** (so restarts do happen in part1 without the knob, just not in the first 115 frames), oracle stood aside for exactly those 31 fills (2,077 bytes), **676,317 fill writes / 0 shifted**, 240 page swaps with the last at frame 647 |
 | same stimulus, 1041's policy | 282 fill writes / **121 shifted**, **0 page swaps ever**, 3.27 MB streamed to a spinning VM |
 | same stimulus, 1040's policy | 102,370 fill writes / 0 shifted, but **105 wrong bytes** where the consumer is positional |
+| **1041's policy, no knob at all, 600 frames** | **FAIL, last page swap at frame 553** — 56 of 163,525 fill writes landed on the wrong byte of the pack, then 2.17 MB streamed into a spinning VM. Frame 553 is where the freeze was first written down in sim, from the hardware report. The natural restarts plus resume-at-`c_addr` reproduce the reported bug at the reported frame with nothing forced: the knob was never the point, it only makes the wait shorter. First shifted write: `fill base=268b: the VM wrote fill[27] = c8 but the pack byte at base+27 is 08 (the byte it put there lives at base+32; accepted so far 32, rewinds 1, c_addr=26ac)` |
+| verdicts shown able to fail, in both directions (`PACK_KIND=` override, no RTL change) | part1 graded as `text` → `FAIL - pack kind is text and 42716 bytes reached the VM, but op_drawString never laid down a single strip in 80 frames`; part0 graded as `rich` → `FAIL - 80 frames, no rich frame (best 1 colours, 0 non-black)`. A per-pack verdict that cannot fail in one direction is only a permission. |
+| on the card (`scripts/sd_install_1042a.sh`) | `Eddie Chan.AW 1040` `888b1c056d70ec4a` · `Eddie Chan.AW 1041` `5b7ab7d5e7f0d80b` · **`Eddie Chan.AW 1042` `579746d33d45b594`**, 8 packs present, `folder == author.shortname` verified, `/System` caches cleared after a backup |
 | `make build CORE_DIR=cores/aw` | 0 errors; `Fitter (171000) was successful`, `Assembler (11888)`, `STA (335001)` all successful |
 | `make check-build CORE_DIR=cores/aw` (scoped) | **worst slack +0.135 ns** (1041a's baseline was +0.129 ns — it got better, not worse), `no dead logic in the core's own modules`, `every SDC constraint in compile.log matched something`, clocks 24.75 / 92.8125 MHz |
 | sim knob out of the netlist | `stall_block` / `stall_tick` appear nowhere in `compile.log` or the map report — `AW_STALL` is simulation-only, and `stall_tick` was moved inside the `ifdef` so it cannot become the dead logic check-build exists to find |
@@ -2129,8 +2132,8 @@ is given is either of those two).
 Still open, and not hidden here:
 
 * **The hardware answers the two real questions** (intro past a minute; captions straight). Sim
-  cannot see the natural-case restarts at all — every clean run above reports `0 early gap cycles`,
-  which is exactly why the forced-gap column exists and why the card still carries 1040 and 1041.
+  showed the natural failure all along — it just needed a run long enough to reach frame 553, and
+  `0 early gap cycles` in a 115-frame run was never evidence of anything.
 * **`PREFILL_MARGIN = 8` is a judgement, not a measurement.** part0's restarts going 405 → 326 is
   the only evidence; without telemetry on the device (task #13) there is no way to tell a margin
   that is enough from one that merely delays the failure.
