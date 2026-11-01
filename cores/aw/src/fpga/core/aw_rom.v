@@ -159,6 +159,16 @@ module aw_rom (
     output reg  [15:0] rom_selftest_cre,
     output reg  [15:0] rom_selftest_pack0,
 
+    // ---- view page table: which physical 32 KiB page each view page reads from ----
+    // Load port for the paged image. Task #18 drives these from the directory loader; until then
+    // core_top ties them to 0 and testbenches drive them, so paging is exercised before the boot
+    // FSM exists. Leaving the write port out would let synthesis make this a ROM that can never
+    // point at another part, which is the entire feature.
+    input  wire        tbl_wr,
+    input  wire [5:0]  tbl_widx,
+    input  wire [7:0]  tbl_wval,
+    output wire        rom_tbl_loaded,   // 0 = identity map, i.e. a single plain pack
+
     // ---- the chip ----
     output wire [5:0]  cram0_a,
     inout  wire [15:0] cram0_dq,
@@ -211,7 +221,12 @@ module aw_rom (
     // two cycles, so anything faster has to wait. There is no flow-control signal
     // from this bridge revision, so the only defence is a wide buffer plus a tripwire
     // that says out loud when bytes were dropped.
-    localparam LWIDTH = 21 + 32;                 // word address, then data
+    // Window is 4 MiB, which is exactly one die: the pool is 128 pages of 32 KiB and word bit 21
+    // is the chip's die select, so an upload can never cross dies. It was 2 MiB because that was
+    // the whole image; with paged images the directory plus pool is 2.94 MiB and anything the
+    // window does not cover is silently dropped at wr_en below - silently, because this bridge
+    // revision has no flow control and no "you wrote past my window" signal.
+    localparam LWIDTH = 22 + 32;                 // byte address, then data
     localparam LDB    = 9;                       // 512 entries = 64 KB in flight
 
     wire              ld_full;
@@ -226,8 +241,8 @@ module aw_rom (
     aw_fifo #(.DW(LWIDTH), .AW(LDB)) u_ldfifo (
         .wr_clk     (clk_bridge),
         .wr_rst     (rst_bridge),
-        .wr_en      (bridge_wr & (bridge_addr[31:21] == 11'h080) & ~ld_abort),
-        .wr_data    ({bridge_addr[20:0], bridge_wr_data}),
+        .wr_en      (bridge_wr & (bridge_addr[31:22] == 12'h040) & ~ld_abort),
+        .wr_data    ({bridge_addr[21:0], bridge_wr_data}),
         .wr_full    (ld_full),
         .wr_free    (),
         .rd_clk     (clk_psram),
@@ -244,7 +259,7 @@ module aw_rom (
 
     // An entry carries a 32-bit word's address, so its payload bytes are at
     // {word address, byte 0..3} and the byte offset inside the word is ld_q[33:32].
-    wire [20:0] ld_baddr = ld_q[LWIDTH-1 -: 21];
+    wire [21:0] ld_baddr = ld_q[LWIDTH-1 -: 22];
     wire [31:0] ld_data  = ld_q[31:0];
     // The APF bridge carries the byte destined for the LOWEST address in the MOST
     // significant byte of the 32-bit write. That is the declaration this core makes -
@@ -369,8 +384,8 @@ module aw_rom (
     // four byte-masked writes.
     //
     // The mapping both paths use: byte address A of the pack lives in word A[20:1],
-    // byte lane A[0]. (Bit 21 of the word address is die select and stays 0 - a 2 MB
-    // pack fits in one of the two dies, and the other die is left alone.) The first
+    // byte lane A[0]. (Bit 21 of the word address is die select and stays 0: the 4 MiB window
+    // fills die 0 exactly, and die 1 belongs to the self-test.) The first
     // version of this block wrote words at the byte address instead of the byte
     // address shifted right by one, which is a different mapping from the reader's:
     // every read would have returned the byte two addresses away, and the only reason
@@ -379,16 +394,16 @@ module aw_rom (
     // Gated by ~st_active: while the self-test owns the controller, a taken write is
     // the test's - counting it would advance the drain past a pack byte.
     wire        d_act    = (d_state == D_RUN) & ~st_active;
-    wire [19:0] ld_w0    = ld_baddr[20:1];                 // word holding byte 0
-    wire [20:0] d_byaddr = ld_baddr + {19'd0, d_step};     // this byte's address
+    wire [20:0] ld_w0    = ld_baddr[21:1];                 // word holding byte 0
+    wire [21:0] d_byaddr = ld_baddr + {20'd0, d_step};     // this byte's address
     wire        d_lane   = d_byaddr[0];
     wire [7:0]  d_byte   = ld_wire[{d_step, 3'd0} +: 8];   // payload byte d_step
     // 1 = write that lane. An aligned whole word is therefore 2'b11, not 2'b00: the
     // first version used 00 here, which with ub_n/lb_n = ~be disabled both lanes and
     // so wrote nothing at all, while every read still looked correct.
     wire [1:0]  d_be     = d_odd ? (d_lane ? 2'b10 : 2'b01) : 2'b11;
-    wire [21:0] d_addr   = d_odd ? {2'b00, d_byaddr[20:1]}
-                                : {2'b00, ld_w0 + {19'd0, d_step[0]}};
+    wire [21:0] d_addr   = d_odd ? {1'b0, d_byaddr[21:1]}
+                                : {1'b0, ld_w0 + {20'd0, d_step[0]}};
     wire [15:0] d_wdata  = d_odd ? (d_lane ? {d_byte, 8'h00} : {8'h00, d_byte})
                                 : (d_step[0] ? ld_wire[31:16] : ld_wire[15:0]);
     wire        d_last   = d_odd ? (d_step == 2'd3) : (d_step == 2'd1);
@@ -930,13 +945,89 @@ module aw_rom (
     end
     wire p_allow = p_allow_q;
 
+    // ============================== view page table =============================
+    // The VM's view is the pack and stays the pack: byte address [20:0], word address [19:0]. The
+    // trailer at 0x1fffe0, the benches' address masks and resume_from_start = ~c_start[20] &
+    // (acc_cnt < 64) all keep working untouched, because the VM never learns there was a pool.
+    // What is mapped is the PSRAM side: view word N lives at psram word {page[N>>14], N[13:0]}.
+    //
+    // A bare CONCATENATION, deliberately. Worst slack is +0.135 ns, and the paths into the cram0
+    // output registers are exactly where build 1039a lost 4 paths at -0.385 ns through arithmetic
+    // the fitter had no reason to place near the I/O cells. An adder here - a header offset, a
+    // frame base that is not page aligned - would repeat that mistake to save 32 KiB of image.
+    // So scripts/build_combined_image.py puts the directory on page 0, numbers frames from page 1,
+    // and refuses any page >= 128: page bit 7 IS die select, and die 1 is the self-test's space.
+    //
+    // With no table installed the map is the IDENTITY, so a plain 2 MiB pack reads exactly as it
+    // did before this code existed. That is what makes the change falsifiable against the benches
+    // that already pass instead of needing new ones to be believed.
+    reg  [21:0] p_addr;                                  // view word address of the next fetch
+    localparam integer PGTBL_AW = 6;                     // 64 view pages of 32 KiB
+    reg  [7:0] pgtbl [0:(1<<PGTBL_AW)-1];                // view page -> physical 32 KiB page
+    // Power-up identity, and that is a safety property rather than tidiness: without it the RAM
+    // starts as X in simulation and random config bits in hardware, and writing ONE entry (which
+    // is all `tbl_loaded` used to signal) silently re-pointed the other 63 pages at page 0. tb_rom
+    // found this - 188 bank-alias mismatches after a single set_page() - and the design is wrong
+    // for it, not the test. Quartus honours this as M10K power-up content, so a partial load
+    // changes exactly the pages it changes and the identity map is what an unloaded core does
+    // rather than a special case bolted onto it.
+    integer pgtbl_i;
+    initial for (pgtbl_i = 0; pgtbl_i < (1 << PGTBL_AW); pgtbl_i = pgtbl_i + 1)
+        pgtbl[pgtbl_i] = pgtbl_i[7:0];
+    reg  [7:0]           tbl_rdat;                       // synchronous (M10K) read result
+    reg  [PGTBL_AW-1:0]  tbl_rdat_idx;                   // ... and which page it belongs to
+    reg                  tbl_loaded;                     // 0 = identity, a single plain pack
+
+    // Writing while the producer reads is not expected (a load happens with the VM in reset and
+    // the stream idle); the M10K would read the OLD value, and page_ready below holds the producer
+    // off the bus for a cycle anyway.
+    wire [PGTBL_AW-1:0] p_view_page = p_addr[19:14];     // page of the word about to be fetched
+
+    always @(posedge clk_psram) begin
+        if (rst_psram) begin
+            // The table itself is NOT cleared here: its power-up identity is what an unloaded core
+            // maps with, and rst_psram cannot re-write 64 RAM cells anyway. tbl_loaded is only a
+            // report of whether anything has been installed - the mapping never depends on it, so
+            // it cannot disagree with the RAM.
+            tbl_loaded   <= 1'b0;
+            tbl_rdat     <= 8'd0;
+            tbl_rdat_idx <= {PGTBL_AW{1'b0}};
+        end else begin
+            tbl_rdat     <= pgtbl[p_view_page];
+            tbl_rdat_idx <= p_view_page;
+            if (tbl_wr) begin
+                pgtbl[tbl_widx] <= tbl_wval;
+                tbl_loaded      <= 1'b1;
+            end
+        end
+    end
+    assign rom_tbl_loaded = tbl_loaded;
+
+    // The read result is only usable for the page it was fetched for: the RAM output is
+    // registered, so on the cycle a page crossing happens it still belongs to the previous page.
+    // Holding the fetch off for that cycle costs exactly ONE cycle per 16,384 words (and one at
+    // the start of each acceptance) against FETCH_HEADROOM 7 and LOOKAHEAD 40. It is applied
+    // always, identity or not, so there is one path rather than a special case that paging
+    // silently bypasses - which is the kind of difference that never shows up until it does.
+    // The one cycle where this could bite is the first cycle after rst_psram: tbl_rdat_idx and
+    // tbl_rdat both hold their reset values, so page_ready can be true with un-read data. That is
+    // only true when p_view_page is 0, whose identity value is also 0, so the fetch is correct
+    // anyway - and a table load happens with the stream idle and takes at least 64 cycles, so the
+    // pipeline is long settled before the VM asks for anything. Stated because "it works out" is
+    // not something a reader should have to re-derive at 2 a.m.
+    wire       page_ready = (tbl_rdat_idx == p_view_page);
+    wire [7:0] page_phys  = tbl_rdat;
+
     // The self-test read preempts while presented (one access every ~444 us); the
     // producer is paused for that window and must not book its traffic as its own.
-    assign rd_req   = st_rd_take | (p_allow & ~st_active);
-    assign rd_addr  = st_rd_take ? st_rd_addr : p_addr;
+    // It also addresses PHYSICAL psram and so bypasses the page map entirely.
+    assign rd_req   = st_rd_take | (p_allow & ~st_active & page_ready);
+    assign rd_addr  = st_rd_take ? st_rd_addr : {page_phys, p_addr[13:0]};
+    // The tag is the VIEW word address, never the physical one: the consumer matches it against
+    // c_addr[20:1], and a paged read that tagged where the byte physically lived would look like
+    // a stream that skipped. Separating tag from address is why paging costs the consumer nothing.
     wire [TW-1:0] rd_tag_w = st_rd_take ? st_rd_addr[TW-1:0] : p_addr[TW-1:0];
 
-    reg  [21:0] p_addr;
     wire        rd_taken   = rd_req & rd_ready;
     wire        prod_taken = rd_taken & ~st_rd_take;
 

@@ -861,6 +861,13 @@ aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .bridge_wr_data       ( bridge_wr_data       ),
     .dataslot_allcomplete ( dataslot_allcomplete ),
 
+    // Page-table load port. Tied off until task #18 installs the directory loader; testbenches
+    // drive it so paging is exercised before the boot FSM exists. See aw_rom's page table.
+    .tbl_wr               ( 1'b0                 ),
+    .tbl_widx             ( 6'd0                 ),
+    .tbl_wval             ( 8'd0                 ),
+    .rom_tbl_loaded       (                      ),
+
     .rom_ready            ( rom_ready            ),
     .rom_error            ( rom_error            ),
     .rom_loading          (                      ),

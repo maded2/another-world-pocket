@@ -103,8 +103,30 @@ module tb_rom;
         .rom_selftest_cre(rom_selftest_cre),
         .rom_selftest_pack0(rom_selftest_pack0),
         .rom_census_sum_r(cen_sum_r), .rom_census_sum_w(cen_sum_w),
-        .rom_census_qmism(cen_qmism), .rom_census_stat(cen_stat)
+        .rom_census_qmism(cen_qmism), .rom_census_stat(cen_stat),
+        .tbl_wr(tbl_wr), .tbl_widx(tbl_widx), .tbl_wval(tbl_wval),
+        .rom_tbl_loaded(tbl_loaded)
     );
+
+    // Page-table load port, driven here because the boot loader that will drive it in hardware
+    // does not exist yet (task #18). See the `paging` block below for why the bench has to be
+    // able to move the map, not just read it.
+    reg        tbl_wr   = 1'b0;
+    reg [5:0]  tbl_widx = 6'd0;
+    reg [7:0]  tbl_wval = 8'd0;
+    wire       tbl_loaded;
+
+    task automatic set_page(input integer view_page, input integer phys_page);
+        begin
+            @(negedge clk_psram);
+            tbl_widx = view_page[5:0];
+            tbl_wval = phys_page[7:0];
+            tbl_wr   = 1'b1;
+            @(negedge clk_psram);
+            tbl_wr   = 1'b0;
+            @(negedge clk_psram);
+        end
+    endtask
 
     // Whole-pack census readouts. The oracle is the model's own array: psram0.mem is what
     // is in the chip, the census reports what the design thinks it committed and what it
@@ -465,6 +487,54 @@ module tb_rom;
         check_stream(24'h000001, 64, "preload@1 (odd)");
         check_stream(24'h002a00, 64, "preload@2a00");
         check_stream(TRAILER, 16, "trailer stream");
+
+        // ---------------------------------------------------------- paging ------
+        // Everything above runs under the identity map, so it proves "no regression" and
+        // nothing else: a page table that is declared, commented at length, optimised away and
+        // never consulted would pass every one of those checks. This core has been bitten by
+        // exactly that - 1042's first attempt declared resume_addr, documented it, exposed it to
+        // the bench, and left the rewind using c_addr; the A/B only caught it because the
+        // candidate reproduced 1041's 121 shifted writes to the byte. So the map gets moved, and
+        // the bytes have to follow it.
+        begin : paging
+            integer pg4, pg3end, pg5, pg7, i, ea;
+            pg4     = 4 * 32768;                 // view page 4, the one gets moved
+            pg3end  = pg4 - 1;                   // last byte of page 3, must NOT move
+            pg5     = 5 * 32768;
+            pg7     = 7 * 32768;
+
+            checks = checks + 1;
+            if (tbl_loaded !== 1'b0) begin
+                errors = errors + 1;
+                $display("  FAIL paging: tbl_loaded=%b before any write; identity is the reset state", tbl_loaded);
+            end
+            check_one_at(pg4 + 8, pg4 + 8, "page 4, identity");
+
+            set_page(4, 7);                      // view page 4 now reads physical page 7
+            checks = checks + 1;
+            if (tbl_loaded !== 1'b1) begin
+                errors = errors + 1;
+                $display("  FAIL paging: table written but tbl_loaded still %b", tbl_loaded);
+            end
+            check_one_at(pg4 + 8, pg7 + 8, "page 4 remapped onto page 7");
+            check_one_at(pg5, pg5, "page 5 undisturbed by the remap");
+            check_one_at(pg3end, pg3end, "page 3 tail undisturbed by the remap");
+
+            // The interesting case: a run that crosses into the remapped page mid-stream. The
+            // bytes must change source partway through, and this is the only coverage of the
+            // producer's one-cycle page-crossing stall. It has to come back byte-exact, not just
+            // finish: because the consumer matches a VIEW word tag, a paging bug shows up here as
+            // a STALL (busy never drops) or a wrong byte, never as a silent pass.
+            for (i = 0; i < 24; i = i + 1) begin
+                if (i < 8) ea = pg3end - 7 + i;  // still page 3
+                else       ea = pg7 + (i - 8);   // page 4's bytes, coming from physical page 7
+                check_one_at(pg4 - 8 + i, ea, "run across the remapped boundary");
+            end
+
+            set_page(4, 4);                      // restore, so later checks mean what they say
+            check_one_at(pg4 + 8, pg4 + 8, "page 4 restored to identity");
+            $display("  paging: page 4 -> 7 -> 4 across 28 reads, 24 of them over the boundary");
+        end
 
         // 3. single-byte reads: even, odd, and at the very last byte of the pack
         for (i = 0; i < 40; i = i + 1)
