@@ -7,7 +7,13 @@
 `default_nettype none
 
 module core_top
-#(parameter [21:0] CENSUS_RANGE = 22'h10_0000)   // whole pack; benches shrink it (see aw_rom)
+// Die 0 in full, and THIS default is the one the bitstream gets. It used to say 2 MiB with the
+// comment "whole pack", which was true until the image became a paged pool - and because this
+// top-level parameter overrides aw_rom's own default, widening the census inside aw_rom changed
+// nothing in hardware at all. A default duplicated at two levels of a hierarchy is two defaults;
+// if you change the inner one, change this one, or the audit will say "census clean" about 2 MiB
+// while the pool runs to 0x2F0000. Benches shrink it, they do not widen it.
+#(parameter [21:0] CENSUS_RANGE = 22'h20_0000)
 (
 
 //
@@ -647,7 +653,8 @@ localparam VID_H_TOTAL   = 825,
 // aw_rom's rom_error codes (its localparams, repeated here rather than exported)
 localparam ERR_TRAILER  = 2'd1,   // the offsets are there but are not a pack
            ERR_OVERFLOW = 2'd2,   // the bridge wrote faster than the chip took it
-           ERR_WAIT    = 2'd3;    // unreachable: WAIT is not functional on the fitted part
+           ERR_DIR     = 2'd3;    // the image's directory was refused (it used to be the
+                                   // unreachable ERR_WAIT; see aw_rom's comment on the reuse)
 
 reg  [9:0]  idle_x, idle_y;
 reg  [24:0] idle_blink;
@@ -730,7 +737,9 @@ always @(posedge clk_core) begin
                     idle_rgb <= 24'h280000;
             end
             ERR_OVERFLOW: idle_rgb <= 24'hc010c0;   // purple: bridge outran the chip
-            ERR_WAIT:     idle_rgb <= 24'hc08010;   // amber:  (unreachable - see above)
+            ERR_DIR:      idle_rgb <= 24'hc08010;   // amber:  the pool's directory was refused, so
+                                                     // the VM was never started - wrong pages would
+                                                     // look like a game, this looks like a fault
             default:
                 if (blinking && in_block) idle_rgb <= 24'hffffff;
         endcase
@@ -840,6 +849,12 @@ M_main u_soc (
     .clock                ( clk_core           )
 );
 
+// Directory / paging state. These were left unconnected the moment they were added, which is how a
+// core can spend a week verifying things nobody is allowed to find out about.
+wire        rom_dir_valid, rom_dir_bad, rom_dir_busy, rom_part_late, rom_pool_ok;
+wire [2:0]  rom_part_sel;
+wire [6:0]  rom_dir_err;
+
 aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .clk_core             ( clk_core             ),
     .rst_core             ( rst_core             ),
@@ -885,6 +900,13 @@ aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .rom_selftest_ceneg   ( rom_selftest_ceneg   ),
     .rom_selftest_cre     ( rom_selftest_cre     ),
     .rom_selftest_pack0   ( rom_selftest_pack0   ),
+    .rom_dir_valid        ( rom_dir_valid        ),
+    .rom_dir_bad          ( rom_dir_bad          ),
+    .rom_dir_busy         ( rom_dir_busy         ),
+    .rom_dir_err          ( rom_dir_err          ),
+    .rom_part             ( rom_part_sel         ),
+    .rom_part_late        ( rom_part_late        ),
+    .rom_pool_ok          ( rom_pool_ok          ),
 
     .cram0_a              ( cram0_a              ),
     .cram0_dq             ( cram0_dq             ),
@@ -1007,6 +1029,12 @@ dbg_console u_cons (
     .cen_qmism     ( rom_census_qmism   ),
     .cen_stat      ( rom_census_stat    ),
     .vid_status    ( vid_status         ),
+    .dir_valid     ( rom_dir_valid      ),
+    .dir_bad       ( rom_dir_bad        ),
+    .pool_ok       ( rom_pool_ok        ),
+    .part_late     ( rom_part_late      ),
+    .rom_part      ( rom_part_sel       ),
+    .dir_err       ( rom_dir_err        ),
     .tx_data    ( cons_data         ),
     .tx_valid   ( cons_valid        ),
     .tx_ready   ( cons_ready        )

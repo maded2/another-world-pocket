@@ -41,6 +41,17 @@ module dbg_console (
     input  wire [3:0]   cen_qmism,           // census block for what each one rules out
     input  wire [2:0]   cen_stat,
     input  wire [7:0]   vid_status,          // {saw_hs,saw_vs,inmenu,design_run,video_sel,suppress,_,rom_ready}
+    // Directory / paging state, so "the VM is running the wrong data" can be told apart from "the
+    // upload is corrupt" - which is the whole point, because both look the same on the panel: black
+    // screen, or animated garbage. All of these are aw_rom outputs already synchronised into clk_core
+    // by its toggle-captured status bundle.
+    input  wire         dir_valid,           // a pool table is installed (0 = identity, plain pack)
+    input  wire         dir_bad,             // the sweep refused a table; see dir_err for why
+    input  wire         pool_ok,             // the chip's pages 1.. match the pool sums the image declares
+    input  wire         part_late,           // a part select arrived after the VM's first byte: refused
+    input  wire [2:0]   rom_part,            // which part the installed table describes
+    input  wire [7:0]   dir_err,             // 0 clean, else bits[7:6] = reason (1 no magic, 2 entry
+                                             // out of range, 3 sweep not served) and bits[5:0] the entry
     output reg  [7:0]  tx_data,
     output wire        tx_valid,
     input  wire        tx_ready
@@ -52,22 +63,63 @@ localparam MID_UP      = 3'd0,   // "AW 1026a up\n"            console out of re
            MID_OK      = 3'd2,   // "pack loaded ok\n"
            MID_ERR1    = 3'd3,   // "ROM ERR: bad trailer\n"
            MID_ERR2    = 3'd4,   // "ROM ERR: psram overflow\n"
-           MID_ERR3    = 3'd5,   // "ROM ERR: wait state (n/a)\n"
+           MID_ERR3    = 3'd5,   // "ROM ERR: bad directory\n"
            MID_MENUIN  = 3'd6,   // "in menu\n"
            MID_MENUOUT = 3'd7,   // "resumed\n"
-           MID_CHK     = 4'd8;   // "C<err>:<32 hex chk_data> <m>/<a> S<s> D<d> B<b> N<n> R<r> P<p>\n"
+           MID_CHK     = 4'd8;   // "C<err>:<32 hex> <match>/<all> S<s> D<d> B<b> N<n> R<r> P<p>
+                                 //  V<v> F<f> L<l> Y<y> X<x> Z<q> <cr>/<cw> G<part><flags> E<err>\n"
+                                 //  - a 156-char line; the G and E fields say what the VM is looking
+                                 //  at and, if a directory was refused, why
 
 // localparam widths must EXACTLY match the string length in bits: Verilog
 // right-justifies a shorter literal and the byte extraction below assumes char 0
 // sits in the MSB.
-// The tag in the boot line is the build id - the first thing a hardware session
-// prints, so any capture identifies which bitstream is actually in the FPGA.
-localparam [8*12-1:0]  MSG_UP      = "AW 1041a up\n";   // diag build: also re-sent every ~2 s (tag_cnt)
+// ---- the boot tag, derived from ONE place -----------------------------------------
+// The tag is the first thing a hardware session prints, so it is how a capture knows
+// which bitstream is in the FPGA. It was a bare string literal and said "AW 1041a up"
+// for 1040, 1041 and 1042 alike: the field this file called "tag = build id" lied for two
+// releases, and on 2026-11-01 that lie made a good install look like a stale one. The bench
+// that checks this line was red for exactly that reason - and was left out of `make sim`,
+// which is how it stayed red and how the lie stayed unfixed.
+//
+// The layout is fixed at 12 bytes - "AW " + 4 digits + 1 suffix + " up\n" - because
+// msg_len and the extractor below assume char 0 sits in the MSB of a 12-byte field. Change
+// BUILD_ID / BUILD_SFX per build; never change the layout, and the length cannot drift.
+parameter [15:0] BUILD_ID  = 16'd1044;
+parameter [7:0]  BUILD_SFX = "a";
+
+function [7:0] dec_digit;                 // one decimal digit of a 4-digit id, as ASCII
+    input [15:0] v;
+    input [15:0] place;
+    begin
+        dec_digit = 8'h30 + ((v / place) % 16'd10);
+    end
+endfunction
+
+localparam [8*12-1:0] MSG_UP = {8'h41, 8'h57, 8'h20,                 // "AW "
+                                dec_digit(BUILD_ID, 16'd1000),
+                                dec_digit(BUILD_ID, 16'd100),
+                                dec_digit(BUILD_ID, 16'd10),
+                                dec_digit(BUILD_ID, 16'd1),
+                                BUILD_SFX,                            // 1042a, 1044b, ...
+                                8'h20, 8'h75, 8'h70, 8'h0a};          // " up\n"
+
+// The extractor is position arithmetic, so a field that is not what it claims fails as garbled
+// text on the wire rather than as an error. Check the shape, not just the value: 'A' first,
+// '\n' last. Both truncation (id too long) and right-justification (a literal shorter than the
+// field) break exactly one of these two.
+initial begin
+    if (MSG_UP[8*12-1 -: 8] !== 8'h41 || MSG_UP[7:0] !== 8'h0a)
+        $display("dbg_console: FAIL banner layout - MSG_UP must be 'AW nnnnX up\\n' in exactly 12 bytes");
+end
 localparam [8*13-1:0]  MSG_RUN     = "game running\n";
 localparam [8*15-1:0]  MSG_OK      = "pack loaded ok\n";
 localparam [8*21-1:0]  MSG_ERR1    = "ROM ERR: bad trailer\n";
 localparam [8*23-1:0]  MSG_ERR2    = "ROM ERR: psram overflow\n";
-localparam [8*25-1:0]  MSG_ERR3    = "ROM ERR: wait state (n/a)\n";
+// Code 3 was "wait state (n/a)" while ERR_WAIT was an unreachable code. It is reachable now and
+// means something you can act on - the image's directory was refused, so the VM was never started -
+// and a line that prints "(n/a)" about a fault that is actually happening is worse than no line.
+localparam [8*23-1:0]  MSG_ERR3    = "ROM ERR: bad directory\n";
 localparam [8*8-1:0]   MSG_MENUIN  = "in menu\n";
 localparam [8*8-1:0]   MSG_MENUOUT = "resumed\n";
 
@@ -216,10 +268,10 @@ always @(*) begin
         MID_OK:      msg_len = 6'd15;
         MID_ERR1:    msg_len = 6'd21;
         MID_ERR2:    msg_len = 6'd23;
-        MID_ERR3:    msg_len = 6'd25;
+        MID_ERR3:    msg_len = 6'd23;
         MID_MENUIN:  msg_len = 6'd8;
         MID_MENUOUT: msg_len = 6'd8;
-        MID_CHK:     msg_len = 8'd148;
+        MID_CHK:     msg_len = 8'd156;
         default:     msg_len = 6'd8;
     endcase
 end
@@ -313,6 +365,25 @@ always @(*) begin
             else if (pos <= 8'd137) tx_data = hxn(cen_sum_r[(8'd137 - pos)*4 +: 4]);
             else if (pos == 8'd138) tx_data = 8'h2f;                   // '/'
             else if (pos <= 8'd146) tx_data = hxn(cen_sum_w[(8'd146 - pos)*4 +: 4]);
+            // G: what the VM is actually looking at. One digit for the part the installed table
+            // describes, one for its state: bit0 a table is installed (0 = identity, a plain pack),
+            // bit1 the sweep refused a table, bit2 the pool matches what the image declares, bit3 a
+            // part select was refused because the game had already started. So `G00` is "plain pack,
+            // nothing installed", `G07` is "part 0 of a pool, sums good", `G13` is "part 1 installed,
+            // sums disagree". Printed because the alternative is a black screen and an argument.
+            else if (pos == 8'd147) tx_data = 8'h20;                   // ' '
+            else if (pos == 8'd148) tx_data = 8'h47;                   // 'G'
+            else if (pos == 8'd149) tx_data = hxn({4'd0, rom_part});
+            else if (pos == 8'd150) tx_data = hxn({part_late, pool_ok, dir_bad, dir_valid});
+            // E: why a directory was refused. aw_rom's encoding: bits[7:6] reason - 1 no magic (not an
+            // error, that is a plain 2 MiB pack), 2 an entry out of range with the entry index in
+            // bits[5:0], 3 the sweep was never served - so E40 plain pack, E82 "entry 2 out of range",
+            // EC0 timeout, E00 after a clean install. The reason lives in its own bits rather than
+            // being ORed with the index: the old 7-bit code made 0x03 mean two different things.
+            else if (pos == 8'd151) tx_data = 8'h20;                   // ' '
+            else if (pos == 8'd152) tx_data = 8'h45;                   // 'E'
+            else if (pos == 8'd153) tx_data = hxn(dir_err[7:4]);
+            else if (pos == 8'd154) tx_data = hxn(dir_err[3:0]);
             else                    tx_data = 8'h0a;                   // '\n'
         end
         MID_UP:      tx_data = MSG_UP      [(11 - pos)*8 +: 8];
@@ -320,7 +391,7 @@ always @(*) begin
         MID_OK:      tx_data = MSG_OK      [(14 - pos)*8 +: 8];
         MID_ERR1:    tx_data = MSG_ERR1    [(20 - pos)*8 +: 8];
         MID_ERR2:    tx_data = MSG_ERR2    [(22 - pos)*8 +: 8];
-        MID_ERR3:    tx_data = MSG_ERR3    [(24 - pos)*8 +: 8];
+        MID_ERR3:    tx_data = MSG_ERR3    [(22 - pos)*8 +: 8];
         MID_MENUIN:  tx_data = MSG_MENUIN  [(7  - pos)*8 +: 8];
         default:     tx_data = MSG_MENUOUT [(7  - pos)*8 +: 8];
     endcase

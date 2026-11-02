@@ -97,7 +97,10 @@ module tb_dbg_console;
 
     // THROTTLE_CYCLES=0: this bench checks back-to-back error lines; the device
     // default (250 ms) is exercised on hardware only, see dbg_console.v.
-    dbg_console #(.THROTTLE_CYCLES(25'd0)) dut_b (
+    // An id of its own on purpose. If both instances printed the same string, the bench could not
+    // tell "derived from BUILD_ID" from "hardcoded literal again" - which is the exact regression
+    // this parameter exists to prevent, and it was invisible for two releases.
+    dbg_console #(.THROTTLE_CYCLES(25'd0), .BUILD_ID(16'd1042), .BUILD_SFX("z")) dut_b (
         .clk(clk), .rst_n(b_rst_n),
         .ev_boot(ev_boot), .ev_rom_ok(ev_rom_ok), .rom_error(rom_error),
         .ev_inmenu(ev_inmenu), .ev_outmenu(ev_outmenu),
@@ -108,6 +111,8 @@ module tb_dbg_console;
         .vid_frames(24'h0), .vid_de_per_frame(20'h0), .vid_lit_per_frame(20'h0),
         .rom_rd_bytes(32'h0), .vid_status(8'h0),
         .cen_sum_r(32'h0), .cen_sum_w(32'h0), .cen_qmism(4'h0), .cen_stat(3'b000),
+        .dir_valid(1'b0), .dir_bad(1'b0), .pool_ok(1'b0), .part_late(1'b0),
+        .rom_part(3'd0), .dir_err(8'd0),
         .tx_data(b_data), .tx_valid(b_valid), .tx_ready(b_ready)
     );
 
@@ -147,6 +152,9 @@ module tb_dbg_console;
         // census: finished, contiguous, written sum equals read sum -> 'Z.0'
         .cen_sum_r(32'h1A2B3C4D), .cen_sum_w(32'h1A2B3C4D),
         .cen_qmism(4'h0), .cen_stat(3'b010),
+        // paging: a table is installed for part 2 and the pool sums match -> flags 0101
+        .dir_valid(1'b1), .dir_bad(1'b0), .pool_ok(1'b1), .part_late(1'b0),
+        .rom_part(3'd2), .dir_err(8'd0),
         .tx_data(c_data), .tx_valid(c_valid), .tx_ready(c_ready)
     );
 
@@ -226,6 +234,20 @@ module tb_dbg_console;
             for (k = 0; k < nbyte && line_ok; k = k + 1)
                 if (got_line[k*8 +: 8] !== want[(want_len-1-k)*8 +: 8])
                     line_ok = 1'b0;
+            // The LENGTH is part of the assertion. Comparing only the characters that arrived means a
+            // message that got shorter - a localparam and its msg_len edited out of step, which is
+            // precisely the failure class this bench exists to catch - matches its own prefix and
+            // passes. Phase C checks this via want_len; phase B did not, and did not print what it
+            // received either, so a failure here said only "line matches" with nothing to look at.
+            if (nbyte != want_len - 1) line_ok = 1'b0;
+            if (!line_ok) begin
+                $write("GOT [ ");
+                for (k = 0; k < nbyte; k = k + 1) $write("%c", got_line[k*8 +: 8]);
+                $write(" ] (%0d chars) WANT [ ", nbyte);
+                for (k = 0; k < want_len-1; k = k + 1) $write("%c", want[(want_len-1-k)*8 +: 8]);
+                $write(" ] (%0d chars)\n", want_len-1);
+                $fflush;
+            end
             expect("line matches", line_ok);
         end
     endtask
@@ -289,7 +311,7 @@ module tb_dbg_console;
 
         // out of reset: boot tag (build id; the device build re-sends it every ~2 s).
         // want_len is chars + 1 (the \n), like every other call in this bench.
-        recv_line("AW 1040a up\n", 12);
+        recv_line("AW 1042z up\n", 12);
 
         // pack loaded, then game running.
         // Events are level-latched by the console every cycle they are high, so
@@ -308,7 +330,7 @@ module tb_dbg_console;
         rom_error = 2'd2; repeat (3) @(posedge clk);
         recv_line("ROM ERR: psram overflow\n", 23);
         rom_error = 2'd3; repeat (3) @(posedge clk);
-        recv_line("ROM ERR: wait state (n/a)\n", 25);
+        recv_line("ROM ERR: bad directory\n", 23);
         rom_error = 2'd0;
 
         // menu navigation both ways
@@ -329,9 +351,9 @@ module tb_dbg_console;
         c_rst_n = 1'b0;
         repeat (5) @(posedge clk);
         c_rst_n = 1'b1;
-        recv_line_c("AW 1040a up\n", 12);
+        recv_line_c("AW 1044a up\n", 12);     // dut_c takes the defaults: BUILD_ID 1044, suffix 'a'
         // C<err>:<32 hex chk> W<match>/<all> S<status> - the loader counters
-        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75 Z.0 1a2b3c4d/1a2b3c4d\n", 148);
+        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75 Z.0 1a2b3c4d/1a2b3c4d G25 E00\n", 156);
 
         if (errors == 0) $display("tb_dbg_console: -> PASS");
         else             $display("tb_dbg_console: -> FAIL (%0d errors)", errors);

@@ -66,7 +66,7 @@ module tb_dir;
     wire        tbl_loaded;
     wire        dir_valid, dir_bad, dir_busy, part_late, pool_ok_w;
     wire [2:0]  dir_part;
-    wire [6:0]  dir_err;
+    wire [7:0]  dir_err;
 
     aw_rom #(.CENSUS_RANGE(22'h8000)) dut (
         .clk_core(clk_core), .rst_core(rst_core),
@@ -127,6 +127,10 @@ module tb_dir;
     // parameter, so the numbers mean the same thing - the mechanism is identical, and 1.5 million
     // back-to-back reads would be measuring the test harness's patience.
     int       poolrun   = 0;
+    // +BADENT: an entry out of range must refuse the WHOLE table, name the entry, and leave identity.
+    // This path existed and had never been driven by a test - every directory the bench wrote was
+    // valid, so the refusal that protects against a corrupt or stale table was pure assertion.
+    int       badent    = 0;
 
     initial begin
         void'($value$plusargs("PACE=%d", pace));
@@ -134,6 +138,7 @@ module tb_dir;
         nomagic = $test$plusargs("NOMAGIC");
         highmap = $test$plusargs("HIGH");
         poolrun = $test$plusargs("POOLSUM");
+        badent  = $test$plusargs("BADENT");
         if (!$value$plusargs("PACK=%s", pack_hex))
             $fatal(1, "tb_dir: +PACK=<pack.hex> is required");
         $readmemh(pack_hex, ref_mem);
@@ -290,6 +295,36 @@ module tb_dir;
     // signal that means "sweep done, census done, trailer checked under the installed table", so
     // the wait is: watch it fall (a sweep is in flight, rom_ready drops while the map changes) and
     // then rise again.
+    // Re-arm when the correct outcome is that the core stays down: wait for rom_ready to fall, then
+    // give it 20000 core cycles (~0.8 ms, far longer than a sweep and a trailer check) to rise, and
+    // require that it did not. rearm()'s "wait for the rise" would sit on its timeout here and then
+    // report on whatever state it happened to land in.
+    task automatic rearm_down(input string why);
+        int g = 0;
+        begin
+            repeat (6) @(negedge clk_bridge);
+            dataslot_allcomplete <= 1'b1;
+            repeat (8) @(negedge clk_bridge);
+            dataslot_allcomplete <= 1'b0;
+            @(negedge clk_core);
+            while (rom_ready && g < 200000) begin @(negedge clk_core); g++; end
+            repeat (20000) @(negedge clk_core);
+            checks = checks + 1;
+            if (rom_ready !== 1'b0) begin
+                errors = errors + 1;
+                $display("  FAIL: rom_ready ROSE with a refused directory - the VM would run on the wrong pages");
+            end
+            checks = checks + 1;
+            if (rom_error !== 2'd3) begin
+                errors = errors + 1;
+                $display("  FAIL: rom_error=%0d with a refused directory, wanted 3 (bad directory)", rom_error);
+            end
+            repeat (80) @(negedge clk_psram);
+            $display("  re-arm down (%s): dir_valid=%b bad=%b err=%02h rom_ready=%b rom_error=%0d after %0d",
+                     why, dir_valid, dir_bad, dir_err, rom_ready, rom_error, g);
+        end
+    endtask
+
     task automatic rearm(input string why);
         int g = 0;
         begin
@@ -394,9 +429,9 @@ module tb_dir;
         // before the first read, and the reads come as one block at the end.
         expect_status(0, 0, 0, "boot from a plain pack: identity map, and not an error");
         checks++;
-        if (dir_err !== 7'h01) begin
+        if (dir_err !== 8'h40) begin
             errors++;
-            $display("  FAIL: a pack with no directory reported err=%02h, wanted bit0 only", dir_err);
+            $display("  FAIL: a pack with no directory reported err=%02h, wanted reason 1 (no magic)", dir_err);
         end
 
         if (nomagic) begin
@@ -410,9 +445,9 @@ module tb_dir;
             rearm("magic removed while a table is installed");
             expect_status(0, 0, 0, "plain pack over an installed pool: identity restored");
             checks++;
-            if (dir_err !== 7'h01) begin
+            if (dir_err !== 8'h40) begin
                 errors++;
-                $display("  FAIL: reported err=%02h after removing the magic, wanted bit0 only",
+                $display("  FAIL: reported err=%02h after removing the magic, wanted reason 1",
                          dir_err);
             end
         end else if (highmap) begin
@@ -420,6 +455,35 @@ module tb_dir;
             write_dir_high;                // view 40..62 -> physical 64..85, and 62 -> 127
             rearm("high pages mapped");
             expect_status(1, 0, 0, "map onto pages above the old limit installed");
+        end else if (badent) begin
+            // Entry 2 of part 0 set to 0. Page 0 is the directory, so 0 is not a page any view may
+            // point at; the sweep must stop, walk the table back, name the entry, and - because
+            // identity over a pool means the VM executes the directory as frame 0 and the panel shows
+            // animated garbage, the same symptom as the restart bug this port spent two days on -
+            // the core must NOT start the VM.
+            write_dir;
+            put_words(16 + 2, 16'd0, 16'd3);
+            rearm_down("directory with entry 2 out of range");
+            expect_status(0, 1, 0, "out-of-range entry: nothing installed, reported as bad");
+            checks++;
+            // reason 2 in bits[7:6], the entry index below: 0x80 | 2. Parenthesised, because `!==`
+            // binds tighter than `|` - the unparenthesised version of this line compared dir_err to
+            // 0x80 and then ORed 2 into the BOOLEAN result, so it failed on a correct core.
+            if (dir_err !== (8'h80 | 8'd2)) begin
+                errors++;
+                $display("  FAIL err=%02h after a bad entry 2 - wanted reason 2 with entry index 2", dir_err);
+            end
+            // Recovery: a good directory installed after the bad one must boot. Fault reporting that
+            // cannot be cleared is a brick with a nicer message, and "install a good image and
+            // relaunch" is the only remedy a user has.
+            write_dir;
+            rearm("valid directory installed after a refused one");
+            expect_status(1, 0, 0, "recovered: the good table is installed and the core booted");
+            checks++;
+            if (rom_error !== 2'd0) begin
+                errors++;
+                $display("  FAIL rom_error=%0d after recovery - a cleared fault must stop reporting", rom_error);
+            end
         end else if (poolrun) begin
             bit [31:0] psum, pxor;
             int w;
@@ -493,7 +557,10 @@ module tb_dir;
         // optimised away and never consulted fails here instead of passing, which is the whole reason
         // this bench exists: 1042 proved "declared" is not "wired".
         phys3 = (want_part == 1) ? 6 : 5;
-        if (nomagic || highmap) phys3 = 3;           // identity: page 3 is its own (the +HIGH map
+        // +BADENT is NOT in this list on purpose. It ends with a good directory installed after the
+        // refused one, so by the time the reads run the map is the pool's and page 3 reads from
+        // physical page 5 like run 1 - the recovery is real, not just a status bit.
+        if (nomagic || highmap) phys3 = 3;             // identity: page 3 is its own (the +HIGH map
                                                        // moves pages 40..62, not page 3)
         check_at(3*PG + 8,      phys3*PG + 8,      "view page 3 reads the page the table names");
         check_at(3*PG + PG - 1, phys3*PG + PG - 1, "and to the last byte of that page");
@@ -530,6 +597,8 @@ module tb_dir;
                 $display("  FAIL: a part write after the first accepted byte was not reported late");
             end
             repeat (200) @(negedge clk_core);
+            // +BADENT ends with a REFUSED install, so the map under test here is identity and the
+            // table is flagged bad; the point of the check (a late write changes nothing) still holds.
             expect_status(nomagic ? 0 : 1, 0, want_part,
                           "a late write changes neither the part nor the map");
             check_at(3*PG + 8, phys3*PG + 8, "still the same part's page 3 after a refused switch");

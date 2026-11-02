@@ -180,7 +180,8 @@ module aw_rom (
     output wire        rom_dir_valid,    // an AWP1 directory was read and its table installed
     output wire        rom_dir_bad,      // the magic was there and the table was not usable
     output wire [2:0]  rom_part,         // the part the installed table describes
-    output wire [6:0]  rom_dir_err,      // 0 clean; bit0 no magic; bit1+entry an entry out of range;
+    output wire [7:0]  rom_dir_err,      // 0 clean; bits[7:6] reason (1 no magic, 2 entry out of
+                                         // range, 3 sweep not served), bits[5:0] the entry index;
                                          // bit6 the sweep was not served in time
     output wire        rom_dir_busy,     // a sweep owns the chip right now
     output wire        rom_pool_ok,      // the chip's pages 1.. equal the pool sum the image claims
@@ -204,7 +205,11 @@ module aw_rom (
     localparam [1:0] ERR_NONE     = 2'd0;
     localparam [1:0] ERR_TRAILER  = 2'd1;
     localparam [1:0] ERR_OVERFLOW = 2'd2;
-    localparam [1:0] ERR_WAIT     = 2'd3;   // no longer reachable: WAIT is not a
+    localparam [1:0] ERR_DIR      = 2'd3;   // the image's own directory was refused: see below.
+                                            // Code 3 used to be ERR_WAIT, which became unreachable
+                                            // when WAIT turned out not to be a handshake on the
+                                            // fitted part, and an unreachable code that prints
+                                            // "wait state (n/a)" is a free slot, not a tombstone.
                                            // functional pin on the fitted part -
                                            // see aw_psram's header
 
@@ -539,8 +544,16 @@ module aw_rom (
     reg  [CEN_AW-1:0] census_addr, census_last;
     reg  [31:0] cr_sum, cr_xor;
     reg  [31:0] cr_pool_sum;          // census sum of pages 1.. only, for the comparison below
-    reg  [31:0] cr_pool_xor;          // and its xor, over the same range - see why both, below
-    reg  [15:0] hdr_lo, hdr_hi, hxr_lo, hxr_hi;   // the pool sums the IMAGE declares (words 12..15)
+    // 16 bits, and that is the real width of the check, not a shortcut. Both sides XOR the same
+    // 16-bit words: build_combined_image.word_xor() does `x ^= w` over uint16s into a 32-bit int, so
+    // the wxor field in the header has 16 bits of zeros above it, and aw_rom XORing a 16-bit rd_q into
+    // a 32-bit register produced zeros in exactly the same places. Declaring 32 here bought nothing
+    // and cost a `check-build` finding (bits 31:16 stuck at GND - the fitter telling you the upper
+    // half of an XOR can never move, because XOR has no carry to push it up). If this is ever widened,
+    // widen the builder's definition to 32-bit little-endian PAIRS at the same time, or the two sides
+    // disagree and every pool reports bad.
+    reg  [15:0] cr_pool_xor;
+    reg  [15:0] hdr_lo, hdr_hi, hxr_lo;           // the pool sums the IMAGE declares (words 12..14)
     // The comparison is COMBINATIONAL, and that is load-bearing. It was a register assigned at the end
     // of the census, and the census runs exactly once per power-up (census_done clears only in reset),
     // so pool_ok froze at whatever the directory happened to say at that instant - the tb_dir +POOLSUM
@@ -560,7 +573,7 @@ module aw_rom (
     // would have been dead logic AND a weaker check, which is the worst of both.
     wire pool_ok = census_done & dir_installed
                  & (cr_pool_sum == {hdr_hi, hdr_lo})
-                 & (cr_pool_xor == {hxr_hi, hxr_lo});
+                 & (cr_pool_xor == hxr_lo);
     reg  [31:0] cr_q [0:3];
     reg         census_active, census_done, census_to;
     reg  [17:0] census_stall;
@@ -594,9 +607,13 @@ module aw_rom (
     reg  [2:0] part_val;
     reg        part_held;
     reg  [7:0] p_wcnt;
-    reg  [6:0]  dir_err_code;
+    // Reason in the top two bits, the entry index below them - SEPARATE fields, not overlapping flags.
+    // It used to be 7 bits of ORed flags sharing the low bits with the index, which made 0x03 mean
+    // both "no magic" and "entry 1 out of range", and made every bad-entry report set the timeout bit
+    // too. A code a human reads off a serial line needs one meaning per value.
+    reg  [7:0]  dir_err_code;
     reg         dir_bad;                 // a directory was expected and was not usable
-    reg  [12:0] dir_stat;                // {installed, bad, pool_ok, part[2:0], err[6:0]} for the console
+    reg  [13:0] dir_stat;                // {installed, bad, pool_ok, part[2:0], err[7:0]} for the console
     reg         dir_stat_tog;
     reg         vfy_arm;              // clk_core: the pack is in (driven further down)
     wire        census_done_core;     // census_done synchronised into clk_core (see below).
@@ -719,7 +736,7 @@ module aw_rom (
     // out-of-range entry is not "slightly wrong", it is the corrupted-table case the whole page-0
     // layout exists to make harmless: refuse the whole install and go back to identity.
     wire dir_val_ok   = (rd_q[7:0] >= 8'd1) && (rd_q[7:0] <= 8'd127);
-    assign dir_install = dir_captured && (dir_ph >= 7'd6) && dir_val_ok;
+    assign dir_install = dir_captured && (dir_ph >= 7'd5) && dir_val_ok;
     assign rom_dir_busy = dir_active | clr_active;
 
     always @(posedge clk_psram) begin
@@ -758,13 +775,12 @@ module aw_rom (
             dir_ph             <= 7'd0;
             dir_part           <= 3'd0;
             dir_stall          <= 18'd0;
-            dir_err_code       <= 7'd0;
+            dir_err_code       <= 8'd0;
             hdr_lo             <= 16'd0;
             hdr_hi             <= 16'd0;
             hxr_lo             <= 16'd0;
-            hxr_hi             <= 16'd0;
             cr_pool_sum        <= 32'd0;
-            cr_pool_xor        <= 32'd0;
+            cr_pool_xor        <= 16'd0;
             part_latched       <= 3'd0;
             arm_ack            <= 1'b0;   // driven here; arm_req_s belongs to its own process
             dir_installed      <= 1'b0;
@@ -919,7 +935,7 @@ module aw_rom (
                         dir_active    <= 1'b0;
                         dir_done      <= 1'b1;
                         clr_req       <= 1'b1;
-                        dir_err_code  <= 7'd1;             // bit0: no magic
+                        dir_err_code  <= 8'h40;            // reason 1: no magic (a plain pack)
                         dir_installed <= 1'b0;
                         dir_bad       <= 1'b0;             // a plain pack is not an error
                         st_s          <= ST_IDLE;
@@ -927,13 +943,12 @@ module aw_rom (
                         dir_ph <= dir_ph + 7'd1;
                         st_s   <= ST_RD;
                     end
-                end else if (dir_ph < 7'd6) begin
-                    // header words 12..15: sum.lo, sum.hi, xor.lo, xor.hi
+                end else if (dir_ph < 7'd5) begin
+                    // header words 12,13,14: sum.lo, sum.hi, xor.lo
                     case (dir_ph)
                     7'd2:    hdr_lo <= rd_q;
                     7'd3:    hdr_hi <= rd_q;
-                    7'd4:    hxr_lo <= rd_q;
-                    default: hxr_hi <= rd_q;
+                    default: hxr_lo <= rd_q;
                     endcase
                     dir_ph <= dir_ph + 7'd1;
                     st_s   <= ST_RD;
@@ -941,16 +956,19 @@ module aw_rom (
                     dir_active    <= 1'b0;
                     dir_done      <= 1'b1;
                     clr_req       <= 1'b1;
-                    // bit1 = an entry was out of range; bits[5:0] = which one, so the console names
-                    // it instead of reporting "bad"
-                    dir_err_code  <= 7'h02 | {1'b1, dir_ph[5:0]};
+                    // reason 2 (an entry out of range) with WHICH entry below it, so the console names
+                    // the entry instead of reporting "bad". The low bits used to carry the sweep PHASE
+                    // (entry index + 6), so the printed number was wrong by six; and the reason used to
+                    // be ORed into the same field as the index, so values collided with the no-magic
+                    // and timeout codes.
+                    dir_err_code  <= 8'h80 | {2'b00, dir_ph[5:0] - 6'd5};
                     dir_bad       <= 1'b1;
                     dir_installed <= 1'b0;
                     st_s          <= ST_IDLE;
-                end else if (dir_ph == 7'd69) begin
+                end else if (dir_ph == 7'd68) begin
                     dir_active    <= 1'b0;
                     dir_done      <= 1'b1;
-                    dir_err_code  <= 7'd0;
+                    dir_err_code  <= 8'd0;
                     dir_bad       <= 1'b0;
                     dir_installed <= 1'b1;
                     part_latched  <= dir_part;             // what the table now describes
@@ -966,7 +984,7 @@ module aw_rom (
                     dir_active    <= 1'b0;
                     dir_done      <= 1'b1;
                     dir_to        <= 1'b1;
-                    dir_err_code  <= 7'h41;               // bit6: not served in time
+                    dir_err_code  <= 8'hC0;               // reason 3: the sweep was never served
                     dir_bad       <= 1'b1;
                     dir_installed <= 1'b0;
                     st_s          <= ST_IDLE;
@@ -1333,9 +1351,14 @@ module aw_rom (
     // word-sum and xor (HDR "<4sHHHHIIIII": byte 24 -> word 12, little-endian pairs). Read in the same
     // sweep because the sweep is already sitting on page 0, four reads is nothing, and a pool sum the
     // core has never looked at is a number in a file rather than a check.
+    // Five header reads then the table: words 0,1 the magic; 12,13 the pool's declared word-sum; 14 the
+    // declared word-xor (HDR "<4sHHHHIIIII", byte 24 -> word 12, little-endian pairs). Word 15 - the
+    // xor's high half - is deliberately NOT read: see cr_pool_xor, where both sides of that comparison
+    // are provably 16 bits wide, so reading a fifth word to compare two zeros is dead logic that an
+    // audit has to flag and a reader has to re-derive.
     wire [9:0] dir_word = (dir_ph <= 7'd1) ? {3'b0, dir_ph[6:0]}
-                              : (dir_ph <= 7'd5) ? (10'd10 + {3'b0, dir_ph[6:0]})
-                              : (dir_base + {3'b0, dir_ph[6:0]} - 10'd6);
+                              : (dir_ph <= 7'd4) ? (10'd10 + {3'b0, dir_ph[6:0]})
+                              : (dir_base + {3'b0, dir_ph[6:0]} - 10'd5);
 
     reg  [7:0]           tbl_rdat;                       // synchronous (M10K) read result
     reg  [PGTBL_AW-1:0]  tbl_rdat_idx;                   // ... and which page it belongs to
@@ -1371,7 +1394,7 @@ module aw_rom (
                 clr_active <= 1'b1;
                 clr_i      <= 6'd0;
             end else if (dir_install) begin
-                pgtbl[dir_ph[5:0] - 6'd6] <= rd_q[7:0];
+                pgtbl[dir_ph[5:0] - 6'd5] <= rd_q[7:0];
                 tbl_loaded <= 1'b1;
             end
         end
@@ -2084,13 +2107,13 @@ module aw_rom (
 
     reg  [1:0]  streamed_c;      // streamed_q in clk_core: the directory is frozen after this
     reg  [1:0]  dd_s;
-    reg  [12:0] dir_stat_c;
+    reg  [13:0] dir_stat_c;
     reg         dir_stat_tog_c;
     reg  [2:0]  late_s;
     always @(posedge clk_core) begin
         if (rst_core) begin
             dd_s            <= 2'b00;
-            dir_stat_c      <= 13'd0;
+            dir_stat_c      <= 14'd0;
             dir_stat_tog_c  <= 1'b0;
             late_s          <= 3'd0;
             streamed_c      <= 2'b00;
@@ -2109,11 +2132,11 @@ module aw_rom (
     wire dir_done_core = dd_s[1];
     wire dir_done_rise = dd_s[1] & ~dd_s[0];
 
-    assign rom_dir_valid = dir_stat_c[12];
-    assign rom_dir_bad   = dir_stat_c[11];
-    assign rom_pool_ok   = dir_stat_c[10];
-    assign rom_part      = dir_stat_c[9:7];
-    assign rom_dir_err   = dir_stat_c[6:0];
+    assign rom_dir_valid = dir_stat_c[13];
+    assign rom_dir_bad   = dir_stat_c[12];
+    assign rom_pool_ok   = dir_stat_c[11];
+    assign rom_part      = dir_stat_c[10:8];
+    assign rom_dir_err   = dir_stat_c[7:0];
     assign rom_part_late = late_s[2];
 
     assign rom_chk_data = chk_data;
@@ -2142,6 +2165,28 @@ module aw_rom (
             // a fact about this design. (The old ERR_WAIT path is gone - WAIT idles
             // high on the fitted part and was never a handshake; see aw_psram.)
             if (seen_overflow) rom_error <= ERR_OVERFLOW;
+            // A directory its own image contradicts is FATAL, and it holds rom_ready down.
+            //
+            // It used to refuse the table, quietly fall back to identity, and let the VM run. For a
+            // plain pack that is exactly right - no magic is not an error, dir_bad stays low, nothing
+            // changes. But dir_bad is only ever set when the magic WAS there and the table behind it
+            // was not usable (an entry outside die 0, or a sweep the chip never served). Identity in
+            // that case means the VM executes the directory page as frame 0 and reads every other page
+            // of a pool as if it were its own: the screen shows animated garbage, which is the SAME
+            // symptom as the restart bug this port spent two days on. A failure mode with the same
+            // symptom as an already-fixed bug has to be reported distinctly or it will be re-diagnosed
+            // from scratch - so the core says "bad directory" on the wire, paints amber on the idle
+            // screen, and does not start the VM at all.
+            //
+            // It is also recoverable in the only way that matters: install a good image and relaunch.
+            // dir_bad drops when the next sweep finds a valid table, or when a plain pack arrives
+            // (that path clears it), and rom_ready rises normally afterwards.
+            // Cleared when a later sweep is happy, so installing a good image and relaunching
+            // actually clears the report - the same reasoning that stops ERR_TRAILER outliving a
+            // passing check. Without this the console would print "C3:" for the rest of the session
+            // after a fault that had been fixed, which is how a diagnostic becomes noise.
+            if (!rom_dir_bad && rom_error == ERR_DIR) rom_error <= ERR_NONE;
+            if (rom_dir_bad) rom_error <= ERR_DIR;
             // rom_ready also waits for the census - not for it to agree, on this first cut:
             // reporting is the point, and a census bug must not become a boot that never
             // happens. The ordering is what makes the number meaningful: the VM does not
@@ -2155,8 +2200,8 @@ module aw_rom (
             // arms the check above). That is what makes a boot-time part select honest: the trailer
             // that was validated is the trailer under the table now installed, not the one that
             // happened to be readable when the upload finished.
-            if (!dir_done_core) rom_ready <= 1'b0;
-            if (chk_done && !seen_overflow && dir_done_core
+            if (!dir_done_core || rom_dir_bad) rom_ready <= 1'b0;
+            if (chk_done && !seen_overflow && dir_done_core && !rom_dir_bad
                 && (!vfy_arm | census_done_core | cen_budget_out)) begin
                 if (offs_ok) begin
                     rom_ready <= 1'b1;

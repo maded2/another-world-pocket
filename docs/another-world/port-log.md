@@ -2364,3 +2364,155 @@ the declared-xor registers being read-but-never-compared got caught rather than 
 Bitstream `build/aw/bitstream.rbf_r`, sha256 `72be08bd825067bc…`, archived as
 `build/bitstreams/aw-paged-3e3a10e.rbf_r`. It is **not** on the card, and nothing about paging has been
 observed on hardware.
+
+
+## 2026-11-02 — the console can say what the VM is looking at, and a default that quietly undid a fix
+
+Task #20. Three things: read out the paging state, stop the banner lying, and the two bugs found while
+doing it — one of which meant yesterday's census fix never reached hardware.
+
+**A parameter with two defaults is two defaults** #bug #lesson
+`core_top` had `#(parameter [21:0] CENSUS_RANGE = 22'h10_0000)` and passed it down to `aw_rom`. So
+when `aw_rom`'s default became die 0 in full, **the bitstream kept sweeping 2 MiB**: the outer default
+won. Yesterday's entry is true of the module and was false of the hardware, and nothing failed — no
+error, no warning, no red audit, because 2 MiB of census is a perfectly well-formed check that simply
+stops short of the pool. Fixed at the level that actually reaches the device; the build before this
+commit does **not** certify the pool despite saying so. Grep for the outer default whenever you widen
+the inner one.
+
+**A diagnostic code nobody had ever read had three defects** #bug
+`dir_err` was 7 bits of ORed flags sharing a field with an index:
+* a bad entry set `7'h02 | {1'b1, ...}` — the forced top bit **is** the timeout flag, so every "entry
+  out of range" also claimed the sweep had never been served;
+* the low six bits carried the sweep **phase** (entry index + 6), so the entry number printed was wrong
+  by six;
+* timeout was `7'h41`, which also decodes as "no magic" — and `0x03` meant both *no magic* and *entry 1
+  out of range*.
+Now: bits[7:6] = reason (1 no magic, 2 entry out of range, 3 never served), bits[5:0] = entry index.
+`E40` plain pack, `E82` entry 2 out of range, `EC0` timeout, `E00` clean. A code a human decodes off a
+serial line needs one meaning per value; ORed flags do not survive that.
+
+**The refusal path had never been driven** #verification
+Every directory `tb_dir` wrote was valid, so the code that rejects a corrupt or stale table — the code
+the whole paging design depends on — was assertion, not tested behaviour. Run 6 (`+BADENT`) writes entry
+2 = 0 and requires: nothing installed, `dir_bad` up, `err == 0x82` naming **that** entry, and reads
+still coming from identity. (My first version of the check was `dir_err !== 7'h02 | 7'd2`, which
+compares against `0x02` and then ORs `2` into the *boolean*: it failed on a correct core. `!==` binds
+tighter than `|`.)
+
+**The banner, and the bench that was hiding it** #bug #process
+`MSG_UP` was a string literal reading `"AW 1041a up"` on 1040, 1041 and 1042 alike — the field this
+file's own comment calls "tag = build id" lied for two releases, and on 2026-11-01 that lie made a good
+install look like a stale one. It is now derived from `BUILD_ID` + `BUILD_SFX` parameters into a
+**fixed 12-byte layout** ("AW " + 4 digits + suffix + ` up\n`), so `msg_len` and the byte extractor
+cannot drift, with a shape check (`A` first, `\n` last) that catches both truncation and
+right-justification.
+
+Why nobody noticed: `tb_dbg_console` **was failing and was not in `make sim`** — a bench nobody runs is
+a bench nobody fixes. It is in the list now, and `dut_b` is deliberately given a *different* `BUILD_ID`
+from `dut_c`, because if both instances printed the same string the bench could not distinguish
+"derived from the parameter" from "hardcoded literal again" — the exact regression that went unnoticed.
+`scripts/sim_dbg.sh` also filtered its own diagnostics (`grep -E 'PASS|FAIL'`), discarding the
+`GOT/WANT` diff a failed compare prints; a run could only ever say "line matches" without naming the
+byte. Fixed, and verified by making it fail on purpose: `G25` against `G24`, printed.
+
+**What the console line gained** #feature
+`... Z.0 <cr>/<cw> G<part><flags> E<err>` — 148 → 156 chars, appended rather than inserted so no
+existing `pos` threshold moved. `G` digit 1 is the part the installed table describes; digit 2 is
+bit0 table installed (0 = identity, a plain pack), bit1 refused, bit2 pool sums match, bit3 a part
+select was refused for arriving after the first byte. So `G00` is a plain pack, `G07` is part 0 of a
+pool with good sums, `G13` is part 1 installed with sums that disagree. The reason this exists is that
+"a VM executing the wrong data" and "the upload is corrupt" look identical on the panel — black screen
+or animated garbage — and after #15 one upload carries eight parts, so "which part am I looking at"
+stops being answerable any other way.
+
+**Evidence** #verification
+* `tb_dir` **6 runs / 175 checks, 0 errors** (run 6 new).
+* `make sim` green including the newly-added console bench: `tb_write`, `tb_keys` 13, `tb_rom` 550 +
+  tripwire, `tb_iv` 24, `tb_reset_gen`, `tb_dbg_console`, `tb_top`.
+* `core_top` connects all six directory outputs (they were dangling when added — a core can spend a
+  week verifying things nobody is able to find out about); the scoped `check-build` dead-logic check is
+  the tripwire that keeps them from being wired to nowhere again.
+
+**Where the two rules meet** #verification
+`build_combined_image.py` computes `word_sum`/`word_xor` over `blob[frames_base : frames_base+pool_bytes]`
+and `verify()` re-checks them against the header, so the declared numbers and the pool bytes are already
+tied together in Python. The core measures the same thing: LE 16-bit words, starting at word 16384, which
+is `frames_base` (page 1), up to the highest word the host actually wrote. Two consequences worth writing
+down before anyone is surprised by them on a device:
+* zero padding at the end of the upload is invisible to both accumulators (0 adds nothing, XORs nothing),
+  so a framework that pads the dataslot file to a block boundary still passes; **non-zero** padding fails
+  the comparison, and the failure would be the core being right about the chip and wrong about the game.
+* the check is only as wide as it is: 32-bit sum plus a 16-bit xor (16 because both sides XOR 16-bit
+  words — see `cr_pool_xor`). Enough to make a compensating-error coincidence negligible, not enough to
+  locate damage; the quarter mask in the `Z` field is what localises.
+
+**Not claimed** #not-proven
+* The console fields have never been seen on hardware; the on-device banner will be read for the first
+  time when this build is installed, and it will not be believed until it matches the bitstream hash.
+* The console bench drives these inputs with **constants**, so it proves the format and the derivation,
+  not that the SoC reports true values. The SoC-side path is #19/#23; `tb_soc` checks bytes to the VM,
+  not console text.
+* `aw.qsf` picks up `NUM_PARALLEL_PROCESSORS` from the build script on every run; left uncommitted on
+  purpose, it is a property of the build host, not of this core.
+
+
+### Added while finishing #20: a refused directory now refuses to boot
+
+The task said a directory that disagrees with its image "must be reportable, never booted through".
+It was reportable and booted anyway: refuse the table, fall back to identity, let the VM run. For a
+plain pack that is right and nothing changed. But `dir_bad` is only ever set when the magic **was**
+there and the table behind it was unusable, and identity in that case means the VM executes the
+directory page as frame 0 and reads every pool page as though it were its own — animated garbage,
+which is the same symptom as the restart bug this port spent two days on. A failure mode that looks
+like an already-diagnosed bug will be re-diagnosed from scratch, so:
+
+* error code 3, previously `ERR_WAIT` and unreachable, becomes **`ERR_DIR`**; the console line becomes
+  `ROM ERR: bad directory` (25 → 23 chars) instead of `ROM ERR: wait state (n/a)`, and the idle screen
+  paints amber. An unreachable code that prints "(n/a)" is a free slot, not a tombstone.
+* `rom_ready` stays low while the directory is bad: **the VM is never started**.
+* it clears when a later sweep is happy, so "install a good image and relaunch" actually clears the
+  report — a fault that cannot be cleared is a brick with a nicer message.
+
+`tb_dir` run 6 now covers the whole arc: bad entry → `dir_valid=0 bad=1 err=82 rom_ready=0
+rom_error=3` → install a good directory → boots, `rom_error` back to 0, and the reads afterwards go
+through the *pool* map (page 3 from physical page 5), not identity. Proving recovery is the part that
+matters; a refusal test that only checks the refusal would pass on a design that latched itself off.
+The bench needed a second re-arm task for this: waiting for `rom_ready` to rise, in a scenario where
+the correct answer is that it does not, sits on the timeout and then reports on whatever state it
+landed in.
+
+**The xor is 16 bits, and now says so.** `check-build` flagged `cr_pool_xor[31:31..16]` stuck at GND,
+and it was right: XOR has no carry, so XORing 16-bit words into a 32-bit register can never move the
+top half. The image builder's `word_xor` does the same thing, so the declared field had 16 bits of
+zeros above it too — the two sides agreed, but they agreed on dead bits, and the audit could not tell
+that apart from a broken accumulator. `cr_pool_xor` is 16 bits, word 15 of the header is not read, and
+the comment says what would have to change together if anyone widened it. The check is a 32-bit sum
+plus a 16-bit xor; that is its real strength, and pretending otherwise was the bug.
+
+**Another bench bug found on the way**: phase B's `recv_line` compared only the characters that
+*arrived*. A message that got shorter — a localparam and its `msg_len` edited out of step, exactly the
+failure class this bench exists to catch — matches its own prefix and **passes**. It now asserts the
+length as well and prints GOT/WANT with character counts. This is what surfaced the stale
+`wait state` expectation, which is itself a lesson in batches: an earlier edit script aborted
+halfway through, so the file it was editing kept the old string, and nothing complained until the
+length check existed.
+
+**Evidence for this increment** #verification
+* `tb_dir` **6 runs / 179 checks, 0 errors**.
+* `make sim` green: `tb_write`, `tb_keys` 13, `tb_rom` 550 + tripwire, `tb_iv` 24, `tb_reset_gen`,
+  `tb_dbg_console`, `tb_top`.
+* `make build CORE_DIR=cores/aw`: 0 errors, **0 critical warnings**; worst setup **0.394 ns**, worst
+  hold **0.105 ns** (the `check-build` number is the global minimum, so 0.105 is hold). Bitstream
+  **`2cd7da63239ed8d7`**. Scoped `check-build` clean: no dead logic, every SDC constraint matched —
+  which is the tripwire that caught both the stuck xor half and the unread declared-xor registers.
+* Superseded identities, recorded so nobody quotes the wrong one: `72be08bd825067bc` was built before
+  the `core_top` census-default fix, so it sweeps 2 MiB and does **not** certify a pool;
+  `73638da549b2b217` was built with the 32-bit (half-dead) xor. Neither is on the card; `AW 1042`
+  (`579746d33d45b594`) still is, and it is the only thing that has ever been run from this line of work.
+
+**Still not claimed** #not-proven — unchanged in kind: no paged bitstream has been in a Pocket. What
+changed is that the paged core can now say, on the wire, which part it is showing, whether its
+directory was valid, whether the pool adds up, and it will not start the VM on a directory it does not
+trust. Whether any of that is *true on hardware* is #15/#23, and the first observation there is still
+"does a 2.94 MiB dataslot upload arrive at all".

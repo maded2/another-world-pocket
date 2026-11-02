@@ -19,5 +19,9 @@ iverilog -g2005 -o tb_dbg_console.vvp \
 # vvp exits 0 even on a failed test (the bench $finish'es either way), so the
 # verdict has to come from its output
 OUT=$(./tb_dbg_console.vvp)
-echo "$OUT" | grep -E 'PASS|FAIL'
+# GOT/WANT included on purpose: recv_line_c prints the received line against the expected one when a
+# compare fails, and filtering it out left a failing run saying only "line matches" with no way to see
+# WHICH byte differed - which is how the banner sat wrong for two releases without anyone being able to
+# say what the core actually printed.
+echo "$OUT" | grep -E 'PASS|FAIL|GOT \['
 echo "$OUT" | grep -q -- '-> PASS' || { echo "error: tb_dbg_console failed" >&2; exit 1; }

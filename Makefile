@@ -190,6 +190,9 @@ sim-soc:
 # mux switch to game video, host commands, audio pins. The only bench that enforces
 # the APF scaler protocol rules on the muxed output from cycle zero (apf_video_check)
 # - the gap between "simulation passes" and "device works".
+sim-dbg:
+	@./docker/run-silice.sh scripts/sim_dbg.sh
+
 sim-top:
 	@$(SILICE) scripts/sim_top.sh
 
@@ -202,7 +205,10 @@ ref-setup:
 ref-sim:
 	@SILICE_IMAGE=$(SILICE_IMAGE) ./docker/run-silice.sh scripts/ref_sim.sh
 
-sim: sim-write sim-keys sim-rom sim-iv sim-reset sim-top
+# sim-dbg used to be missing from this list. Its absence is the reason the boot banner printed
+# "AW 1041a up" on builds 1040, 1041 and 1042: the bench that compares that line byte for byte had
+# been red for two releases, and a bench nobody runs is a bench nobody fixes.
+sim: sim-write sim-keys sim-rom sim-iv sim-reset sim-dbg sim-top
 
 # ------------------------------------------------------------------- package --
 # The pack .bin files are game content, not build output: they live in
