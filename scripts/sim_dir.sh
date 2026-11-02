@@ -71,6 +71,15 @@ echo "=== run 3: a plain pack presented over an installed pool falls back to ide
 ./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +NOMAGIC
 rc_c=$?
 
-rc=$(( rc_a + rc_b + rc_c ))
-[ "$rc" -eq 0 ] || echo "tb_dir: run1=$rc_a run2=$rc_b run3=$rc_c"
+echo "=== run 4: bytes written above the old 2 MiB window land, and the view can be pointed there ==="
+# PACE 10, like every other run. An earlier revision of this run used PACE=6 "to go faster" and the
+# loader FIFO overflowed - ERR_OVERFLOW, with the directory bytes among those dropped, which read as
+# "the design lost my table above 2 MiB" and was in fact the bench writing faster than the chip can
+# take. The rate that overflows is tested on purpose in tb_rom (+TRIPWIRE); it is not a rate to test
+# anything else at.
+./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +HIGH
+rc_d=$?
+
+rc=$(( rc_a + rc_b + rc_c + rc_d ))
+[ "$rc" -eq 0 ] || echo "tb_dir: run1=$rc_a run2=$rc_b run3=$rc_c run4=$rc_d"
 exit $rc

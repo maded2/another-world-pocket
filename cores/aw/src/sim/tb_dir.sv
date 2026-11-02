@@ -112,11 +112,16 @@ module tb_dir;
     // over an installed pool falls back to identity rather than keeping the pool's mapping. Needs
     // its own run for the same reason +PART does: both happen before the first byte.
     int       nomagic   = 0;
+    // +HIGH maps view pages onto physical pages ABOVE the old 2 MiB upload limit, including page 127,
+    // the last page of die 0, and checks them twice over: against the chip model's own memory (the
+    // write landed) and through the VM's byte stream (the map and the read path agree).
+    int       highmap   = 0;
 
     initial begin
         void'($value$plusargs("PACE=%d", pace));
         void'($value$plusargs("PART=%d", want_part));
         nomagic = $test$plusargs("NOMAGIC");
+        highmap = $test$plusargs("HIGH");
         if (!$value$plusargs("PACK=%s", pack_hex))
             $fatal(1, "tb_dir: +PACK=<pack.hex> is required");
         $readmemh(pack_hex, ref_mem);
@@ -154,6 +159,102 @@ module tb_dir;
                     e1 = (k + 1 == 3) ? ((n == 0) ? 16'd5 : ((n == 1) ? 16'd6 : 16'd3))
                                       : (k + 1);          // entry 3 is always the odd half
                     put_words(16 + n*72 + k, e0, e1);
+                end
+            end
+        end
+    endtask
+
+    // ---- +HIGH: the region above the old 2 MiB limit -----------------------------------------
+    // The upload window went 2 MiB -> 4 MiB in 16fe39d, and nothing in the repo had ever written a
+    // bridge word at or above 0x10200000 since: tb_rom loads a 2 MiB pack, and the paged tests here
+    // move pages inside that 2 MiB. So the widening was compiled and never exercised, which is the
+    // same class of gap as "declared but not wired" - and the whole eight-parts-in-one-load premise
+    // depends on bytes landing ABOVE that boundary (the pool ends at byte 0x2F0000).
+    //
+    // The VM's view is 2 MiB, so the only way to read physical page 64 or beyond is THROUGH the page
+    // table - which makes this one test cover both the widened window and the map's upper range. Pages
+    // 40..61 go to 64..85 and page 62 goes to 127, the last page of die 0: first word past the old
+    // limit, and last word the window can name. Entry 63 stays identity because the boot check reads
+    // the trailer through the map and has to pass.
+    // One entry, one rule. Written as a function rather than "the odd half is the even half plus one"
+    // because that shortcut put page 128 in entry 63 - die 1, out of range - and the design refused
+    // the whole table, which was the RIGHT answer and a broken test. Entry 63 has to stay identity for
+    // a second reason too: the boot check reads the trailer through the map.
+    function automatic [15:0] hi_ent(input int k);
+        begin
+            if      (k == 0)           hi_ent = 16'd1;      // entry 0 is never the directory page
+            else if (k >= 40 && k <= 61) hi_ent = 16'(64 + (k - 40));
+            else if (k == 62)          hi_ent = 16'd127;    // last page of die 0
+            else                       hi_ent = k[15:0];
+        end
+    endfunction
+
+    task automatic write_dir_high;
+        int n, k;
+        begin
+            put_words(0, 16'h5741, 16'h3150);
+            for (n = 0; n < 8; n = n + 1)
+                for (k = 0; k < 64; k = k + 2)
+                    put_words(16 + n*72 + k, hi_ent(k), hi_ent(k + 1));
+        end
+    endtask
+
+    // Two words per page, unique per page, written at the FIRST word of the physical page - which is
+    // a byte address of page*32768, so page 64 is byte 0x200000: the first byte the old window would
+    // have silently dropped at wr_en, with no flow control and no out-of-window error to say so.
+    function automatic [15:0] hi_w0(input int pg); hi_w0 = 16'hD000 | pg[7:0]; endfunction
+    function automatic [15:0] hi_w1(input int pg); hi_w1 = 16'hD800 | pg[7:0]; endfunction
+
+    task automatic write_hi_data;
+        int i, pg;
+        begin
+            for (i = 0; i < 22; i = i + 1) begin
+                pg = 64 + i;
+                put_words(pg*16384, hi_w0(pg), hi_w1(pg));
+            end
+            put_words(127*16384, hi_w0(127), hi_w1(127));
+        end
+    endtask
+
+    // Two oracles, deliberately independent. The model's own array says the WRITE landed where the
+    // address said; the VM's byte stream says the READ path and the table agree with it. Either one
+    // alone can pass on an accident: the array alone would miss a broken map, and the byte stream
+    // alone could be reading a copy the loader made somewhere else.
+    task automatic check_hi(input int vpage, input int ppage);
+        integer k;
+        reg [7:0] got;
+        reg [15:0] want0, want1;
+        begin
+            want0 = hi_w0(ppage); want1 = hi_w1(ppage);
+            checks = checks + 4;
+            if (psram0.mem[ppage*16384]   !== want0 ||
+                psram0.mem[ppage*16384+1] !== want1) begin
+                errors = errors + 4;
+                $display("  FAIL model: physical page %0d does not hold what was written (mem=%04h,%04h want %04h,%04h) - the write above the old 2 MiB window was dropped or mis-routed",
+                         ppage, psram0.mem[ppage*16384], psram0.mem[ppage*16384+1], want0, want1);
+            end
+            for (k = 0; k < 4; k = k + 1) begin
+                @(negedge clk_core);
+                mem_addr     <= vpage*32768 + k;
+                mem_in_ready <= 1'b1;
+                @(negedge clk_core);
+                mem_in_ready <= 1'b0;
+                begin : wait_byte
+                    int guard = 0;
+                    while (mem_busy && guard < 20000) begin @(negedge clk_core); guard = guard + 1; end
+                    if (mem_busy) begin
+                        errors = errors + 1;
+                        $display("  STALL high read @%06h (view page %0d -> physical %0d): busy never dropped",
+                                 vpage*32768 + k, vpage, ppage);
+                    end else begin
+                        got = mem_data;
+                        if (got !== ((k == 0 || k == 1) ? want0[k*8 +: 8] : want1[(k-2)*8 +: 8])) begin
+                            errors = errors + 1;
+                            $display("  MISMATCH high byte @%06h (view %0d -> phys %0d, byte %0d): got %02h want %02h",
+                                     vpage*32768 + k, vpage, ppage, k, got,
+                                     (k == 0 || k == 1) ? want0[k*8 +: 8] : want1[(k-2)*8 +: 8]);
+                        end
+                    end
                 end
             end
         end
@@ -269,6 +370,9 @@ module tb_dir;
                 $display("  FAIL: rom_ready never rose (error=%b) - the sweep and the boot check",
                          rom_error);
                 $display("        must order themselves so the trailer is read UNDER the table.");
+                $display("        dir: valid=%b bad=%b part=%0d err=%02h busy=%b selftest D=%04h P=%04h",
+                         dir_valid, dir_bad, dir_part, dir_err, dir_busy,
+                         st_die0, st_pack0);
             end
         end
         // The order below is not stylistic. The directory is frozen once the VM takes its first
@@ -299,6 +403,11 @@ module tb_dir;
                 $display("  FAIL: reported err=%02h after removing the magic, wanted bit0 only",
                          dir_err);
             end
+        end else if (highmap) begin
+            write_hi_data;                 // above 0x10200000: the bytes the old window dropped
+            write_dir_high;                // view 40..62 -> physical 64..85, and 62 -> 127
+            rearm("high pages mapped");
+            expect_status(1, 0, 0, "map onto pages above the old limit installed");
         end else begin
             write_dir;
             rearm("directory written after the pack");
@@ -321,12 +430,26 @@ module tb_dir;
         // optimised away and never consulted fails here instead of passing, which is the whole reason
         // this bench exists: 1042 proved "declared" is not "wired".
         phys3 = (want_part == 1) ? 6 : 5;
-        if (nomagic) phys3 = 3;                      // identity: page 3 is its own
+        if (nomagic || highmap) phys3 = 3;           // identity: page 3 is its own (the +HIGH map
+                                                       // moves pages 40..62, not page 3)
         check_at(3*PG + 8,      phys3*PG + 8,      "view page 3 reads the page the table names");
         check_at(3*PG + PG - 1, phys3*PG + PG - 1, "and to the last byte of that page");
         check_at(4*PG,          4*PG,              "the next page is unaffected");
         check_at(2*PG + 100,    2*PG + 100,        "the previous page is unaffected");
         check_at(9*PG + 4,      9*PG + 4,          "a page every part shares");
+
+        if (highmap) begin
+            // Every mapped page above the old boundary, both oracles. Page 64 is the first byte the
+            // old window would have dropped without telling anyone; page 127 is the last the widened
+            // window can name (bit 21 of the word address is die select, so page 128 would be die 1).
+            for (int i = 0; i < 22; i = i + 1) check_hi(40 + i, 64 + i);
+            check_hi(62, 127);
+            // And the selectivity control: a page the map did not move still reads the pack. Without
+            // this, a global offset in the address arithmetic would pass every check above.
+            check_at(10*PG + 8, 10*PG + 8, "page 10 unmapped: still reads the pack");
+            check_at(30*PG + 8, 30*PG + 8, "page 30 unmapped: still reads the pack");
+            check_at(63*PG + 16, 63*PG + 16, "page 63 (the trailer page) stayed identity");
+        end
 
         // Late refusal. Bytes are flowing, so a part change must be reported and NOT obeyed, and no
         // sweep is expected either - the directory is frozen. rearm() is not used here because it
