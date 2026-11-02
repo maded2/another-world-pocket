@@ -459,6 +459,18 @@ module tb_dir;
                 $display("  FAIL pool_ok=%b after corrupting the declared sum - the check is not comparing anything", pool_ok_w);
             end
             expect_status(1, 0, 0, "a disagreeing pool still installs (the table is valid; the SUM is what failed)");
+            // And the second comparator on its own terms: sum restored to the true value, xor left one
+            // bit off. If pool_ok came back 1 here, the xor would be decoration - which matters because
+            // a checksum alone is satisfied by two words trading places, and a page table trading pages
+            // is exactly the failure this feature can produce.
+            put_words(12, psum[15:0], psum[31:16]);
+            put_words(14, pxor[15:0] ^ 16'h0001, pxor[31:16]);
+            rearm("declared sum correct, declared xor one bit off");
+            checks = checks + 1;
+            if (pool_ok_w !== 1'b0) begin
+                errors = errors + 1;
+                $display("  FAIL pool_ok=%b with a wrong declared xor - the second comparator is decoration", pool_ok_w);
+            end
         end else begin
             write_dir;
             rearm("directory written after the pack");

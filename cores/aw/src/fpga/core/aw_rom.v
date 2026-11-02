@@ -539,6 +539,7 @@ module aw_rom (
     reg  [CEN_AW-1:0] census_addr, census_last;
     reg  [31:0] cr_sum, cr_xor;
     reg  [31:0] cr_pool_sum;          // census sum of pages 1.. only, for the comparison below
+    reg  [31:0] cr_pool_xor;          // and its xor, over the same range - see why both, below
     reg  [15:0] hdr_lo, hdr_hi, hxr_lo, hxr_hi;   // the pool sums the IMAGE declares (words 12..15)
     // The comparison is COMBINATIONAL, and that is load-bearing. It was a register assigned at the end
     // of the census, and the census runs exactly once per power-up (census_done clears only in reset),
@@ -552,7 +553,14 @@ module aw_rom (
     // re-upload is verified by the core restart the framework performs around a dataslot change
     // (data.json parameter bits 7/8), not by a second sweep. A sum check also cannot say WHICH side
     // is wrong; it says the two disagree, and that is what the console needs to know.
-    wire pool_ok = census_done & dir_installed & (cr_pool_sum == {hdr_hi, hdr_lo});
+    // Both declared numbers, not just the sum. A checksum alone can be satisfied by compensating
+    // errors - two words trading places preserves the sum exactly, and a page table trading pages is
+    // precisely the failure this feature can produce - so the image declares an xor too and the core
+    // compares it. The reads were already being made; leaving the pair in registers nobody compared
+    // would have been dead logic AND a weaker check, which is the worst of both.
+    wire pool_ok = census_done & dir_installed
+                 & (cr_pool_sum == {hdr_hi, hdr_lo})
+                 & (cr_pool_xor == {hxr_hi, hxr_lo});
     reg  [31:0] cr_q [0:3];
     reg         census_active, census_done, census_to;
     reg  [17:0] census_stall;
@@ -756,6 +764,7 @@ module aw_rom (
             hxr_lo             <= 16'd0;
             hxr_hi             <= 16'd0;
             cr_pool_sum        <= 32'd0;
+            cr_pool_xor        <= 32'd0;
             part_latched       <= 3'd0;
             arm_ack            <= 1'b0;   // driven here; arm_req_s belongs to its own process
             dir_installed      <= 1'b0;
@@ -870,7 +879,10 @@ module aw_rom (
                 // Pages 1 upward only: page 0 is the directory, and its own bytes would otherwise sit
                 // inside the sum the directory declares for the pool. The point of comparing against
                 // a declared number is that the two are computed from different things.
-                if (census_addr >= CEN_POOL0) cr_pool_sum <= cr_pool_sum + rd_q;
+                if (census_addr >= CEN_POOL0) begin
+                    cr_pool_sum <= cr_pool_sum + rd_q;
+                    cr_pool_xor <= cr_pool_xor ^ rd_q;
+                end
                 cr_sum       <= cr_sum + rd_q;
                 cr_xor       <= cr_xor ^ rd_q;
                 cr_q[census_addr[CEN_QSHIFT +: 2]] <=
