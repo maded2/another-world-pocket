@@ -2354,3 +2354,13 @@ day. One process per register; cross-process signalling goes through a request w
   A check that cannot be read out is a check nobody can fail. Next: the console (#20), then `tb_soc`
   per-part views (#19), then the card (#15/#23).
 * `interact.json` is untouched — deliberately, until the boot-time-write behaviour is measured (#21).
+
+**Build identity for this source** (added after the entry above, from the compile of `3e3a10e`)
+`make build CORE_DIR=cores/aw`: 0 errors, **0 critical warnings**; Slow 1100mV 85C worst setup slack
+**0.395 ns**, worst hold **0.125 ns** (`check-build` reports the global minimum, so its 0.125 ns is
+hold, not setup — the same convention that gave 1042's 0.135 and the paging drop's 0.124). Scoped
+`check-build CORE_DIR=cores/aw` clean: no dead logic, every SDC constraint matched — which is also how
+the declared-xor registers being read-but-never-compared got caught rather than shipped.
+Bitstream `build/aw/bitstream.rbf_r`, sha256 `72be08bd825067bc…`, archived as
+`build/bitstreams/aw-paged-3e3a10e.rbf_r`. It is **not** on the card, and nothing about paging has been
+observed on hardware.
