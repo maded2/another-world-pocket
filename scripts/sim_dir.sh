@@ -80,6 +80,10 @@ echo "=== run 4: bytes written above the old 2 MiB window land, and the view can
 ./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +HIGH
 rc_d=$?
 
-rc=$(( rc_a + rc_b + rc_c + rc_d ))
-[ "$rc" -eq 0 ] || echo "tb_dir: run1=$rc_a run2=$rc_b run3=$rc_c run4=$rc_d"
+echo "=== run 5: the core checks the pool against the sum the image declares, and notices corruption ==="
+./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +POOLSUM
+rc_e=$?
+
+rc=$(( rc_a + rc_b + rc_c + rc_d + rc_e ))
+[ "$rc" -eq 0 ] || echo "tb_dir: run1=$rc_a run2=$rc_b run3=$rc_c run4=$rc_d run5=$rc_e"
 exit $rc

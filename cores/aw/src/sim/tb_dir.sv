@@ -64,7 +64,7 @@ module tb_dir;
     wire [3:0]  cen_qmism;
     wire [2:0]  cen_stat;
     wire        tbl_loaded;
-    wire        dir_valid, dir_bad, dir_busy, part_late;
+    wire        dir_valid, dir_bad, dir_busy, part_late, pool_ok_w;
     wire [2:0]  dir_part;
     wire [6:0]  dir_err;
 
@@ -87,7 +87,8 @@ module tb_dir;
         .rom_selftest_pack0(st_pack0),
         .tbl_wr(1'b0), .tbl_widx(6'd0), .tbl_wval(8'd0), .rom_tbl_loaded(tbl_loaded),
         .rom_dir_valid(dir_valid), .rom_dir_bad(dir_bad), .rom_part(dir_part),
-        .rom_dir_err(dir_err), .rom_dir_busy(dir_busy), .rom_part_late(part_late)
+        .rom_dir_err(dir_err), .rom_dir_busy(dir_busy), .rom_part_late(part_late),
+        .rom_pool_ok(pool_ok_w)
     );
 
     aw_psram_model psram0 (
@@ -116,12 +117,23 @@ module tb_dir;
     // the last page of die 0, and checks them twice over: against the chip model's own memory (the
     // write landed) and through the VM's byte stream (the map and the read path agree).
     int       highmap   = 0;
+    // +POOLSUM: does the core notice a pool that does not add up? The image declares a word sum over
+    // the pool, the census measures the chip, and pool_ok is the two agreeing. Tested BOTH ways
+    // because a comparator that only ever sees the good case is not a comparator: one byte of the
+    // pool is then changed in the chip and pool_ok must go to 0.
+    //
+    // The window is this bench's CENSUS_RANGE (32 Ki words), not the bitstream's 4 MiB, for the
+    // reason tb_rom gives for the same choice: both sides of the comparison are gated by the same
+    // parameter, so the numbers mean the same thing - the mechanism is identical, and 1.5 million
+    // back-to-back reads would be measuring the test harness's patience.
+    int       poolrun   = 0;
 
     initial begin
         void'($value$plusargs("PACE=%d", pace));
         void'($value$plusargs("PART=%d", want_part));
         nomagic = $test$plusargs("NOMAGIC");
         highmap = $test$plusargs("HIGH");
+        poolrun = $test$plusargs("POOLSUM");
         if (!$value$plusargs("PACK=%s", pack_hex))
             $fatal(1, "tb_dir: +PACK=<pack.hex> is required");
         $readmemh(pack_hex, ref_mem);
@@ -408,6 +420,45 @@ module tb_dir;
             write_dir_high;                // view 40..62 -> physical 64..85, and 62 -> 127
             rearm("high pages mapped");
             expect_status(1, 0, 0, "map onto pages above the old limit installed");
+        end else if (poolrun) begin
+            bit [31:0] psum, pxor;
+            int w;
+            // The sum the core will measure: pages 1.. only (page 0 is the directory, and its own
+            // bytes are not part of what the directory declares), over the words the sweep reaches.
+            // PSRAM word w is ref_mem bytes 2w (low) and 2w+1 (high), little-endian.
+            psum = 32'd0; pxor = 32'd0;
+            for (w = 16384; w < 32768; w = w + 1) begin
+                psum = psum + {ref_mem[w*2+1], ref_mem[w*2]};
+                pxor = pxor ^ {ref_mem[w*2+1], ref_mem[w*2]};
+            end
+            write_dir;
+            put_words(12, psum[15:0], psum[31:16]);      // image words 12,13 = declared sum
+            put_words(14, pxor[15:0], pxor[31:16]);      // and 14,15 = declared xor
+            rearm("directory with a declared pool sum");
+            expect_status(1, 0, 0, "pool installed with sums");
+            $display("        poolsum: cr=%08h declared=%08h census_done=%b active=%b installed=%b cw_max=%0h last=%0h",
+                     dut.cr_pool_sum, {dut.hdr_hi, dut.hdr_lo}, dut.census_done, dut.census_active,
+                     dut.dir_installed, dut.cw_max, dut.census_last);
+            checks = checks + 1;
+            if (pool_ok_w !== 1'b1) begin
+                errors = errors + 1;
+                $display("  FAIL pool_ok=%b with a correct declared sum - the census, the page-0 skip, or the comparison is wrong", pool_ok_w);
+            end
+            // The negative control. The DECLARED sum is changed, not the pool: the census measures the
+            // chip once per power-up (a second sweep would steal the chip from a streaming VM), so the
+            // chip cannot be re-measured on demand here - and a sum check cannot tell which side moved
+            // anyway. Moving the other side is the same event to the comparator, and it is a real field
+            // condition: an image whose declared sum disagrees with the bytes in the chip. Without this
+            // control, pool_ok=1 would mean either "matched" or "never compared" - the exact ambiguity
+            // this port has been bitten by over and over.
+            put_words(12, psum[15:0] ^ 16'h0001, psum[31:16]);   // declared sum, off by one
+            rearm("declared pool sum now disagrees with the chip");
+            checks = checks + 1;
+            if (pool_ok_w !== 1'b0) begin
+                errors = errors + 1;
+                $display("  FAIL pool_ok=%b after corrupting the declared sum - the check is not comparing anything", pool_ok_w);
+            end
+            expect_status(1, 0, 0, "a disagreeing pool still installs (the table is valid; the SUM is what failed)");
         end else begin
             write_dir;
             rearm("directory written after the pack");

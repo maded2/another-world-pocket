@@ -183,6 +183,7 @@ module aw_rom (
     output wire [6:0]  rom_dir_err,      // 0 clean; bit0 no magic; bit1+entry an entry out of range;
                                          // bit6 the sweep was not served in time
     output wire        rom_dir_busy,     // a sweep owns the chip right now
+    output wire        rom_pool_ok,      // the chip's pages 1.. equal the pool sum the image claims
     output wire        rom_part_late,    // a part write arrived after the first byte: next launch
 
     // ---- the chip ----
@@ -498,7 +499,14 @@ module aw_rom (
     // override it: 1,048,576 back-to-back reads is ~126 ms of simulated time for a check whose
     // mechanism is identical over 32 Ki words, and both sides of the comparison are gated by
     // the same parameter so the numbers stay meaningful.
-    parameter [21:0] CENSUS_RANGE = 22'h10_0000;
+    // 4 MiB, not 2: die 0 in full. The 2 MiB default was the whole image once, and with a paged
+    // image the pool runs to byte 0x2F0000, so a census capped at 2 MiB could never certify the bytes
+    // the paging feature exists to store - the difference between a check and a gesture. The sweep
+    // still STOPS at cw_max (the highest word actually written), so a plain 2 MiB pack pays exactly
+    // what it paid before and a 2.94 MiB pool pays roughly 200 ms more boot. Word bit 21 is die
+    // select, so 0x200000 words is precisely die 0: the census cannot wander onto the other die,
+    // where the self-test probe now lives.
+    parameter [21:0] CENSUS_RANGE = 22'h20_0000;
     localparam [21:0] CEN_LAST    = CENSUS_RANGE - 22'd1;
     // Quarter boundary. The slice is `addr[CEN_QSHIFT +: 2]` - `+: ` starts AT the base bit,
     // so this picks bits [CEN_QSHIFT+1 : CEN_QSHIFT]. It was written `CEN_QSHIFT+1 +: 2`,
@@ -523,8 +531,28 @@ module aw_rom (
     // Holding the *last index* rather than a limit is what makes CEN_AW bits enough: a limit
     // of CENSUS_RANGE itself would need one bit more than the addresses it bounds.
     localparam integer CEN_AW = $clog2(CENSUS_RANGE);
+    // Word 16384 = the first word of physical page 1, i.e. the first word that is not the directory.
+    // Declared after CEN_AW so the comparison is width-matched instead of silently extended, and a
+    // localparam rather than a literal because a bare 16384 next to a 21-bit cursor is the kind of
+    // width mismatch that Verilator warns about and Quartus quietly fixes.
+    localparam [CEN_AW-1:0] CEN_POOL0 = (1 << 14);
     reg  [CEN_AW-1:0] census_addr, census_last;
     reg  [31:0] cr_sum, cr_xor;
+    reg  [31:0] cr_pool_sum;          // census sum of pages 1.. only, for the comparison below
+    reg  [15:0] hdr_lo, hdr_hi, hxr_lo, hxr_hi;   // the pool sums the IMAGE declares (words 12..15)
+    // The comparison is COMBINATIONAL, and that is load-bearing. It was a register assigned at the end
+    // of the census, and the census runs exactly once per power-up (census_done clears only in reset),
+    // so pool_ok froze at whatever the directory happened to say at that instant - the tb_dir +POOLSUM
+    // run caught it with both sums printed equal and pool_ok low, because the census had finished
+    // before the directory was ever written. Measured and declared are different clocks of event now:
+    // the census fills one, the sweep fills the other, and the verdict is true whenever both are true.
+    //
+    // What it cannot do is re-measure the CHIP without a new census, and a census after the first byte
+    // would steal the chip from a streaming VM - the same reason the directory sweep freezes. A
+    // re-upload is verified by the core restart the framework performs around a dataslot change
+    // (data.json parameter bits 7/8), not by a second sweep. A sum check also cannot say WHICH side
+    // is wrong; it says the two disagree, and that is what the console needs to know.
+    wire pool_ok = census_done & dir_installed & (cr_pool_sum == {hdr_hi, hdr_lo});
     reg  [31:0] cr_q [0:3];
     reg         census_active, census_done, census_to;
     reg  [17:0] census_stall;
@@ -560,7 +588,7 @@ module aw_rom (
     reg  [7:0] p_wcnt;
     reg  [6:0]  dir_err_code;
     reg         dir_bad;                 // a directory was expected and was not usable
-    reg  [11:0] dir_stat;                // {installed, bad, part[2:0], err[6:0]} for the console
+    reg  [12:0] dir_stat;                // {installed, bad, pool_ok, part[2:0], err[6:0]} for the console
     reg         dir_stat_tog;
     reg         vfy_arm;              // clk_core: the pack is in (driven further down)
     wire        census_done_core;     // census_done synchronised into clk_core (see below).
@@ -683,7 +711,7 @@ module aw_rom (
     // out-of-range entry is not "slightly wrong", it is the corrupted-table case the whole page-0
     // layout exists to make harmless: refuse the whole install and go back to identity.
     wire dir_val_ok   = (rd_q[7:0] >= 8'd1) && (rd_q[7:0] <= 8'd127);
-    assign dir_install = dir_captured && (dir_ph >= 7'd2) && dir_val_ok;
+    assign dir_install = dir_captured && (dir_ph >= 7'd6) && dir_val_ok;
     assign rom_dir_busy = dir_active | clr_active;
 
     always @(posedge clk_psram) begin
@@ -723,6 +751,11 @@ module aw_rom (
             dir_part           <= 3'd0;
             dir_stall          <= 18'd0;
             dir_err_code       <= 7'd0;
+            hdr_lo             <= 16'd0;
+            hdr_hi             <= 16'd0;
+            hxr_lo             <= 16'd0;
+            hxr_hi             <= 16'd0;
+            cr_pool_sum        <= 32'd0;
             part_latched       <= 3'd0;
             arm_ack            <= 1'b0;   // driven here; arm_req_s belongs to its own process
             dir_installed      <= 1'b0;
@@ -834,6 +867,10 @@ module aw_rom (
             // FIFO (see the producer's push gate). Route it to the probe that owns
             // it, then advance: cfg0 -> cfg1 -> cfg2 -> cfg3 -> pack read -> done.
             if (cen_captured) begin
+                // Pages 1 upward only: page 0 is the directory, and its own bytes would otherwise sit
+                // inside the sum the directory declares for the pool. The point of comparing against
+                // a declared number is that the two are computed from different things.
+                if (census_addr >= CEN_POOL0) cr_pool_sum <= cr_pool_sum + rd_q;
                 cr_sum       <= cr_sum + rd_q;
                 cr_xor       <= cr_xor ^ rd_q;
                 cr_q[census_addr[CEN_QSHIFT +: 2]] <=
@@ -878,6 +915,16 @@ module aw_rom (
                         dir_ph <= dir_ph + 7'd1;
                         st_s   <= ST_RD;
                     end
+                end else if (dir_ph < 7'd6) begin
+                    // header words 12..15: sum.lo, sum.hi, xor.lo, xor.hi
+                    case (dir_ph)
+                    7'd2:    hdr_lo <= rd_q;
+                    7'd3:    hdr_hi <= rd_q;
+                    7'd4:    hxr_lo <= rd_q;
+                    default: hxr_hi <= rd_q;
+                    endcase
+                    dir_ph <= dir_ph + 7'd1;
+                    st_s   <= ST_RD;
                 end else if (!dir_val_ok) begin
                     dir_active    <= 1'b0;
                     dir_done      <= 1'b1;
@@ -888,7 +935,7 @@ module aw_rom (
                     dir_bad       <= 1'b1;
                     dir_installed <= 1'b0;
                     st_s          <= ST_IDLE;
-                end else if (dir_ph == 7'd65) begin
+                end else if (dir_ph == 7'd69) begin
                     dir_active    <= 1'b0;
                     dir_done      <= 1'b1;
                     dir_err_code  <= 7'd0;
@@ -924,8 +971,8 @@ module aw_rom (
             // that samples on a toggle edge is always reading a settled value. "err[6]" is kept
             // rather than dropped - "sweep not served" and "entry 12 out of range" would otherwise
             // share one code, and they want different fixes.
-            if ({dir_installed, dir_bad, part_latched, dir_err_code} !== dir_stat) begin
-                dir_stat     <= {dir_installed, dir_bad, part_latched, dir_err_code};
+            if ({dir_installed, dir_bad, pool_ok, part_latched, dir_err_code} !== dir_stat) begin
+                dir_stat     <= {dir_installed, dir_bad, pool_ok, part_latched, dir_err_code};
                 dir_stat_tog <= ~dir_stat_tog;
             end
 
@@ -1270,8 +1317,13 @@ module aw_rom (
             default:   dir_base = 10'd520;
         endcase
     end
+    // Six header reads then the table. Words 0,1 are the magic; words 12..15 are the pool's declared
+    // word-sum and xor (HDR "<4sHHHHIIIII": byte 24 -> word 12, little-endian pairs). Read in the same
+    // sweep because the sweep is already sitting on page 0, four reads is nothing, and a pool sum the
+    // core has never looked at is a number in a file rather than a check.
     wire [9:0] dir_word = (dir_ph <= 7'd1) ? {3'b0, dir_ph[6:0]}
-                                           : (dir_base + {3'b0, dir_ph[6:0]} - 10'd2);
+                              : (dir_ph <= 7'd5) ? (10'd10 + {3'b0, dir_ph[6:0]})
+                              : (dir_base + {3'b0, dir_ph[6:0]} - 10'd6);
 
     reg  [7:0]           tbl_rdat;                       // synchronous (M10K) read result
     reg  [PGTBL_AW-1:0]  tbl_rdat_idx;                   // ... and which page it belongs to
@@ -1307,7 +1359,7 @@ module aw_rom (
                 clr_active <= 1'b1;
                 clr_i      <= 6'd0;
             end else if (dir_install) begin
-                pgtbl[dir_ph[5:0] - 6'd2] <= rd_q[7:0];
+                pgtbl[dir_ph[5:0] - 6'd6] <= rd_q[7:0];
                 tbl_loaded <= 1'b1;
             end
         end
@@ -2020,13 +2072,13 @@ module aw_rom (
 
     reg  [1:0]  streamed_c;      // streamed_q in clk_core: the directory is frozen after this
     reg  [1:0]  dd_s;
-    reg  [11:0] dir_stat_c;
+    reg  [12:0] dir_stat_c;
     reg         dir_stat_tog_c;
     reg  [2:0]  late_s;
     always @(posedge clk_core) begin
         if (rst_core) begin
             dd_s            <= 2'b00;
-            dir_stat_c      <= 12'd0;
+            dir_stat_c      <= 13'd0;
             dir_stat_tog_c  <= 1'b0;
             late_s          <= 3'd0;
             streamed_c      <= 2'b00;
@@ -2045,8 +2097,9 @@ module aw_rom (
     wire dir_done_core = dd_s[1];
     wire dir_done_rise = dd_s[1] & ~dd_s[0];
 
-    assign rom_dir_valid = dir_stat_c[11];
-    assign rom_dir_bad   = dir_stat_c[10];
+    assign rom_dir_valid = dir_stat_c[12];
+    assign rom_dir_bad   = dir_stat_c[11];
+    assign rom_pool_ok   = dir_stat_c[10];
     assign rom_part      = dir_stat_c[9:7];
     assign rom_dir_err   = dir_stat_c[6:0];
     assign rom_part_late = late_s[2];

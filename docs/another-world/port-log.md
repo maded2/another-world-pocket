@@ -2263,3 +2263,94 @@ trusting a short clean part1 run. The refusal is the tool doing its job — a ta
 written compiles, places, routes, closes timing and never does anything — and it is recorded here so
 the next person does not read a red `check-build` as a regression rather than as a half-built
 feature. Nothing was installed on the card from this source; `AW 1042` remains the only build on it.
+
+
+## 2026-11-02 — one upload holds all eight parts: directory, part select, and a census that can see the pool
+
+Commits `f2dea93` (directory loader, part select, `tb_dir`), `9d0cc0f` (one driver per register),
+`e171977` (`+HIGH`, the bytes above 2 MiB), plus this session's census work.
+
+The paging table in `aw_rom` could remap a view but had nothing to load it from: `core_top` tied the
+load port to 0. This closes the loop in the core, in simulation.
+
+**What is implemented** #feature #paged
+* A directory sweep over physical page 0, sharing the serialiser that the self-test and census already
+  use. Seven header reads — magic words 0/1 (`AWP1`, so a plain 2 MiB pack is told from a pool by a
+  signature rather than by an upload-size heuristic that would trip on a future image), then the pool's
+  declared word-sum/xor at image words 12..15 — then the 64 table entries of the selected part.
+  Installed one entry per psram cycle.
+* Part select by **address decode**: `0x00F0_0000 + N*4`, part number in `bridge_addr[4:2]`, **data
+  ignored**, because the interact write path's byte order is documented nowhere near well enough to
+  carry a value.
+* Refusal paths that report: an entry of 0 (the directory page) or ≥128 (die 1) aborts the install and
+  walks the table back to identity; no magic leaves identity and is not an error; a select arriving
+  after the VM's first byte is refused and reported.
+
+**What the tests prove** #verification
+`tb_dir`, five scenarios, **161 checks, 0 errors** (`make sim-dir`):
+1. plain-pack boot, pool install, late select refused (12);
+2. part 1 selected before the first byte — **view page 3 reads physical page 6** while neighbours and
+   the shared page stay put (13);
+3. a plain pack presented over an installed pool restores identity (14). This one exists because the
+   failure mode is invisible: a stale pool table aimed at a fresh 2 MiB pack reads another part's bytes
+   and looks exactly like a corrupt upload;
+4. `+HIGH` — bytes written **above the old 2 MiB window** land, and the view is pointed at them up to
+   page 127, the last page of die 0 (107). The VM's view is 2 MiB, so the *only* way to read physical
+  page 64 or beyond is through the table: one run covers the window and the map's upper range. Each
+   page is checked twice over with deliberately independent oracles — the chip model's own `mem[]` (the
+   write landed) and the VM's byte stream (the read path agrees) — plus the selectivity control: pages
+   10, 30 and 63 unmapped still read the pack, without which a global offset in the arithmetic would
+   pass everything;
+5. `+POOLSUM` — the census's measured pool sum against the sum the image declares, correct case and
+   the disagreeing case (15).
+
+**Four things the tests caught, that design review did not** #bug #verification
+1. **`pool_ok` froze at boot.** It was a register assigned at the end of the census, and `census_done`
+   clears only in reset — the census runs **once per power-up**. `+POOLSUM` printed both sums equal and
+   `pool_ok` low, because the census had finished before the directory existed. The comparison is
+   combinational now: the census fills one side, the sweep fills the other, the verdict is true when
+   both are. Measured and declared are different *events*, and freezing a verdict at one of them was
+   the bug.
+2. **The census could not see the pool at all.** Its range was 2 MiB — correct when the image was one
+   2 MiB pack, blind now that the pool runs to `0x2F0000`. It is die 0 in full (4 MiB); the sweep still
+   stops at the highest word actually written, so a plain pack pays exactly what it paid before. A
+   check that cannot reach the bytes the feature exists to store is a gesture.
+3. **`take` is not "the VM accepted a byte".** The refusal gate used `take`, which means *the stream
+   advanced* — the consumer runs ahead of the host. The window closed before a single read. The event
+   is `accept_vm` (`inr[0] & ~inr[1]`).
+4. **`pack_written` is a level**, high forever once the trailer is written and the bridge is quiet.
+   Fed to the re-armable handshake it swept forever and `rom_ready` could only rise in the gaps between
+   sweeps (the tb_top 27 ms timeout). The old code fed the same level to a one-shot pending, which is
+   why it looked safe. Convert levels to edges before re-triggering anything.
+
+**And four that only Quartus caught** #lesson
+`arm_req_s`, the pop machine, `clr_*` and `part_pop` were all multi-driven — I had added each
+register's reset to the sequencer's reset branch *and* given it its own process. **Verilator ran all of
+it green.** This file already records that lesson once (for `chk_cnt`); I repeated it four times in one
+day. One process per register; cross-process signalling goes through a request wire the other side only
+*reads*.
+
+**Two rules this settled** #decision
+* **The directory is frozen at the VM's first byte**, like the self-test probe. A post-boot sweep
+  cannot change usable state and it steals the chip from a streaming VM. `tb_soc` reported 64 fill
+  writes "with no acceptance open" and I reached for a looser oracle — instead the bytes were checked
+  against `part0.bin` at `0x10dc` and were *correct*: the design was right and the measurement was
+  disturbed. Fix the cause, not the check.
+* **`p_addr` narrowed 22 → 20** because paging made bit 21 dead (physical = `{page, addr[13:0]}`, and
+  `start_addr_r` only ever holds a view ≤ 2 MiB). The audit was cleared by fixing the cause; the
+  load-bearing 21-bit `rd_tag_w` comparison was left alone and bit 20 became a constant instead.
+
+**What I refuse to claim** #not-proven
+* **No paged build has been in a Pocket.** `AW 1042` (sha `579746d33d45b594`) is still the only thing on
+  the card. The first hardware unknown is whether the framework uploads 2.94 MiB into the dataslot at
+  all (#15) — every number in this entry is simulation.
+* The census measures the chip **once per power-up**; a re-upload is certified by the core restart the
+  framework does around a dataslot change, not by a second sweep. A sum check also cannot say *which*
+  side disagrees.
+* `+HIGH` writes synthetic patterns, not a real 2.94 MiB image, and `+POOLSUM` runs over this bench's
+  census window rather than the bitstream's 4 MiB — same reason tb_rom gives for the same choice: both
+  sides of the comparison are gated by the same parameter, so the numbers mean the same thing.
+* Nothing consumes `rom_dir_valid` / `rom_dir_bad` / `rom_part` / `rom_dir_err` / `rom_pool_ok` yet.
+  A check that cannot be read out is a check nobody can fail. Next: the console (#20), then `tb_soc`
+  per-part views (#19), then the card (#15/#23).
+* `interact.json` is untouched — deliberately, until the boot-time-write behaviour is measured (#21).
