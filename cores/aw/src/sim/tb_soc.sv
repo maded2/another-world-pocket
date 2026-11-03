@@ -19,6 +19,13 @@
 module tb_soc;
 
     localparam integer PACK_BYTES = 2097136;          // one pack: 2 MiB - 16
+    // The combined (paged) image is 2.94 MiB, so the upload needs its own buffer: `ref_mem` stays
+    // "the 2 MiB the VM is entitled to see", which is what every oracle below indexes, and the thing
+    // pushed through the bridge goes in here. Keeping them separate is the whole point. If the paged
+    // run overwrote ref_mem with the image, the oracles would compare the VM's bytes against the
+    // image at the same address - and under a page table those are different bytes, so the test would
+    // either fail on a working design or, worse, be comparing the wrong things and pass.
+    localparam integer IMG_BYTES  = 3 * 1024 * 1024;  // room for aw-all.bin (2.938 MiB)
     localparam integer PACK_WORDS = PACK_BYTES / 4;
     localparam [23:0]  TRAILER    = 24'h1fffe0;
     localparam integer MAXPIX     = (1 << 21);
@@ -78,11 +85,14 @@ reg design_run = 1'b0;
     wire        cram0_wait;
 
     /* verilator lint_off PINCONNECTEMPTY */
-    // Sweeps 2 Ki words rather than the whole pack: this bench is not a pack-integrity test,
-    // and a full 1,048,576-read census costs ~135 ms of simulation before rom_ready. The
-    // bitstream uses the default (the whole pack); scripts/sim_rom.sh is the bench that
-    // verifies the mechanism, including with +SKIP=<word> to lose a write on purpose.
-    aw_rom #(.CENSUS_RANGE(22'h000800)) u_rom (
+    // (A previous note here said this bench sweeps 2 Ki words and "is not a pack-integrity test".
+    // That stopped being true the day the pool had to be certified from a SoC run, so it is gone
+    // rather than left as a description of something the code no longer does.)
+    // Die 0 in full, i.e. the bitstream's default, deliberately NOT a shrunk window. A tiny census
+    // runs faster but cannot measure a 2.94 MiB pool, and "pool_ok" measured over 32 Ki words would
+    // be a check whose range was inherited from a smaller image - which this port has now been bitten
+    // by twice. Cost: ~1.5M extra reads before design_run, a few minutes of wall time on a long run.
+    aw_rom #(.CENSUS_RANGE(22'h20_0000)) u_rom (
         .clk_core            (clk_core),
         .rst_core            (rst_core),
         .mem_in_ready        (mem_in_ready),
@@ -102,6 +112,13 @@ reg design_run = 1'b0;
         .rom_ready           (rom_ready),
         .rom_error           (rom_error),
         .rom_loading         (rom_loading),
+        .rom_dir_valid       (dir_valid_w),
+        .rom_dir_bad         (dir_bad_w),
+        .rom_dir_busy        (dir_busy_w),
+        .rom_dir_err         (dir_err_w),
+        .rom_part            (dir_part_w),
+        .rom_part_late       (dir_late_w),
+        .rom_pool_ok         (pool_ok_w),
         .cram0_a             (cram0_a),
         .cram0_dq            (cram0_dq),
         .cram0_wait          (cram0_wait),
@@ -256,6 +273,12 @@ reg design_run = 1'b0;
 
     // ---- memory image, for the bridge loader
     reg [7:0] ref_mem [0:PACK_BYTES-1];
+    reg [7:0] img_mem [0:IMG_BYTES-1];               // uploaded image when +IMG is given
+    int         img_bytes = 0;                       // its real length, from +IMG_BYTES
+    int         part_sel  = -1;                      // +PART: which part to select before byte 0
+    wire        dir_valid_w, dir_bad_w, dir_busy_w, dir_late_w, pool_ok_w;
+    wire [2:0]  dir_part_w;
+    wire [7:0]  dir_err_w;
     string    pack_hex;
     // What this pack is supposed to put on screen, from scripts/sim_soc.sh. Not cosmetic:
     // part0 IS the copy-protection screen and is near-black in the REFERENCE simulator too, so
@@ -264,6 +287,11 @@ reg design_run = 1'b0;
     // black screen is a fault); "text" = the copy-protection screen, whose real oracles are the
     // op_drawString strip and the census, and where "no strip was ever written" is the fault.
     string    pack_kind = "rich";
+    // +IMG=<hex> +IMG_BYTES=<n> upload a COMBINED (paged) image instead of a plain pack, and +PART=N
+    // selects the part before the VM's first byte. ref_mem still holds the part's own 2 MiB view and
+    // every oracle keeps comparing against that, which is the point: the bytes the VM reads have been
+    // through the page table, and the reference has not.
+    string    img_hex = "";
     string    framedir;
     // Pace of the modelled bridge. Measured on this design, one 32-bit write every ten
     // 74.25 MHz cycles (~25 MB/s) is absorbed; every eight (~31 MB/s) overruns the drain
@@ -284,6 +312,31 @@ reg design_run = 1'b0;
     // reading). Bench and design must not agree with each other and disagree with the
     // framework: while both took the payload little-endian, every byte of a real pack
     // was stored reversed inside its 32-bit entry and this bench still passed.
+    // ---- paging transition watcher (only while a paged run is in flight) ----
+    // A paged +PART=1 run installed part 0 with part_val=1/part_held=1 sitting in the ROM unclaimed,
+    // and reading the design from the outside could not say which sweep ran when. This logs every
+    // change of the arm/sweep/part state, so the ordering question - did a sweep run before the
+    // select, did the select's own arm fire, did a later sweep overwrite it - is answered by a trace.
+    reg        watch_on = 1'b0;
+    reg [63:0] watch_t  = 0;
+    reg [5:0]  prev_ps, cur_ps;
+    always @(posedge clk_core) begin
+        prev_ps <= {u_rom.arm_pending, u_rom.arm_req, u_rom.dir_pend,
+                    u_rom.dir_active, u_rom.part_held, u_rom.streamed_q};
+        watch_t <= watch_t + 64'd1;
+        if (watch_on) begin
+            cur_ps = {u_rom.arm_pending, u_rom.arm_req, u_rom.dir_pend,
+                      u_rom.dir_active, u_rom.part_held, u_rom.streamed_q};
+            if (cur_ps != prev_ps) begin
+                $display("  SWEEP t=%0t pend=%b req=%b dpnd=%b act=%b held=%b streamed=%b | dir_part=%0d latched=%0d valid=%b | phase=%0d ack=%b ack_s=%b req_s=%b",
+                         $time, cur_ps[5], cur_ps[4], cur_ps[3], cur_ps[2], cur_ps[1], cur_ps[0],
+                         u_rom.dir_part, u_rom.part_latched, u_rom.dir_installed,
+                         u_rom.arm_phase, u_rom.arm_ack, u_rom.arm_ack_s, u_rom.arm_req_s);
+                $fflush;
+            end
+        end
+    end
+
     task automatic wr32(input [31:0] a, input [31:0] d);
         begin
             // WR high for exactly one cycle, then pace cycles of quiet. Leaving WR high
@@ -1160,6 +1213,9 @@ reg design_run = 1'b0;
         void'($value$plusargs("FRAMES=%d", max_frames));
         void'($value$plusargs("NOINPUT=%d", noinput));
         void'($value$plusargs("PACK_KIND=%s", pack_kind));
+        void'($value$plusargs("IMG=%s", img_hex));
+        void'($value$plusargs("IMG_BYTES=%d", img_bytes));
+        void'($value$plusargs("PART=%d", part_sel));
         void'($value$plusargs("ADDRLOG=%d", addrlog));
         if (!$value$plusargs("FRAMEDIR=%s", framedir)) framedir = "/tmp/awframes";
 
@@ -1199,6 +1255,11 @@ reg design_run = 1'b0;
         else
             $display("tb_soc: probe ok (sentinel in page1.buffer[123] reads back)");
         $readmemh(pack_hex, ref_mem);
+        if (img_hex != "") begin
+            $readmemh(img_hex, img_mem);
+            $display("tb_soc: PAGED run - image %s (%0d bytes) uploaded, ref_mem is part %0d's view",
+                     img_hex, img_bytes, part_sel);
+        end
         $display("tb_soc: pack %s, bridge pace %0d, frames %0d -> %s",
                  pack_hex, pace, max_frames, framedir); $fflush;
 
@@ -1212,9 +1273,39 @@ reg design_run = 1'b0;
         $display("tb_soc: with the VM in reset, its memory pins are in_ready=%b addr=%h busy=%b",
                  mem_in_ready, mem_addr, mem_busy); $fflush;
         $display("tb_soc: loading %0d bytes through the bridge", PACK_BYTES); $fflush;
-        for (integer i = 0; i < PACK_WORDS; i = i + 1)
-            wr32(32'h1000_0000 + i*4,
-                 {ref_mem[i*4+3], ref_mem[i*4+2], ref_mem[i*4+1], ref_mem[i*4]});
+        if (img_bytes > 0) begin
+            // The image goes in from img_mem; ref_mem is left holding the part's own view so the
+            // oracles below stay honest. Addresses stay inside the loader's 4 MiB window (the image is
+            // 2.94 MiB) and above the old 2 MiB limit for the tail - which is exactly the region no
+            // simulation had written before tb_dir +HIGH.
+            for (integer i = 0; i < img_bytes/4; i = i + 1)
+                wr32(32'h1000_0000 + i*4,
+                     {img_mem[i*4+3], img_mem[i*4+2], img_mem[i*4+1], img_mem[i*4]});
+        end else begin
+            for (integer i = 0; i < PACK_WORDS; i = i + 1)
+                wr32(32'h1000_0000 + i*4,
+                     {ref_mem[i*4+3], ref_mem[i*4+2], ref_mem[i*4+1], ref_mem[i*4]});
+        end
+        // Part select BEFORE the upload-complete edge, and the order is the whole point. A part write
+        // does not arm a directory sweep on its own, and must not: in the real flow the OS writes the
+        // interact value into core register space and the core then restarts, so the sweep that
+        // installs a table always runs at an upload with the part already chosen. Selecting after
+        // allcomplete - which is what this did - leaves the boot sweep installing part 0 with nothing
+        // ever re-sweeping, and the run reports on part 0 while labelled part 1. Only the
+        // dir_part != part_sel check below stands between that and a green result.
+        // The gate also closes at the VM's first accepted byte; after that a switch could not reset
+        // the game anyway (the VM's reset pin is tied to constant 0 inside the generated netlist).
+        if (part_sel >= 0) begin
+            watch_on = 1'b1;
+            wr32(32'h00F0_0000 + part_sel*4, 32'h0000_0001);   // the ADDRESS picks the part; data ignored
+            // Where the request actually got to, before the upload edge is pulsed. This print exists
+            // because a paged +PART=1 run installed part 0 twice and every explanation I could produce
+            // from the outside was a guess: the FIFO, the drain machine's state, the armed flag and
+            // both copies of the part number are the only things that can say which stage dropped it.
+            $display("tb_soc: after select %0d: fifo_empty=%b p_state=%0d part_val=%0d part_held=%b | arm_pending=%b dir_active=%b dir_part=%0d part_latched=%0d",
+                     part_sel, u_rom.part_empty, u_rom.p_state, u_rom.part_val, u_rom.part_held,
+                     u_rom.arm_pending, u_rom.dir_active, u_rom.dir_part, u_rom.part_latched); $fflush;
+        end
         @(negedge clk_bridge); dataslot_allcomplete <= 1;
         @(negedge clk_bridge); dataslot_allcomplete <= 0;
 
@@ -1223,6 +1314,35 @@ reg design_run = 1'b0;
             while (!rom_ready && g < 6000000) begin @(posedge clk_core); g = g + 1; end
             $display("tb_soc: rom_ready=%b rom_error=%0d after %0d cycles",
                      rom_ready, rom_error, g); $fflush;
+            if (part_sel >= 0) begin
+                // The paged run's own gates, before any frame is drawn. pool_ok is the strong one:
+                // pages 1.. of the chip add up to what the image's directory declares, measured over
+                // the whole pool - which is the first time anything has certified a >2 MiB upload end
+                // to end, in simulation or on hardware.
+                $display("tb_soc: directory: valid=%b bad=%b part=%0d err=%02h pool_ok=%b (wanted part %0d)",
+                         dir_valid_w, dir_bad_w, dir_part_w, dir_err_w, pool_ok_w, part_sel);
+                watch_on = 1'b0;
+                $display("tb_soc: part path now: fifo_empty=%b p_state=%0d part_val=%0d part_held=%b streamed=%b part_latched=%0d",
+                         u_rom.part_empty, u_rom.p_state, u_rom.part_val, u_rom.part_held,
+                         u_rom.streamed_q, u_rom.part_latched);
+                $display("tb_soc: poolsum: measured=%08h declared=%08h census_done=%b active=%b cw_max=%0h last=%0h range=%0h",
+                         u_rom.cr_pool_sum, {u_rom.hdr_hi, u_rom.hdr_lo}, u_rom.census_done,
+                         u_rom.census_active, u_rom.cw_max, u_rom.census_last,
+                         u_rom.CENSUS_RANGE); $fflush;
+                if (!dir_valid_w || dir_bad_w || dir_part_w != part_sel[2:0]) begin
+                    errors = errors + 1;
+                    $display("tb_soc: FAIL - the paged directory did not install cleanly");
+                end
+                // pool_ok is deliberately NOT gated here, and the reason is a property of the design
+                // worth having in writing: a 2.94 MiB census takes longer than boot is willing to
+                // wait, so rom_ready proceeds on cen_budget_out and the pool verdict lands AFTER the
+                // VM has started. It is a post-boot reading, not a boot gate - which also means it
+                // can never be used to refuse boot, however tempting that looks. The assert lives
+                // after the frame run, where census_done has had time to arrive.
+                if (!pool_ok_w && !u_rom.census_done)
+                    $display("tb_soc: (pool_ok is 0 because the census is still sweeping %0d words - expected, see the check after the run)",
+                             u_rom.cw_max);
+            end
             if (!rom_ready) begin
                 $display("tb_soc: FAIL - the pack never verified, so the VM stays in reset.");
                 $display("          rom_error=%0d (1 bad trailer, 2 bridge overran the drain -",
@@ -1266,6 +1386,24 @@ reg design_run = 1'b0;
                     $display("  t=%0t frames=%0d bytes_to_vm=%0d addr=%h starving=%0d leds=%b",
                              $time, frames, bytes_to_vm, mem_addr, starving, leds); $fflush;
                 end
+            end
+        end
+
+        // The pool verdict, waited for rather than sampled. This is the end-to-end statement that
+        // the paging work depends on: a 2.94 MiB image went across the bridge, the chip holds it, and
+        // it adds up to what the image's own directory declares - measured by the core, over the
+        // whole pool, with the VM already running.
+        if (part_sel >= 0) begin
+            begin
+                int gc; gc = 0;
+                while (!u_rom.census_done && gc < 8000000) begin @(posedge clk_core); gc = gc + 1; end
+                $display("tb_soc: census done=%b after %0d more core cycles; measured=%08h declared=%08h pool_ok=%b",
+                         u_rom.census_done, gc, u_rom.cr_pool_sum,
+                         {u_rom.hdr_hi, u_rom.hdr_lo}, pool_ok_w); $fflush;
+            end
+            if (!pool_ok_w) begin
+                errors = errors + 1;
+                $display("tb_soc: FAIL - the core's pool sum does not match the image's directory");
             end
         end
 
@@ -1315,22 +1453,42 @@ reg design_run = 1'b0;
         // image over the megabyte op_drawString reads. Byte order is the design's: even byte
         // in [7:0], odd byte in [15:8] (see aw_rom's c_byte mux).
         begin : psram_image_cmp
-            integer i, bad, firstbad;
+            integer i, bad, firstbad, n, w0;
             bad = 0; firstbad = -1;
-            for (i = 0; i < 65536; i = i + 1) begin
-                if (u_mem.mem[22'h8_0000 + i[21:0]] !==
-                    {ref_mem[('h10_0000 + i*2) + 1], ref_mem['h10_0000 + i*2]}) begin
+            // Which array is the truth about the chip depends on what was uploaded, and mixing them
+            // up is the easiest mistake in this mode: in a paged run ref_mem is the part's VIEW and the
+            // chip holds the IMAGE, so comparing them disagrees on 17707 words of a working design -
+            // which is exactly what it did, and the design was right. So: compare the chip against the
+            // bytes that were actually pushed across the bridge. In a paged run that also widens the
+            // check from the 128 KiB "text megabyte" window to the whole upload, which is the first
+            // byte-exact statement about a >2 MiB dataslot load anywhere in this repo (the census
+            // sums say the pool ADDS UP; this says it is the right bytes in the right places).
+            // First attempt got the window wrong and the failure said so precisely: it reported the
+            // first disagreement at word 0x178000, which is byte 0x2F0000 - the exact END of the
+            // image - with the chip holding the model's 5a5a poison. Every uploaded word had matched;
+            // the loop had simply run past the file. So the window is stated as (first word, count)
+            // derived from the upload, not inherited from the old 128 KiB window.
+            w0 = (img_bytes > 0) ? 0        : 524288;      // paged: whole image; plain: word 0x80000 = byte 0x100000
+            n  = (img_bytes > 0) ? img_bytes/2 : 65536;
+            for (i = 0; i < n; i = i + 1) begin
+                if (u_mem.mem[w0 + i[21:0]] !==
+                    ((img_bytes > 0)
+                       ? {img_mem[(w0*2 + i*2) + 1], img_mem[w0*2 + i*2]}
+                       : {ref_mem[('h10_0000 + i*2) + 1], ref_mem['h10_0000 + i*2]})) begin
                     bad = bad + 1;
                     if (firstbad < 0) firstbad = i;
                 end
             end
             if (bad != 0) begin
                 errors = errors + 1;
-                $display("  FAIL: PSRAM disagrees with the image over the text megabyte: %0d words, first at word %0d (holds %04h, image %04h)",
-                         bad, firstbad, u_mem.mem[22'h8_0000 + firstbad[21:0]],
-                         {ref_mem[('h10_0000 + firstbad*2) + 1], ref_mem['h10_0000 + firstbad*2]});
+                $display("  FAIL: PSRAM disagrees with what was uploaded: %0d of %0d words, first at word %0d (holds %04h, want %04h)",
+                         bad, n, w0 + firstbad, u_mem.mem[w0 + firstbad[21:0]],
+                         ((img_bytes > 0)
+                            ? {img_mem[((w0+firstbad)*2) + 1], img_mem[(w0+firstbad)*2]}
+                            : {ref_mem[('h10_0000 + firstbad*2) + 1], ref_mem['h10_0000 + firstbad*2]}));
             end else
-                $display("  ok   PSRAM holds the image across the text megabyte (65536 words)");
+                $display("  ok   PSRAM holds what was uploaded, byte-exact (%0d words, %0d..%0d)",
+                         n, w0, w0 + n - 1);
         end
 
         // ---- text verdict ---------------------------------------------------------------

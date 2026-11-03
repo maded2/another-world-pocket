@@ -131,6 +131,20 @@ module tb_dir;
     // This path existed and had never been driven by a test - every directory the bench wrote was
     // valid, so the refusal that protects against a corrupt or stale table was pure assertion.
     int       badent    = 0;
+    // +LATESEL: the part write lands AFTER the upload-complete sweep has already installed part 0.
+    // This is the ordering I cannot measure from here - KB-035 says persisted interact values are
+    // written "at boot immediately before Reset Exit", which reads like after the dataslot upload -
+    // and without a select-arms-a-sweep path the launch installs part 0 and reports success. tb_soc
+    // hit exactly this with +PART=1, so it gets its own run rather than staying a footnote.
+    //
+    // The run passes, and the pass is narrower than it looks: here rst_core is released long before
+    // the select, while at launch the core is held in reset through the whole upload, and a select
+    // arriving in that window is lost - the arm toggle flips, the core-domain synchroniser is pinned
+    // at 0 by the same reset, and no sweep is ever armed (tb_soc trace: arm_t=1, parm_cs=000, no
+    // arm_pending edge, dir_valid stuck on the part the boot sweep installed). The fix that does not
+    // depend on an edge surviving reset is to read ALL parts' tables at upload and choose the part at
+    // read time - 8*64 table words is nothing in M10Ks, and then a select is a level, not an event.
+    int       latesel   = 0;
 
     initial begin
         void'($value$plusargs("PACE=%d", pace));
@@ -139,6 +153,7 @@ module tb_dir;
         highmap = $test$plusargs("HIGH");
         poolrun = $test$plusargs("POOLSUM");
         badent  = $test$plusargs("BADENT");
+        latesel = $test$plusargs("LATESEL");
         if (!$value$plusargs("PACK=%s", pack_hex))
             $fatal(1, "tb_dir: +PACK=<pack.hex> is required");
         $readmemh(pack_hex, ref_mem);
@@ -322,6 +337,22 @@ module tb_dir;
             repeat (80) @(negedge clk_psram);
             $display("  re-arm down (%s): dir_valid=%b bad=%b err=%02h rom_ready=%b rom_error=%0d after %0d",
                      why, dir_valid, dir_bad, dir_err, rom_ready, rom_error, g);
+        end
+    endtask
+
+    // Let whatever the last event armed run to completion: rom_ready drops for the sweep, the trailer
+    // check re-runs under the new table, and rom_ready rises again. Deliberately does NOT pulse
+    // dataslot_allcomplete - the point is to wait on an arm that came from somewhere else, and
+    // pulsing it here would hide a select that arms nothing at all.
+    task automatic settle(input string why);
+        int g = 0;
+        begin
+            @(negedge clk_core);
+            while (rom_ready && g < 200000) begin @(negedge clk_core); g = g + 1; end
+            while (!rom_ready && g < 4000000) begin @(negedge clk_core); g = g + 1; end
+            repeat (120) @(negedge clk_psram);      // status crosses clocks; let it land
+            $display("  settle (%s): dir_valid=%b bad=%b part=%0d err=%02h after %0d",
+                     why, dir_valid, dir_bad, dir_part, dir_err, g);
         end
     endtask
 
@@ -545,7 +576,16 @@ module tb_dir;
         // because a switch after that could not reset the game (its reset pin is tied to constant 0
         // inside the generated netlist) and would swap the bytes under a running one. The ADDRESS
         // picks the part - 0x00F0_0004 is part 1 - and nothing about the data written matters.
-        if (want_part > 0) begin
+        if (want_part > 0 && latesel) begin
+            // The awkward order: the boot sweep has installed part 0, and now the select arrives.
+            // Nothing else is going to arm a sweep, so if the select does not, the table stays part
+            // 0 and the reads below would pass only by reading the wrong part's bytes - which is
+            // precisely the failure the phys3 check is here to make impossible.
+            bridge_write32(32'h00F0_0000 + want_part*4, 32'h0000_0001);
+            settle("part write AFTER the boot sweep installed part 0");
+            expect_status(1, 0, want_part,
+                          "a select landing after the boot sweep still installs its own part");
+        end else if (want_part > 0) begin
             bridge_write32(32'h00F0_0000 + want_part*4, 32'h0000_0001);
             rearm("part write before the first byte");
             expect_status(1, 0, want_part, "part selected from an address write");

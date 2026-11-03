@@ -83,7 +83,14 @@ fi
 # hardware-only freeze.
 # PACK_KIND tells tb_soc what the pack is supposed to render (part0 is black by design); it went
 # on this list the same afternoon it was invented, for the same reason as the two above.
-for _v in TRACE READTRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS EXTRA WORK STALL FRAMEDIR PACK_KIND; do
+# IMG is the combined (paged) image for scripts/sim_soc.sh. It was missing from this list, so
+# `IMG=... scripts/sim_soc.sh` came back as a perfectly ordinary plain-pack run with no hint that the
+# request had been dropped - and the log looked like a paged run that passed, which is the dangerous
+# version: the first paged tb_soc result would have been a plain run wearing a paged label.
+# PART is shared: scripts/ref_sim.sh has used it for years as the reference-run part index, and
+# scripts/sim_soc.sh now reads it as "which part to select before the VM's first byte". Both are
+# integer part indices; if they ever mean different things, one of them gets renamed.
+for _v in TRACE READTRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS EXTRA WORK STALL FRAMEDIR PACK_KIND IMG; do
     [ -n "${!_v:-}" ] && docker_args+=(-e "$_v")
 done
 

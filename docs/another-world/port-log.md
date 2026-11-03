@@ -2516,3 +2516,58 @@ changed is that the paged core can now say, on the wire, which part it is showin
 directory was valid, whether the pool adds up, and it will not start the VM on a directory it does not
 trust. Whether any of that is *true on hardware* is #15/#23, and the first observation there is still
 "does a 2.94 MiB dataslot upload arrive at all".
+
+---
+
+## 2026-11-03 — the paged view runs the real VM, and the part select is broken at launch (#19)
+
+`tb_soc` can now boot the actual VM on a paged view: `+IMG=build/aw-all.bin +PART=n` uploads the
+2.94 MiB combined image and compares the bytes the VM receives against that part's own pack.
+
+**What is demonstrated** #green
+* **part 0, paged, end to end**: `ok PSRAM holds what was uploaded, byte-exact (1540096 words,
+  0..1540095)` — the whole image, including everything past the old 2 MiB limit;
+  `census done=1; measured=9ca26b21 declared=9ca26b21 pool_ok=1`; and the VM drew its frames while
+  **97,657 compared bytes** matched `part0.bin`, `31360 fill writes / 0 shifted -> PASS`.
+* `tb_dir` still **6 runs / 179 checks, 0 errors**; plain `part0` still PASS (`56320 fill writes /
+  0 shifted`) — but its byte and frame counters moved, because `tb_soc`'s census now sweeps die 0 the
+  way hardware does, so it steals the chip during play. **The old plain anchors are not comparable**;
+  re-measure before using them for an A/B.
+
+**What is broken, and only simulation found it** #bug
+**A part select that arrives after the boot sweep installs nothing.** `+PART=1` boots with
+`dir_valid=1 bad=0 part=0`, and then the run is not "wrong part, nothing happens" — the VM executes
+part 0's bytes as if they were part 1, control flow runs off (`addr=200085`, past the 2 MiB view), and
+the stream starves: `bytes_to_vm` frozen at 3392 while `starving` climbs by 250 k every 10 ms.
+
+Traced rather than argued. `tb_soc` now carries a transition watcher on
+`{arm_pending, arm_req, dir_pend, dir_active, part_held, streamed_q}` plus the handshake internals,
+and the trace says it plainly: at the moment of the select a table is *already* installed
+(`valid=1 latched=0`), the FIFO request lands (`fifo_empty=1 part_val=1 part_held=1`), and afterwards
+**the arm machinery never moves again** — not for the select, not even for `dataslot_allcomplete`.
+
+A patch that toggled an arm request on the select made `tb_dir`'s late-select case pass. It is
+**reverted**, because the same trace showed it still doing nothing at boot: `arm_t=1` (the psram side
+flipped) with `parm_cs=000` and no `arm_pending` edge — the toggle edge lands while `rst_core` is
+still asserted, so the core-domain synchroniser is pinned by that reset and the event is lost inside
+the reset window. Keeping it would have bought a green test and a launch that still runs part 0,
+which is the worst possible trade.
+
+**The fix has to be level-based, not event-based** #decision
+Read **every** part's table at upload (8 × 64 words + tags is nothing in M10Ks) and index it by part
+at read time. Then a select is a *level* the read path samples, there is no event to lose, and the
+ordering question — does the framework write interact values before or after the dataslot upload
+(KB-035 reads like after) — stops mattering. That is task **#28**, and the single-image plan depends
+on it: without it, "eight parts in one upload" means "eight parts, and you get part 0".
+
+**Evidence hygiene** #process
+`tb_dir` run 7 (`+LATESEL`) is **opt-in** (`LATESEL_TEST=1`) and expected to fail, with the reason in
+`scripts/sim_dir.sh`. It was briefly in the default sequence while the reverted patch made it pass,
+which is exactly how a test can certify a feature that does not work at boot: `tb_dir` has `rst_core`
+released long before the select, and the launch does not. A passing test whose preconditions differ
+from the field path is not evidence about the field path.
+
+**Not claimed** — `part>0` has never run, paged or otherwise, since the select cannot reach it; the
+part-0 paged PASS is partly vacuous on that axis (part 0 is the default map, so it would pass with
+the select mechanism absent entirely). Console fields, uploads >2 MiB and everything else on hardware
+remain #15/#23.

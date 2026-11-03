@@ -39,6 +39,11 @@ FRAMES="${FRAMES:-40}"
 # underneath the other, so the first reported on bytes it never asked for. Keying by pack makes
 # different packs independent; the lock below handles the same-pack case.
 SLUG="$(basename "$PACK" .bin)"
+# A paged run gets its own key. Without it, a paged part0 run and a plain part0 run share obj/ and
+# pack.hex, and whichever builds second rewrites the files the other is running against - the exact
+# failure this keying exists to prevent, re-created by adding a second mode.
+IMG="${IMG:-}"; PART="${PART:-}"
+if [ -n "$IMG" ]; then SLUG="$SLUG-$(basename "$IMG" .bin)-p${PART:-0}"; fi
 WORK="${WORK:-${TMPDIR:-/tmp}/aw-sim-soc-$SLUG}"
 LOCK="$WORK.lock"
 # The frames have to land somewhere the host can see. This script runs inside a container
@@ -66,6 +71,22 @@ if ! flock -n 9; then
     flock 9
 fi
 
+# IMG=<combined image> makes this a PAGED run: the image goes through the bridge, PART=<n> selects
+# the part before the VM's first byte, and PACK stays the REFERENCE the byte stream is compared
+# against. Two files, two roles - and keeping them apart is the point. Loading the image into ref_mem
+# would have the oracle compare the VM's bytes against the image at the same address; under a page
+# table those are different bytes, so the test would fail a working design - or compare the wrong
+# things and pass, which is worse.
+if [ -n "$IMG" ] && [ ! -f "$IMG" ]; then
+    echo "error: no combined image at $IMG" >&2
+    echo "       build it with: python3 scripts/build_combined_image.py" >&2
+    exit 2
+fi
+if [ -n "$IMG" ] && [ -z "$PART" ]; then
+    echo "error: IMG is set but PART is not - which part should the VM's view describe?" >&2
+    exit 2
+fi
+
 python3 - "$PACK" "$WORK/pack.hex" <<'PY'
 import sys
 data = open(sys.argv[1], 'rb').read()
@@ -74,6 +95,23 @@ with open(sys.argv[2], 'w') as fh:
         fh.write("%02x\n" % b)
 print("wrote %s (%d bytes)" % (sys.argv[2], len(data)))
 PY
+
+IMG_BYTES=0
+if [ -n "$IMG" ]; then
+    python3 - "$IMG" "$WORK/img.hex" >"$WORK/imghex.log" 2>&1 <<'PYIMG'
+import sys
+data = open(sys.argv[1], 'rb').read()
+with open(sys.argv[2], 'w') as fh:
+    for b in data:
+        fh.write("%02x\n" % b)
+print("wrote %s (%d bytes)" % (sys.argv[2], len(data)))
+PYIMG
+    if [ ! -s "$WORK/img.hex" ]; then
+        echo "error: img.hex came out empty - see $WORK/imghex.log" >&2; exit 2
+    fi
+    IMG_BYTES=$(stat -c %s "$IMG")
+    echo "paged : image=$IMG ($IMG_BYTES bytes), part=$PART; ref_mem stays $PACK's view"
+fi
 
 # TRACE=1 wires the design's own rasterizer/busy/paging nets out of the generated netlist
 # and prints every change. A black screen with a byte-accurate ROM is either 'the VM stopped
@@ -131,7 +169,8 @@ echo "role  : $role"
 echo "kind  : $kind (what the verdict is graded on)"
 echo "=== run: load, boot, capture $FRAMES frames ==="
 ./obj/tb_soc "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" "+FRAMES=$FRAMES" \
-             "+FRAMEDIR=$FRAMEDIR" "+PACK_KIND=$kind" ${EXTRA:-}
+             "+FRAMEDIR=$FRAMEDIR" "+PACK_KIND=$kind" \
+             ${IMG:+"+IMG=$WORK/img.hex" "+IMG_BYTES=$IMG_BYTES" "+PART=$PART"} ${EXTRA:-}
 # EXTRA carries bench plusargs that are not the pack, e.g.
 #   EXTRA=+FUZZ_BRAM=1 ./docker/run-silice.sh scripts/sim_soc.sh
 # (the positional argument is the pack, so "$@" could not be used for both)
