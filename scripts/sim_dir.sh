@@ -88,23 +88,16 @@ echo "=== run 6: an out-of-range entry refuses the whole table and names the ent
 ./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +BADENT
 rc_f=$?
 
-# run 7 is opt-in and EXPECTED TO FAIL, because it describes a capability the design does not have:
-# a part select that arrives after the boot sweep. It fails in both benches - tb_dir with rst_core
-# released (dir_valid=1 part=0, wanted part=1) and tb_soc at launch, where an arm requested while the
-# core is in reset is lost outright. A patch that toggled an arm request on the select did make this
-# run pass, and it is reverted: the same trace showed it still does nothing at boot, because the
-# toggle edge lands inside the rst_core window, so keeping it would have bought a green test and a
-# launch that still runs part 0. The fix has to be level-based (read every part's table at upload and
-# index it by part at read time) - task #28, and the single-image plan depends on it.
-if [ "${LATESEL_TEST:-0}" = "1" ]; then
-    echo "=== run 7 (opt-in, documents an absent capability): late part select ==="
-    ./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +PART=1 +LATESEL
-    rc_g=$?
-else
-    echo "=== run 7 skipped (opt-in): late part select is not implemented; LATESEL_TEST=1 shows it failing ==="
-    rc_g=0
-fi
+# run 7: a part select that lands AFTER the boot sweep. It is back in the default sequence, and what
+# changed is the design rather than the expectation: the boot sweep now loads all eight parts' tables,
+# so a select is a register write the next fetch sees, with no sweep to arm, no arm to lose to
+# rst_core, and no dependence on whether the framework delivers the interact write before or after the
+# dataslot upload (the ordering task #21 exists to measure). It passes in both benches now - tb_dir
+# here, tb_soc +PART=1 with the VM rendering part 1's intro through part 1's table.
+echo "=== run 7: a part select that lands AFTER the boot sweep still installs its own part ==="
+./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +PART=1 +LATESEL
+rc_g=$?
 
-rc=$(( rc_a + rc_b + rc_c + rc_d + rc_e + rc_f ))
+rc=$(( rc_a + rc_b + rc_c + rc_d + rc_e + rc_f + rc_g ))
 [ "$rc" -eq 0 ] || echo "tb_dir: run1=$rc_a run2=$rc_b run3=$rc_c run4=$rc_d run5=$rc_e run6=$rc_f run7=$rc_g"
 exit $rc

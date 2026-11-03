@@ -348,8 +348,7 @@ module tb_dir;
         int g = 0;
         begin
             @(negedge clk_core);
-            while (rom_ready && g < 200000) begin @(negedge clk_core); g = g + 1; end
-            while (!rom_ready && g < 4000000) begin @(negedge clk_core); g = g + 1; end
+            repeat (400) @(negedge clk_core);       // a select is a level: no sweep, no rom_ready dip
             repeat (120) @(negedge clk_psram);      // status crosses clocks; let it land
             $display("  settle (%s): dir_valid=%b bad=%b part=%0d err=%02h after %0d",
                      why, dir_valid, dir_bad, dir_part, dir_err, g);

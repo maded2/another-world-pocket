@@ -324,18 +324,18 @@ reg design_run = 1'b0;
     always @(posedge clk_core) begin
         prev_ps <= {u_rom.arm_pending, u_rom.arm_req, u_rom.dir_pend,
                     u_rom.dir_active, u_rom.part_held, u_rom.streamed_q};
-        prev_inst <= {u_rom.dir_part, u_rom.part_latched, u_rom.dir_installed, u_rom.dir_bad,
+        prev_inst <= {u_rom.view_part, u_rom.ent_bad, u_rom.dir_installed, u_rom.dir_bad,
                       u_rom.dir_err_code};
         watch_t <= watch_t + 64'd1;
         if (watch_on) begin
             cur_ps = {u_rom.arm_pending, u_rom.arm_req, u_rom.dir_pend,
                       u_rom.dir_active, u_rom.part_held, u_rom.streamed_q};
-            cur_inst = {u_rom.dir_part, u_rom.part_latched, u_rom.dir_installed, u_rom.dir_bad,
+            cur_inst = {u_rom.view_part, u_rom.ent_bad, u_rom.dir_installed, u_rom.dir_bad,
                         u_rom.dir_err_code};
             if ((cur_ps != prev_ps) || (cur_inst != prev_inst)) begin
-                $display("  SWEEP t=%0t pend=%b req=%b dpnd=%b act=%b held=%b streamed=%b | dir_part=%0d latched=%0d inst=%b bad=%b err=%02h | phase=%0d ack=%b ack_s=%b req_s=%b",
+                $display("  SWEEP t=%0t pend=%b req=%b dpnd=%b act=%b held=%b streamed=%b | view_part=%0d ent_bad=%02h inst=%b bad=%b err=%02h | phase=%0d ack=%b ack_s=%b req_s=%b",
                          $time, cur_ps[5], cur_ps[4], cur_ps[3], cur_ps[2], cur_ps[1], cur_ps[0],
-                         u_rom.dir_part, u_rom.part_latched, u_rom.dir_installed, u_rom.dir_bad,
+                         u_rom.view_part, u_rom.ent_bad, u_rom.dir_installed, u_rom.dir_bad,
                          u_rom.dir_err_code,
                          u_rom.arm_phase, u_rom.arm_ack, u_rom.arm_ack_s, u_rom.arm_req_s);
                 $fflush;
@@ -1310,7 +1310,7 @@ reg design_run = 1'b0;
             // both copies of the part number are the only things that can say which stage dropped it.
             $display("tb_soc: after select %0d: fifo_empty=%b p_state=%0d part_val=%0d part_held=%b | arm_pending=%b dir_active=%b dir_part=%0d part_latched=%0d",
                      part_sel, u_rom.part_empty, u_rom.p_state, u_rom.part_val, u_rom.part_held,
-                     u_rom.arm_pending, u_rom.dir_active, u_rom.dir_part, u_rom.part_latched);
+                     u_rom.arm_pending, u_rom.dir_active, u_rom.view_part, u_rom.ent_bad);
             // arm_ack/streamed are printed because the launch-path diagnosis needs them: the request
             // level was proven visible in the core (part_req_cs=011) with streamed_c=00 and still no
             // arm_pending, because arm_pending is only ever SET in the not-in-reset branch, and after
@@ -1336,7 +1336,7 @@ reg design_run = 1'b0;
                 watch_on = 1'b0;
                 $display("tb_soc: part path now: fifo_empty=%b p_state=%0d part_val=%0d part_held=%b streamed=%b part_latched=%0d",
                          u_rom.part_empty, u_rom.p_state, u_rom.part_val, u_rom.part_held,
-                         u_rom.streamed_q, u_rom.part_latched);
+                         u_rom.streamed_q, u_rom.view_part);
                 $display("tb_soc: poolsum: measured=%08h declared=%08h census_done=%b active=%b cw_max=%0h last=%0h range=%0h",
                          u_rom.cr_pool_sum, {u_rom.hdr_hi, u_rom.hdr_lo}, u_rom.census_done,
                          u_rom.census_active, u_rom.cw_max, u_rom.census_last,

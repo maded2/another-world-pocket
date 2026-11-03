@@ -595,8 +595,7 @@ module aw_rom (
     // anyway, because the sweep is idempotent and always reads the newest held part.
     reg  [1:0]  arm_req_s;
     reg         arm_ack;
-    reg         dir_installed;                     // a table is installed for part_latched
-    reg  [2:0]  part_latched;
+    reg         dir_installed;                     // the VIEW THE CORE IS ON has a usable table
     // aw_fifo is NOT first-word-fallthrough: rd_q belongs to the cycle AFTER rd_en, which is why the
     // loader consumes it through rd_q_valid. Sampling part_fw in the same cycle as the pop read the
     // PREVIOUS word instead - 0 out of reset - so the sweep ran, installed cleanly and reported no
@@ -657,11 +656,17 @@ module aw_rom (
         // pin is tied to 0 inside the generated netlist (see core_top), so the game would keep
         // running over another part's bytes - and `part_late` says so out loud instead of failing
         // as a wrong-looking picture. The variable is persisted, so it arrives again next boot.
-        if (bridge_wr && bridge_addr[31:12] == 20'h00F00 && !streamed_s[1]) begin
+        // Two reasons a select is refused, one flag, because both mean "the view did not move and
+        // you will be told": bytes were already flowing, or that part has no usable table in the
+        // image that is loaded. Checking it HERE (at the decode, single driver) rather than at the
+        // commit keeps part_late on one process; part_ok is a psram-domain register, so the test
+        // costs a compare and no crossing.
+        if (bridge_wr && bridge_addr[31:12] == 20'h00F00 && !streamed_s[1]
+            && (!dir_installed || part_ok[bridge_addr[4:2]])) begin
             part_push <= 1'b1;
             part_din  <= bridge_addr[4:2];
         end else if (bridge_wr && bridge_addr[31:12] == 20'h00F00) begin
-            part_late <= 1'b1;      // refused: bytes were already flowing. Reported, not fixed.
+            part_late <= 1'b1;      // refused. Reported, not fixed.
         end
     end
 
@@ -735,8 +740,7 @@ module aw_rom (
     // An entry names a physical page in 1..127. 0 is the directory and >=128 is die 1, so an
     // out-of-range entry is not "slightly wrong", it is the corrupted-table case the whole page-0
     // layout exists to make harmless: refuse the whole install and go back to identity.
-    wire dir_val_ok   = (rd_q[7:0] >= 8'd1) && (rd_q[7:0] <= 8'd127);
-    assign dir_install = dir_captured && (dir_ph >= 7'd5) && dir_val_ok;
+    assign dir_install = dir_captured && (dir_ph >= DIR_PH_ENT0);
     assign rom_dir_busy = dir_active | clr_active;
 
     always @(posedge clk_psram) begin
@@ -772,8 +776,9 @@ module aw_rom (
             dir_done           <= 1'b1;
             dir_to             <= 1'b0;
             dir_pend           <= 1'b0;
-            dir_ph             <= 7'd0;
-            dir_part           <= 3'd0;
+            dir_ph             <= 10'd0;
+            hdr_parts          <= 16'd0;
+            ent_bad            <= 8'd0;
             dir_stall          <= 18'd0;
             dir_err_code       <= 8'd0;
             hdr_lo             <= 16'd0;
@@ -781,7 +786,7 @@ module aw_rom (
             hxr_lo             <= 16'd0;
             cr_pool_sum        <= 32'd0;
             cr_pool_xor        <= 16'd0;
-            part_latched       <= 3'd0;
+            view_part          <= 3'd0;
             arm_ack            <= 1'b0;   // driven here; arm_req_s belongs to its own process
             dir_installed      <= 1'b0;
             clr_req            <= 1'b0;
@@ -819,16 +824,13 @@ module aw_rom (
                 dir_active    <= 1'b1;
                 dir_done      <= 1'b0;
                 dir_to        <= 1'b0;
-                dir_ph        <= 7'd0;
+                dir_ph        <= 10'd0;
                 dir_stall     <= 18'd0;
-                // The part comes from the FIFO if one is waiting, otherwise this is a re-read of
-                // the same part (a retry, or an upload that finished while the sweep was already
-                // armed) - never a silent fall back to part 0, which would replay part 1's intro
-                // under a menu that says part 4.
-                // part_held is READ here and cleared by its own process (a single driver per
-                // register, per the chk_cnt note below - the sequencer writing it as well is the
-                // multiple-constant-driver error Quartus elaborates on and Verilator never shows).
-                dir_part      <= part_held ? part_val : part_latched;
+                ent_bad       <= 8'd0;
+                // No part is chosen here, and that is the point. The sweep now reads all eight
+                // tables, so there is no "which part is this sweep for" to get wrong - not by a race,
+                // not by a stale latch, not by an arm that arrived on the wrong side of a reset. The
+                // live view is view_part, which only a part select changes.
                 st_seq        <= ST_SEQ_DIR;
                 st_s          <= ST_RD;
             end else if (cen_pend) begin
@@ -943,16 +945,19 @@ module aw_rom (
                         dir_ph <= dir_ph + 7'd1;
                         st_s   <= ST_RD;
                     end
-                end else if (dir_ph < 7'd5) begin
-                    // header words 12,13,14: sum.lo, sum.hi, xor.lo
+                end else if (dir_ph < DIR_PH_ENT0) begin
+                    // header word 5 then words 12,13,14: the declared part count, then sum.lo,
+                    // sum.hi, xor.lo. The count is what makes an absent part detectable rather than
+                    // merely empty, and it costs one read of a page the sweep is already sitting on.
                     case (dir_ph)
-                    7'd2:    hdr_lo <= rd_q;
-                    7'd3:    hdr_hi <= rd_q;
+                    10'd2:   hdr_parts <= rd_q;
+                    10'd3:   hdr_lo <= rd_q;
+                    10'd4:   hdr_hi <= rd_q;
                     default: hxr_lo <= rd_q;
                     endcase
-                    dir_ph <= dir_ph + 7'd1;
+                    dir_ph <= dir_ph + 10'd1;
                     st_s   <= ST_RD;
-                end else if (!dir_val_ok) begin
+                end else if (!ent_ok) begin
                     dir_active    <= 1'b0;
                     dir_done      <= 1'b1;
                     clr_req       <= 1'b1;
@@ -961,20 +966,27 @@ module aw_rom (
                     // (entry index + 6), so the printed number was wrong by six; and the reason used to
                     // be ORed into the same field as the index, so values collided with the no-magic
                     // and timeout codes.
-                    dir_err_code  <= 8'h80 | {2'b00, dir_ph[5:0] - 6'd5};
+                    dir_err_code  <= 8'h80 | {2'b00, ent_page};
                     dir_bad       <= 1'b1;
                     dir_installed <= 1'b0;
                     st_s          <= ST_IDLE;
-                end else if (dir_ph == 7'd68) begin
+                end else if (dir_ph == DIR_PH_LAST) begin
                     dir_active    <= 1'b0;
                     dir_done      <= 1'b1;
                     dir_err_code  <= 8'd0;
-                    dir_bad       <= 1'b0;
-                    dir_installed <= 1'b1;
-                    part_latched  <= dir_part;             // what the table now describes
+                    // The verdict is about the VIEW THE CORE IS ACTUALLY ON, which is a different
+                    // question from "is any of this image sane": a directory whose part 3 is
+                    // unsalvageable must not stop part 0 from booting, and a directory that is fine
+                    // except for the part somebody selected must absolutely stop it. Anything wrong
+                    // with another part shows up as that part's select being refused.
+                    // (Limitation, stated: err names the offending VIEW PAGE, not the part, because
+                    // the 8-bit code has 6 bits under the reason. The part is identifiable by which
+                    // selects get refused - bit 3 of G. Naming both would need the code widened.)
+                    dir_bad       <= ~part_ok[view_part];
+                    dir_installed <=  part_ok[view_part];
                     st_s          <= ST_IDLE;
                 end else begin
-                    dir_ph <= dir_ph + 7'd1;
+                    dir_ph <= dir_ph + 10'd1;
                     st_s   <= ST_RD;
                 end
             end
@@ -1001,8 +1013,8 @@ module aw_rom (
             // that samples on a toggle edge is always reading a settled value. "err[6]" is kept
             // rather than dropped - "sweep not served" and "entry 12 out of range" would otherwise
             // share one code, and they want different fixes.
-            if ({dir_installed, dir_bad, pool_ok, part_latched, dir_err_code} !== dir_stat) begin
-                dir_stat     <= {dir_installed, dir_bad, pool_ok, part_latched, dir_err_code};
+            if ({dir_installed, dir_bad, pool_ok, view_part, dir_err_code} !== dir_stat) begin
+                dir_stat     <= {dir_installed, dir_bad, pool_ok, view_part, dir_err_code};
                 dir_stat_tog <= ~dir_stat_tog;
             end
 
@@ -1311,7 +1323,16 @@ module aw_rom (
     // own change made dead, so it is mine to remove rather than to explain.
     reg  [19:0] p_addr;                                  // view word address of the next fetch
     localparam integer PGTBL_AW = 6;                     // 64 view pages of 32 KiB
-    reg  [7:0] pgtbl [0:(1<<PGTBL_AW)-1];                // view page -> physical 32 KiB page
+    localparam integer PGTBL_PARTS = 8;                  // directory records per image
+    localparam integer PGTBL_DEPTH = PGTBL_PARTS << PGTBL_AW;   // 512
+    // Eight tables, one per part, in ONE RAM addressed {part, view_page}. This is the level-based
+    // part select that task #28 needed, and the reason it had to be this shape is in the port log:
+    // every way of ARMING a re-read after a part select loses the request, because the launch holds
+    // rst_core through the upload and closes the window at the VM's first accepted byte. With all
+    // eight tables resident there is nothing to arm - the select changes a register and the very next
+    // fetch uses it. Cost: 448 extra M10K bits out of ~1100, and ~2 us more at boot for 512 reads
+    // instead of 64, against a census that walks 1,540,096 words.
+    reg  [7:0] pgtbl [0:PGTBL_DEPTH-1];                  // {part, view page} -> physical page
     // Power-up identity, and that is a safety property rather than tidiness: without it the RAM
     // starts as X in simulation and random config bits in hardware, and writing ONE entry (which
     // is all `tbl_loaded` used to signal) silently re-pointed the other 63 pages at page 0. tb_rom
@@ -1320,23 +1341,49 @@ module aw_rom (
     // changes exactly the pages it changes and the identity map is what an unloaded core does
     // rather than a special case bolted onto it.
     integer pgtbl_i;
-    initial for (pgtbl_i = 0; pgtbl_i < (1 << PGTBL_AW); pgtbl_i = pgtbl_i + 1)
-        pgtbl[pgtbl_i] = pgtbl_i[7:0];
+    // Identity for EVERY part, not just part 0: an unloaded core must map the same way whichever
+    // part number ends up in view_part, so a select can never turn an unloaded core into a paging
+    // core. The safety property is the same one tb_rom found (a partially written table re-pointed 63
+    // pages at page 0); it just now has to hold for all eight views.
+    initial for (pgtbl_i = 0; pgtbl_i < PGTBL_DEPTH; pgtbl_i = pgtbl_i + 1)
+        pgtbl[pgtbl_i] = pgtbl_i[PGTBL_AW-1:0];
     // Install writers, one mux, priority order stated because two of them can be simultaneously
     // true and the choice is a behaviour: the bench port first (it is the only thing that can test
     // a table the boot logic would reject), then the identity walk-back, then the sweep's entries.
     reg                  clr_active;                     // walk the whole table back to identity
-    reg  [5:0]           clr_i;
+    reg  [8:0]           clr_i;                          // 0..511: every part's table, not just one
     reg                  clr_req;                        // the sequencer's ask; owned by IT, and the
                                                          // only thing it may drive here (see below)
     wire                 dir_install;
     reg                  dir_active, dir_done, dir_to;
-    reg  [6:0]           dir_ph;                         // 0,1 = magic words; 2..65 = table entries
-    reg  [2:0]           dir_part;                       // part sampled at sweep start
+    // Sweep phases: 0,1 magic; 2 the part count; 3,4,5 the pool's declared sum.lo/sum.hi/xor.lo;
+    // then 512 table words = 8 parts x 64 view pages, finishing at DIR_PH_LAST.
+    localparam [9:0] DIR_PH_ENT0  = 10'd6;
+    localparam [9:0] DIR_PH_LAST  = DIR_PH_ENT0 + 10'd511;   // 6 + 512 - 1 = 517
+    reg  [9:0]           dir_ph;
     reg  [17:0]          dir_stall;
-    reg  [9:0]           dir_base;                       // first table word of dir_part, in words
+    reg  [9:0]           dir_base;                       // first table word of the part being read
+    // The entry cursor, derived from the phase rather than stored: one value, one place to read it.
+    wire [9:0] dir_e     = dir_ph - DIR_PH_ENT0;         // entry index 0..511
+    wire [2:0] ent_part  = dir_e[8:6];                   // which part's table this entry belongs to
+    wire [5:0] ent_page  = dir_e[5:0];                   // which view page it maps
+    reg  [15:0]          hdr_parts;                      // directory's declared part count (word 5)
+    reg  [2:0]           view_part;                      // the LIVE view; the read path's own clock
+    reg  [7:0]           ent_bad;                        // bit p: part p has an unusable entry
+    wire [3:0]  np       = (hdr_parts >= 16'd8) ? 4'd8 : hdr_parts[3:0];
+    wire [7:0]  exists_mask = 8'hFF >> (4'd8 - np);      // parts the image actually declares
+    wire        ent_exists  = ({5'd0, ent_part} < {4'd0, np});
+    // An entry is a physical page in 1..127 and nothing else: 0 is the directory block, >=128 is die
+    // 1, and a non-zero high byte means the word is not a page number at all.
+    wire        ent_inrng   = (rd_q[15:8] == 8'd0) && (rd_q[7:0] >= 8'd1) && (rd_q[7:0] <= 8'd127);
+    wire        ent_ok      = !ent_exists || ent_inrng;
+    // A part is usable when the image declares it and none of its entries was refused. Validated for
+    // all eight parts in the one sweep, which is what makes a select a level: by the time anyone can
+    // ask, the answer for every part is already in a register.
+    wire [7:0]  ent_bad_nxt = ent_bad | (ent_exists && !ent_inrng ? (8'b1 << ent_part) : 8'b0);
+    wire [7:0]  part_ok     = ~ent_bad_nxt & exists_mask;
     always @(*) begin
-        case (dir_part)
+        case (ent_part)
             3'd0:      dir_base = 10'd16;
             3'd1:      dir_base = 10'd88;
             3'd2:      dir_base = 10'd160;
@@ -1356,12 +1403,12 @@ module aw_rom (
     // xor's high half - is deliberately NOT read: see cr_pool_xor, where both sides of that comparison
     // are provably 16 bits wide, so reading a fifth word to compare two zeros is dead logic that an
     // audit has to flag and a reader has to re-derive.
-    wire [9:0] dir_word = (dir_ph <= 7'd1) ? {3'b0, dir_ph[6:0]}
-                              : (dir_ph <= 7'd4) ? (10'd10 + {3'b0, dir_ph[6:0]})
-                              : (dir_base + {3'b0, dir_ph[6:0]} - 10'd5);
+    wire [9:0] dir_word = (dir_ph <= 10'd1) ? {7'b0, dir_ph[2:0]}
+                              : (dir_ph <= 10'd5) ? (10'd9 + {7'b0, dir_ph[2:0]})
+                              : (dir_base + {4'b0, ent_page});
 
     reg  [7:0]           tbl_rdat;                       // synchronous (M10K) read result
-    reg  [PGTBL_AW-1:0]  tbl_rdat_idx;                   // ... and which page it belongs to
+    reg  [2+PGTBL_AW:0]  tbl_rdat_idx;                   // ... and which {part, page} it belongs to
     reg                  tbl_loaded;                     // 0 = identity, a single plain pack
 
     // Writing while the producer reads is not expected (a load happens with the VM in reset and
@@ -1381,20 +1428,27 @@ module aw_rom (
             clr_active   <= 1'b0;
             clr_i        <= 6'd0;
         end else begin
-            tbl_rdat     <= pgtbl[p_view_page];
-            tbl_rdat_idx <= p_view_page;
+            tbl_rdat     <= pgtbl[{view_part, p_view_page}];
+            tbl_rdat_idx <= {view_part, p_view_page};
             if (tbl_wr) begin
-                pgtbl[tbl_widx] <= tbl_wval;
+                // The bench port writes part 0's table and nothing else. Stated because it is a
+                // behaviour, not an accident: tb_rom pokes single entries to test paging, and view_part
+                // is 0 until a directory select says otherwise, so "part 0" is the table under test.
+                pgtbl[{3'd0, tbl_widx}] <= tbl_wval;
                 tbl_loaded      <= 1'b1;
             end else if (clr_active) begin
-                pgtbl[clr_i] <= {2'b0, clr_i};
-                if (clr_i == 6'd63) clr_active <= 1'b0;
-                else                clr_i <= clr_i + 6'd1;
+                pgtbl[clr_i] <= clr_i[PGTBL_AW-1:0];
+                if (clr_i == 9'd511) clr_active <= 1'b0;
+                else                clr_i <= clr_i + 9'd1;
             end else if (clr_req) begin
                 clr_active <= 1'b1;
                 clr_i      <= 6'd0;
             end else if (dir_install) begin
-                pgtbl[dir_ph[5:0] - 6'd5] <= rd_q[7:0];
+                // A part the image does not declare is written back to IDENTITY rather than left as
+                // whatever an earlier image installed there: the table must describe the bytes that
+                // are actually in the chip right now, and "we stopped writing" would leave a stale
+                // map that part_ok only accidentally protects.
+                pgtbl[{ent_part, ent_page}] <= ent_exists ? rd_q[7:0] : ent_page;
                 tbl_loaded <= 1'b1;
             end
         end
@@ -1413,7 +1467,11 @@ module aw_rom (
     // anyway - and a table load happens with the stream idle and takes at least 64 cycles, so the
     // pipeline is long settled before the VM asks for anything. Stated because "it works out" is
     // not something a reader should have to re-derive at 2 a.m.
-    wire       page_ready = (tbl_rdat_idx == p_view_page);
+    // The {part, page} tag is compared, not just the page: a select that lands between a table read
+    // and the fetch that would use it drops page_ready, so the fetch re-reads under the new view
+    // instead of serving the old part's bytes. That is the whole race, closed by making the tag
+    // include what the select changes.
+    wire       page_ready = (tbl_rdat_idx == {view_part, p_view_page});
     wire [7:0] page_phys  = tbl_rdat;
 
     // The self-test read preempts while presented (one access every ~444 us); the
@@ -1643,6 +1701,21 @@ module aw_rom (
             default: p_state <= P_IDLE;
             endcase
         end
+    end
+
+    // The live view, in clk_psram - the clock of the read path that consumes it. A select is
+    // therefore not a message to anyone: it is a change of state that the next table read sees, with
+    // no handshake to lose and no reset window to fall into.
+    //
+    // Before the first verdict (dir_installed=0) any part number is accepted, because nothing can
+    // read yet - rom_ready is low until the boot check passes, and the check needs an installed
+    // table - and the sweep that follows validates whatever was asked for. After a verdict, only a
+    // part whose table passed is accepted; the rest are refused and reported, which is the same
+    // "reported, not fixed" contract as a select that arrived after the first byte.
+    always @(posedge clk_psram) begin
+        if (rst_psram)               view_part <= 3'd0;
+        else if (part_rv && (p_state == P_WAIT) && (!dir_installed || part_ok[part_fw]))
+            view_part <= part_fw;
     end
 
     // The one-way gate on part requests. Once the VM has taken a byte, re-pointing the page table
