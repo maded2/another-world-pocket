@@ -2571,3 +2571,40 @@ from the field path is not evidence about the field path.
 part-0 paged PASS is partly vacuous on that axis (part 0 is the default map, so it would pass with
 the select mechanism absent entirely). Console fields, uploads >2 MiB and everything else on hardware
 remain #15/#23.
+
+### Addendum, same day: two select fixes tried and reverted, and one bug I invented (#28)
+
+Neither patch is in the tree. `aw_rom.v` is byte-identical to `b3949d4`, so the paged identity above
+(`2cd7da63239ed8d7`, 0.394 / 0.105 ns, scoped audit clean) still describes HEAD.
+
+1. **Toggle an arm request on the select.** `arm_t=1` psram-side, `parm_cs=000` core-side, no
+   `arm_pending`, no sweep: the edge happens while `rst_core` is asserted, so it never exists to the
+   consumer. `tb_dir` was green on it, and that green was worthless — `tb_dir` has `rst_core` released
+   long before the select and a launch does not.
+2. **Held level (`part_req`) plus `arm_pending` that survives reset.** The core *does* see it
+   (`part_req=1`, `part_req_cs=011`, `streamed_c=00`) and `pend` still stays 0, because `arm_pending`
+   is only ever **set** in the not-in-reset branch. After reset releases, the boot check passes,
+   `rom_ready` rises and the VM's first accepted byte shuts the `~streamed_c` window. (Sub-finding: a
+   request cleared by the shared `arm_ack` must let the set win, or a commit landing in the ack window
+   is erased on the cycle it is raised.)
+
+**Conclusion, and it is a design conclusion, not a debugging one:** the only arm that can land before
+the VM's first byte is the mid-upload `pack_written` one, which necessarily runs before any part
+select can arrive. So the part must be selectable **without an event**: load all eight tables in the
+one boot sweep and index them by a `view_part` register in `clk_psram` — the read path's own clock,
+so there is no crossing and nothing to lose. Task #28 carries the design and the next rebuild.
+
+**The bug I invented, and why the discipline mattered** #not-proven → #verification
+A paged run began failing `pool_ok` with every term printed true
+(`census_done=1 dir_installed=1 dir_bad=0 sum_eq=1 xor=be39/be39`, `rom_pool_ok=0`). I theorised a
+stranded source-data+toggle crossing, wrote replacement RTL, and it *still* read `000`. Printing the
+producer's wire beside the consumer's copy showed `pool_ok=1 rom_pool_ok=0`: the verdict was right and
+the crossing was still in flight — `pool_ok` becomes true at the census end, which is exactly the
+cycle the check sampled it. With a settle it reads 1 and the run passes; the earlier PASS had simply
+finished its census long before the check, and that timing difference was the only variable. **My
+theory explained neither the passing run nor the failing one**, which is the test it failed. RTL
+reverted, bench fixed in `bb21ab5`.
+
+Gates at this point: `make sim` green (tb_write, tb_keys 13, tb_rom 550 + tripwire, tb_iv 24,
+tb_reset_gen, tb_dbg_console, tb_top); `tb_dir` 6 runs / 179 checks; paged part 0 PASS (`96841`
+compared bytes vs `part0.bin`, `30592 fill writes / 0 shifted`, PSRAM byte-exact 1540096 words).
