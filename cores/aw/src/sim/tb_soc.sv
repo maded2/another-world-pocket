@@ -320,17 +320,23 @@ reg design_run = 1'b0;
     reg        watch_on = 1'b0;
     reg [63:0] watch_t  = 0;
     reg [5:0]  prev_ps, cur_ps;
+    reg [15:0] prev_inst, cur_inst;
     always @(posedge clk_core) begin
         prev_ps <= {u_rom.arm_pending, u_rom.arm_req, u_rom.dir_pend,
                     u_rom.dir_active, u_rom.part_held, u_rom.streamed_q};
+        prev_inst <= {u_rom.dir_part, u_rom.part_latched, u_rom.dir_installed, u_rom.dir_bad,
+                      u_rom.dir_err_code};
         watch_t <= watch_t + 64'd1;
         if (watch_on) begin
             cur_ps = {u_rom.arm_pending, u_rom.arm_req, u_rom.dir_pend,
                       u_rom.dir_active, u_rom.part_held, u_rom.streamed_q};
-            if (cur_ps != prev_ps) begin
-                $display("  SWEEP t=%0t pend=%b req=%b dpnd=%b act=%b held=%b streamed=%b | dir_part=%0d latched=%0d valid=%b | phase=%0d ack=%b ack_s=%b req_s=%b",
+            cur_inst = {u_rom.dir_part, u_rom.part_latched, u_rom.dir_installed, u_rom.dir_bad,
+                        u_rom.dir_err_code};
+            if ((cur_ps != prev_ps) || (cur_inst != prev_inst)) begin
+                $display("  SWEEP t=%0t pend=%b req=%b dpnd=%b act=%b held=%b streamed=%b | dir_part=%0d latched=%0d inst=%b bad=%b err=%02h | phase=%0d ack=%b ack_s=%b req_s=%b",
                          $time, cur_ps[5], cur_ps[4], cur_ps[3], cur_ps[2], cur_ps[1], cur_ps[0],
-                         u_rom.dir_part, u_rom.part_latched, u_rom.dir_installed,
+                         u_rom.dir_part, u_rom.part_latched, u_rom.dir_installed, u_rom.dir_bad,
+                         u_rom.dir_err_code,
                          u_rom.arm_phase, u_rom.arm_ack, u_rom.arm_ack_s, u_rom.arm_req_s);
                 $fflush;
             end
@@ -1304,7 +1310,13 @@ reg design_run = 1'b0;
             // both copies of the part number are the only things that can say which stage dropped it.
             $display("tb_soc: after select %0d: fifo_empty=%b p_state=%0d part_val=%0d part_held=%b | arm_pending=%b dir_active=%b dir_part=%0d part_latched=%0d",
                      part_sel, u_rom.part_empty, u_rom.p_state, u_rom.part_val, u_rom.part_held,
-                     u_rom.arm_pending, u_rom.dir_active, u_rom.dir_part, u_rom.part_latched); $fflush;
+                     u_rom.arm_pending, u_rom.dir_active, u_rom.dir_part, u_rom.part_latched);
+            // arm_ack/streamed are printed because the launch-path diagnosis needs them: the request
+            // level was proven visible in the core (part_req_cs=011) with streamed_c=00 and still no
+            // arm_pending, because arm_pending is only ever SET in the not-in-reset branch, and after
+            // reset releases the VM's first byte closes the window. Logs/soc-paged-p1fix3.log.
+            $display("tb_soc: request line: arm_ack=%b streamed_q=%b streamed_c=%b",
+                     u_rom.arm_ack, u_rom.streamed_q, u_rom.streamed_c); $fflush;
         end
         @(negedge clk_bridge); dataslot_allcomplete <= 1;
         @(negedge clk_bridge); dataslot_allcomplete <= 0;
@@ -1397,6 +1409,21 @@ reg design_run = 1'b0;
             begin
                 int gc; gc = 0;
                 while (!u_rom.census_done && gc < 8000000) begin @(posedge clk_core); gc = gc + 1; end
+                $display("tb_soc: pool_ok terms: census_done=%b dir_installed=%b dir_bad=%b sum_eq=%b xor=%04h/%04h",
+                         u_rom.census_done, u_rom.dir_installed, u_rom.dir_bad,
+                         (u_rom.cr_pool_sum == {u_rom.hdr_hi, u_rom.hdr_lo}),
+                         u_rom.cr_pool_xor, u_rom.hxr_lo);
+                // Settle, then look. pool_ok is combinational in the ROM and reaches this side through
+                // a clock crossing, and the census end is exactly the instant it becomes true - reading
+                // rom_pool_ok on that same cycle reports 0 about a verdict that is already correct a
+                // few cycles later. That is what produced "FAIL - the core's pool sum does not match"
+                // with every term printed true, and it is the same trap tb_dir guards with an explicit
+                // settle: a crossing has latency, and an assertion does not wait for latency it never
+                // asked for. The passing run had finished its census long before the check, which is
+                // the only reason the two runs differed.
+                repeat (200) @(negedge clk_core);
+                $display("tb_soc: after settle: pool_ok_wire=%b rom_pool_ok=%b dir_valid=%b dir_bad=%b",
+                         u_rom.pool_ok, pool_ok_w, dir_valid_w, dir_bad_w);
                 $display("tb_soc: census done=%b after %0d more core cycles; measured=%08h declared=%08h pool_ok=%b",
                          u_rom.census_done, gc, u_rom.cr_pool_sum,
                          {u_rom.hdr_hi, u_rom.hdr_lo}, pool_ok_w); $fflush;

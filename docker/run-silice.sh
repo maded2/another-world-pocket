@@ -90,7 +90,11 @@ fi
 # PART is shared: scripts/ref_sim.sh has used it for years as the reference-run part index, and
 # scripts/sim_soc.sh now reads it as "which part to select before the VM's first byte". Both are
 # integer part indices; if they ever mean different things, one of them gets renamed.
-for _v in TRACE READTRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS EXTRA WORK STALL FRAMEDIR PACK_KIND IMG; do
+# LATESEL_TEST opts tb_dir's run 7 in or out of the default sequence, and run 7 is the evidence for
+# task #28, so a dropped LATESEL_TEST silently turns "the late-select case was checked and passed"
+# into "the case was not run" while the suite still prints its usual PASS. Same failure shape as IMG
+# above, which is why it is on this list on the same day it was needed.
+for _v in TRACE READTRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS EXTRA WORK STALL FRAMEDIR PACK_KIND IMG LATESEL_TEST; do
     [ -n "${!_v:-}" ] && docker_args+=(-e "$_v")
 done
 
