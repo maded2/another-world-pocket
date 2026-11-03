@@ -145,6 +145,12 @@ module tb_dir;
     // depend on an edge surviving reset is to read ALL parts' tables at upload and choose the part at
     // read time - 8*64 table words is nothing in M10Ks, and then a select is a level, not an event.
     int       latesel   = 0;
+    // +PARTBAD: an out-of-range entry in a part NOBODY IS ON. Eight tables means the blast radius of
+    // a corrupt entry is one part, which is a claim about behaviour and therefore needs its own run:
+    // the boot must go ahead, the corruption must still be reported, the corrupt part must be
+    // unselectable, and a healthy part must remain selectable afterwards (that last one is what
+    // distinguishes "that part is refused" from "the machinery wedged").
+    int       partbad   = 0;
 
     initial begin
         void'($value$plusargs("PACE=%d", pace));
@@ -154,6 +160,7 @@ module tb_dir;
         poolrun = $test$plusargs("POOLSUM");
         badent  = $test$plusargs("BADENT");
         latesel = $test$plusargs("LATESEL");
+        partbad = $test$plusargs("PARTBAD");
         if (!$value$plusargs("PACK=%s", pack_hex))
             $fatal(1, "tb_dir: +PACK=<pack.hex> is required");
         $readmemh(pack_hex, ref_mem);
@@ -485,6 +492,34 @@ module tb_dir;
             write_dir_high;                // view 40..62 -> physical 64..85, and 62 -> 127
             rearm("high pages mapped");
             expect_status(1, 0, 0, "map onto pages above the old limit installed");
+        end else if (partbad) begin
+            // Part 3's entry 5 set to 0 while the core sits on part 0. Page 0 is the directory, so 0
+            // is not a page any view may point at - but it is part 3's problem, not part 0's.
+            write_dir;
+            put_words(16 + 3*72 + 5, 16'd0, 16'd7);
+            rearm("part 3 entry 5 out of range, part 0 clean");
+            expect_status(1, 0, 0, "a bad entry in another part still boots this one");
+            if (dir_err !== (8'h80 | 8'd5)) begin
+                $display("  FAIL the refused page is not named: err=%02h, wanted %02h",
+                         dir_err, (8'h80 | 8'd5)); errors++;
+            end
+            checks++;
+            if (dir_bad) begin
+                $display("  FAIL the whole directory was refused over one other part's entry"); errors++;
+            end
+            checks++;
+            // The corrupt part must be refused...
+            bridge_write32(32'h00F0_0000 + 3*4, 32'h0000_0001);
+            settle("select of the part with the corrupt entry");
+            expect_status(1, 0, 0, "the corrupt part is unselectable and the view stays put");
+            if (!part_late) begin
+                $display("  FAIL refusing a corrupt part was not reported (part_late=0)"); errors++;
+            end
+            checks++;
+            // ...and a healthy one must not be, or the run would equally be proving a wedge.
+            bridge_write32(32'h00F0_0000 + 1*4, 32'h0000_0001);
+            settle("select of a healthy part after refusing a corrupt one");
+            expect_status(1, 0, 1, "a healthy part is still selectable");
         end else if (badent) begin
             // Entry 2 of part 0 set to 0. Page 0 is the directory, so 0 is not a page any view may
             // point at; the sweep must stop, walk the table back, name the entry, and - because

@@ -84,7 +84,7 @@ echo "=== run 5: the core checks the pool against the sum the image declares, an
 ./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +POOLSUM
 rc_e=$?
 
-echo "=== run 6: an out-of-range entry refuses the whole table and names the entry ==="
+echo "=== run 6: an out-of-range entry in the viewed part refuses it and names the entry ==="
 ./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +BADENT
 rc_f=$?
 
@@ -98,6 +98,10 @@ echo "=== run 7: a part select that lands AFTER the boot sweep still installs it
 ./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +PART=1 +LATESEL
 rc_g=$?
 
-rc=$(( rc_a + rc_b + rc_c + rc_d + rc_e + rc_f + rc_g ))
+echo "=== run 8: a corrupt entry in SOMEBODY ELSE's part - boots, reports, and refuses that select ==="
+./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +PART=1 +PARTBAD
+rc_h=$?
+
+rc=$(( rc_a + rc_b + rc_c + rc_d + rc_e + rc_f + rc_g + rc_h ))
 [ "$rc" -eq 0 ] || echo "tb_dir: run1=$rc_a run2=$rc_b run3=$rc_c run4=$rc_d run5=$rc_e run6=$rc_f run7=$rc_g"
 exit $rc
