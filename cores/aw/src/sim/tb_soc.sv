@@ -794,6 +794,20 @@ reg design_run = 1'b0;
     integer  txt_strips = 0, txt_writes = 0, txt_drift = 0, txt_val = 0, txt_rewind = 0;
     integer  txt_last_row = 0, txt_f0 = 0, txt_f1 = 0;
     integer  txt_src = 0, txt_cmis = 0;      // source byte of the strip, content mismatches
+    // Where the strip monitor ENDS a strip, and this is a fix rather than a tuning knob. A strip is
+    // one op_drawString run: addresses increase by one per stream byte, so the model is
+    // dst = base + k + constant. Part 6 draws a full-screen picture, which is 64,000 consecutive pixel
+    // writes with no gap longer than TXT_GAP - so the monitor held one "strip" across a screen wrap,
+    // and reported drift=64000 (exactly one screen) plus 38,285 content mismatches for the second
+    // screen. The first screen passed clean (drift=0, value=0, content=0 for 64,000 writes), the
+    // per-byte stream oracle said 0 wrong bytes, and the plain and paged runs produced the IDENTICAL
+    // count - so what was broken was the monitor's scope, not the port. See task #29.
+    //
+    // A destination address that DECREASES is the boundary: within a screen, pixel writes are
+    // monotonic. What this can no longer catch, stated plainly: a strip that ends by jumping BACKWARD
+    // mid-screen would now be counted as two clean strips instead of one drifting one. Drift inside a
+    // screen - the shear this monitor exists to find - is still checked.
+    integer  txt_prev_dst = -1;
     integer  txt_acc = 0;                    // acceptances seen inside the current strip
     integer  txt_k = 0;                      // bytes the VM has consumed since the strip began
     reg [7:0] txt_data_d = 8'h0;
@@ -813,10 +827,12 @@ reg design_run = 1'b0;
                          bytes_to_vm - txt_k0, mem_addr, txt_src, txt_src + (bytes_to_vm - txt_k0));
         end
         if (tr_vm_pix_we) txt_gap = 0; else txt_gap = txt_gap + 1;
-        if (tr_vm_pix_we && (!txt_in_strip || txt_gap > TXT_GAP)) begin
+        if (tr_vm_pix_we && (!txt_in_strip || txt_gap > TXT_GAP
+                             || (txt_prev_dst >= 0 && u_soc._w_vm_pix_waddr < txt_prev_dst))) begin
             // first write of a strip: the address jumps here, so nothing to compare yet
             txt_in_strip = 1;
             txt_base     = u_soc._w_vm_pix_waddr;
+            txt_prev_dst = u_soc._w_vm_pix_waddr;
             txt_k0       = bytes_to_vm;
             txt_src      = stream_base;   // the acceptance this strip's bytes come from
             // Byte 0 is compared here as well: this branch is the first write's cycle, and the
@@ -852,6 +868,7 @@ reg design_run = 1'b0;
                                  txt_k, off, txt_off, rewinds);
                 end
             end
+            txt_prev_dst = u_soc._w_vm_pix_waddr;
             txt_last_row = (u_soc._w_vm_pix_waddr - txt_base) / 320;
             // CONTENT, which the address check cannot do: the VM writes byte k of this strip at
             // base+k, so the byte itself has to be the pack's byte at src+k. A stream restart
