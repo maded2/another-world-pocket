@@ -2608,3 +2608,61 @@ reverted, bench fixed in `bb21ab5`.
 Gates at this point: `make sim` green (tb_write, tb_keys 13, tb_rom 550 + tripwire, tb_iv 24,
 tb_reset_gen, tb_dbg_console, tb_top); `tb_dir` 6 runs / 179 checks; paged part 0 PASS (`96841`
 compared bytes vs `part0.bin`, `30592 fill writes / 0 shifted`, PSRAM byte-exact 1540096 words).
+
+---
+
+## 2026-11-04 — the part select is a level: eight tables at boot, indexed at read time (#28)
+
+`aw_rom` now loads **all eight parts' page tables** during the one boot sweep (512 directory words
+instead of 64) and the read path chooses between them with a `clk_psram` register, `view_part`. There
+is nothing to arm, so there is nothing for `rst_core` to swallow and nothing for the VM's first
+accepted byte to shut out — the two traced failure modes that made `part>0` unreachable yesterday.
+Cost: 448 M10K bits of the ~1100 available, ~2 µs more at boot against a census that walks 1,540,096
+words, and **no measurable timing cost** (fast-model hold 0.122 ns, up from 0.105).
+
+**What is demonstrated** #green
+* `+PART=1`: `dir_valid=1 bad=0 part=1 err=00`, `pool_ok=1`, PSRAM byte-exact 1,540,096 words, and the
+  VM draws **part 1's intro** — 57 non-black / 53 rich frames, best 10 colours — while **42,632
+  compared bytes match `part1.bin`**, `30336 fill writes / 0 shifted -> PASS`. The old signature for a
+  wrong part (`bytes_to_vm` frozen at 3392, `addr=200085` off the end of the view, starving climbing
+  250 k/10 ms) is gone.
+* `+PART=3`: `part=3`, 48 rich frames, `11330 fill writes / 0 shifted -> PASS` — so it is not a
+  part-0-and-1 coincidence.
+* `tb_dir` **8 runs / 210 checks, 0 errors**. Run 7 (`+LATESEL`, a select landing *after* the boot
+  sweep) is back in the default sequence and passes with `after 0`: the select lands and the next fetch
+  sees it. Run 6's title changed, because the claim changed.
+* `make sim` green: `tb_write`, `tb_keys` 13, `tb_rom` 550 + tripwire, `tb_iv` 24, `tb_reset_gen`,
+  `tb_dbg_console`, `tb_top`.
+
+**Behaviour, not incident** #decision
+* **Identity for every part** at power-up, so an unloaded core maps the same whichever part number is
+  in `view_part` — a select can never turn an unloaded core into a paging core.
+* **The table read tag is `{part, page}`, not `page`.** A select landing between a table read and the
+  fetch that would use it drops `page_ready`, so the fetch re-reads under the new view instead of
+  serving the old part's bytes. That one tag is the whole race.
+* **The verdict is per part.** A directory whose part 3 is unsalvageable must not stop part 0 booting;
+  a directory that is fine except for the part somebody *did* select absolutely must. A select of an
+  unusable part is refused at the decode and reported (`G` bit 3). Run 8 covers the arc: boots,
+  reports `err=85`, refuses part 3, and **still lets part 1 in** — the last check is what separates a
+  refusal from a wedge.
+* **A part the image does not declare** (header word 5, one extra read of a page already being swept)
+  is written back to identity rather than left holding whatever a previous image installed there.
+* **`dir_part` and `part_latched` are deleted, not zeroed.** There is no longer a "which part is this
+  sweep for" to get wrong, and a register that can only hold its reset value is a `check-build` finding
+  waiting to happen.
+
+**`check-build` earned its keep twice** #verification
+1. `ent_bad[0]` stuck at GND — I had folded the set into the combinational `ent_bad_nxt` that the
+   verdict reads and never stored it, so the per-part mask could never be set *and* the inherited
+   abort-on-first-bad-entry punished the good parts. **A mask that cannot be set is not a mask.**
+2. `pgtbl_rtl_0_bypass[33]` stuck at GND — the table was a byte wide with seven bits of information,
+   because physical pages are 1..127 (bit 7 is the die select, die 1 reserved). Now a 7-bit RAM, which
+   makes the die-0 rule **structural** instead of something a validator happens to enforce.
+
+**Identity** #identity bitstream `build/aw/bitstream.rbf_r` sha **`69b52b107ffff27c`** (superseding
+`b7e4190f089cde9f`, built with the dead mask; and before that the single-table paged build
+`2cd7da63239ed8d7`). 0 errors, 0 critical warnings; slow-model setup 0.919 ns / hold 0.275 ns,
+fast-model setup 0.394 ns / hold 0.122 ns; scoped `check-build CORE_DIR=cores/aw` clean — no dead
+logic, every SDC constraint matched. **Nothing on this line has been in a Pocket**: `AW 1042`
+(`579746d33d45b594`) is still the only bitstream ever installed, and the hardware questions stay #15
+(does a 2.94 MiB dataslot upload arrive at all) then #23.

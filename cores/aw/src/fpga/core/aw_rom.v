@@ -1391,11 +1391,23 @@ module aw_rom (
     reg  [5:0]           bad_page;                       // last view page refused, for the console
     wire [3:0]  np       = (hdr_parts >= 16'd8) ? 4'd8 : hdr_parts[3:0];
     wire [7:0]  exists_mask = 8'hFF >> (4'd8 - np);      // parts the image actually declares
-    wire        ent_exists  = ({5'd0, ent_part} < {4'd0, np});
+    // (declared here because ent_exists and ent_ok below read it; see the wrap note further down.)
+    wire in_entries = dir_captured && (dir_ph >= DIR_PH_ENT0);
+    wire        ent_exists  = in_entries && ({5'd0, ent_part} < {4'd0, np});
     // An entry is a physical page in 1..127 and nothing else: 0 is the directory block, >=128 is die
     // 1, and a non-zero high byte means the word is not a page number at all.
     wire        ent_inrng   = (rd_q[15:8] == 8'd0) && (rd_q[7:0] >= 8'd1) && (rd_q[7:0] <= 8'd127);
-    wire        ent_ok      = !ent_exists || ent_inrng;
+    // Parenthesised-in-spirit, written flat so the reading is unambiguous: outside the entry region
+    // nothing is an entry and therefore nothing can be a BAD entry. The && / || precedence here is the
+    // same shape as the bug it prevents, and I do not want the next reader to have to work it out.
+    wire        ent_ok      = (!in_entries) || (!ent_exists) || ent_inrng;
+    // Only ever evaluate an entry OUTSIDE THE ENTRY REGION, and this line is a bug fix, not style:
+    // dir_e is dir_ph - 6 on an UNSIGNED 10-bit wire, so in the header phases and in idle it wraps to
+    // 1018..1023, ent_part becomes (1018>>6)&7 = 7, and the verdict then reads whatever happened to be
+    // on rd_q as part 7's entry. If that word was not a page number - which idle usually guarantees -
+    // ent_bad_nxt bit 7 was set continuously and a part 7 SELECT WAS REFUSED ON A NUMBER THAT WAS NEVER
+    // READ. Parts 0..6 are unreachable by that wrap, which is exactly why they all worked and only
+    // part 7 failed, and why "test every part" is not a completeness nicety.
     // A part is usable when the image declares it and none of its entries was refused. Validated for
     // all eight parts in the one sweep, which is what makes a select a level: by the time anyone can
     // ask, the answer for every part is already in a register.
