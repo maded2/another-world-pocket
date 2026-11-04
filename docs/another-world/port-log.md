@@ -2666,3 +2666,58 @@ fast-model setup 0.394 ns / hold 0.122 ns; scoped `check-build CORE_DIR=cores/aw
 logic, every SDC constraint matched. **Nothing on this line has been in a Pocket**: `AW 1042`
 (`579746d33d45b594`) is still the only bitstream ever installed, and the hardware questions stay #15
 (does a 2.94 MiB dataslot upload arrive at all) then #23.
+
+---
+
+## 2026-11-04 — long-run A/B: the paged view does not change restart behaviour (#19), and `drift=0` was never evidence (#29)
+
+### Part 1 to frame ~742, paged against plain, same session, same RTL
+
+| | plain (identity map) | paged (part 1's table) |
+|---|---|---|
+| frames / non-black / rich | 755 / 724 / 720 | 756 / 719 / 715 |
+| bytes to VM / compared vs `part1.bin` | 1,158,981 / 1,156,838 | 1,153,793 / 1,151,650 |
+| restarts, all mid-acceptance | **31** | **31** |
+| fill writes | 954,775 / **0 shifted** | 950,173 / **0 shifted** |
+| frame swaps (last) | 314 (742) | 308 (742) |
+| verdict | PASS | PASS |
+
+Why this is the right comparison: the freeze was never about *whether* a restart happens — it is about
+where the consumer's pointer ends up afterwards. 1041's policy reproduced the failure at exactly this
+scale (last page swap frame 553, **56 shifted fill writes**), and 1042 cleared it (655 frames, 0 of
+676k shifted). Both runs here go **past** frame 553, both take the same 31 restarts, and **neither
+shifts a single write out of ~950,000**, so paging neither causes nor masks the defect at the scale
+where it appears. The paged run delivers ~0.4% fewer bytes and 6 fewer swaps: the census owns the chip
+for part of the run, so bytes arrive slightly slower — expected, and the reason the comparison is done
+in one session rather than against old numbers. #green
+
+### Part 6 was the strip monitor's scope, not the port (#29)
+`TEXT drift=64000 content=38285` in **one "strip" of 128,000 writes**: part 6 draws a full-screen
+picture, the monitor held one `op_drawString` strip across a **screen wrap**, and scored the second
+screen as drift. The first 64,000 writes were clean, the per-byte oracle said 0 wrong bytes, and plain
+and paged produced the **identical** 102,285-error count — that equality was the diagnosis: the pager
+was neither cause nor cover. Fix: a strip ends where the destination address decreases (pixel writes
+are monotonic inside a screen). Part 6 then passes — plain 586,833 compared bytes / 0 shifted, paged
+373,693 / 0 shifted.
+
+**The part that matters more than the fix:** every `TEXT DRIFT` line in the entire history of
+`build/logs` is at write **64001+**, i.e. a wrap. The drift term has **never fired for a real reason**,
+so `drift=0` is not a health certificate — it means "no destination decrease and no per-write offset
+change inside a strip". The oracle that actually caught the shear is the **fill-buffer shifted-writes
+count** (1041: 56; 1042: 0 of 676k), and the freeze was confirmed on hardware. Recorded in the bench.
+Negative control, because a relaxed check must be shown to still bite: VM on part 6's view with
+`ref_mem` from `part5.bin` → `content=128001`, **471,083 errors → FAIL**. And stated: a strip ending by
+jumping backward **mid-screen** now counts as two clean strips instead of one drifting one.
+
+### Part 5's pad check: explained, deliberately not "fixed"
+The three failures are `none`, `right`, `left` while `up`/`down`/`fire` reflect fine — and the *first*
+pattern (`none`, nothing driven) already reads `ud=-1 mask=8` in the game's own pad variables. The check
+asserts that the **game's variables** mirror the port; in a scripted scene the game writes those
+variables itself, so the assertion is scene-dependent by construction. The input path is proven by the
+other seven parts. Preferred fix (task #30): assert the port's value reaches the VM's **input
+register**, not the game's variables. Not deleting it, and not relaxing it silently — that rule exists
+because the boot banner once lied for two releases.
+
+Gates: `tb_dir` 8 runs / 210 checks; `make sim` green. Bench-only changes since `f01a4ad0a9b2f358`, so
+that identity still describes HEAD. Nothing paged has been in a Pocket; `AW 1042`
+(`579746d33d45b594`) is still the only bitstream installed, and the hardware order is #15 → #21 → #23.
