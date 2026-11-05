@@ -1444,6 +1444,9 @@ reg design_run = 1'b0;
                 $display("tb_soc: census done=%b after %0d more core cycles; measured=%08h declared=%08h pool_ok=%b",
                          u_rom.census_done, gc, u_rom.cr_pool_sum,
                          {u_rom.hdr_hi, u_rom.hdr_lo}, pool_ok_w); $fflush;
+                $display("tb_soc: census terms: dir_done=%b dir_active=%b cen_pend=%b active=%b cw_max=%0h census_last=%0h allc=%b",
+                         u_rom.dir_done, u_rom.dir_active, u_rom.cen_pend,
+                         u_rom.census_active, u_rom.cw_max, u_rom.census_last, dataslot_allcomplete); $fflush;
             end
             if (!pool_ok_w) begin
                 errors = errors + 1;

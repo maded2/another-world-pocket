@@ -236,6 +236,24 @@ def verify(image_path, packs, quiet=False):
     if word_xor(pool) != img["pool_xor"]:
         errs.append("pool word xor is %08x, directory says %08x"
                     % (word_xor(pool), img["pool_xor"]))
+    # The core's pool sum covers every page it was given except page 0 - it does not read pool_bytes.
+    # So the declared sum and the measured sum describe the same bytes ONLY while the pool is a whole
+    # number of pages starting at frames_base and nothing follows it in the file. That is what
+    # "nframes x PAGE" states, and what the per-frame padding above guarantees. If a future builder
+    # packs frames tighter, moves frames_base, or appends anything after the pool, the two sums stop
+    # meaning the same thing and every image reads bad on hardware while being perfectly good - so it
+    # fails here, in Python, with a sentence about it, rather than on a Pocket.
+    if img["pool_bytes"] != img["nframes"] * PAGE:
+        errs.append("pool_bytes %d != nframes %d x PAGE %d: the core sums pool_bytes/2 words from page 1,"
+                    " so it would measure a different range than this sum covers"
+                    % (img["pool_bytes"], img["nframes"], PAGE))
+    if img["pool_bytes"] % 2:
+        errs.append("pool_bytes %d is odd; the core sums 16-bit words" % img["pool_bytes"])
+    # Die 0 is 2^21 PSRAM words = 4 MiB bytes, and pages 128..255 are die 1 (page bit 7 is the die
+    # select). A pool that runs off the end of die 0 would be silently read from the wrong chip.
+    if img["frames_base"] + img["pool_bytes"] > 2 * 0x200000:
+        errs.append("pool ends at byte 0x%X, past die 0 (0x%X bytes): the census cannot reach it"
+                    % (img["frames_base"] + img["pool_bytes"], 2 * 0x200000))
     for i, s in enumerate(img["frame_sums"]):
         f = pool[i * PAGE : (i + 1) * PAGE]
         if len(f) != PAGE:

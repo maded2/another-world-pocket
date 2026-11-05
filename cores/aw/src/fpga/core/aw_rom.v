@@ -571,7 +571,22 @@ module aw_rom (
     // precisely the failure this feature can produce - so the image declares an xor too and the core
     // compares it. The reads were already being made; leaving the pair in registers nobody compared
     // would have been dead logic AND a weaker check, which is the worst of both.
+    // (hdr_hi,hdr_lo) != 0 is not decoration: with nothing declared both sides of the compare are
+    // zero, and a check satisfied by two zeros is not a check. A plain pack, or a header the sweep
+    // never got through, must not be able to certify a pool.
+    //
+    // What the measured side covers, stated because it was briefly wrong in the other direction here:
+    // cr_pool_sum is the census over pages 1..census_last, and census_last STOPS at cw_max - the
+    // highest word the core saw written. So it is "every page the framework wrote, except the
+    // directory", which for an image whose pool is the whole rest of the file is exactly what the
+    // builder summed. I tried to bound it by the declared pool_bytes instead and it cost two
+    // regressions (a census that started mid-upload and starved the bridge to ERR_OVERFLOW; and an
+    // off-by-one where the pool ends exactly at cw_max, silently dropping its last word) to discover
+    // that the range was already right for a reason I had not read. It is also STRONGER for #15: a
+    // truncated upload measures fewer words than declared and disagrees, whereas a pool_bytes-bound
+    // sum would have quietly measured only what arrived.
     wire pool_ok = census_done & dir_installed
+                 & ({hdr_hi, hdr_lo} != 32'd0)
                  & (cr_pool_sum == {hdr_hi, hdr_lo})
                  & (cr_pool_xor == hxr_lo);
     reg  [31:0] cr_q [0:3];
@@ -974,9 +989,6 @@ module aw_rom (
                     // GND"). A mask that cannot be set is not a mask.
                     ent_bad       <= ent_bad | (8'b1 << ent_part);
                     bad_page      <= ent_page;
-                    dir_err_code  <= 8'h80 | {2'b00, ent_page};
-                    dir_ph        <= dir_ph + 10'd1;
-                    st_s          <= ST_RD;
                     dir_err_code  <= 8'h80 | {2'b00, ent_page};
                     dir_ph        <= dir_ph + 10'd1;
                     st_s          <= ST_RD;
@@ -1425,18 +1437,32 @@ module aw_rom (
             default:   dir_base = 10'd520;
         endcase
     end
-    // Six header reads then the table. Words 0,1 are the magic; words 12..15 are the pool's declared
-    // word-sum and xor (HDR "<4sHHHHIIIII": byte 24 -> word 12, little-endian pairs). Read in the same
-    // sweep because the sweep is already sitting on page 0, four reads is nothing, and a pool sum the
-    // core has never looked at is a number in a file rather than a check.
-    // Five header reads then the table: words 0,1 the magic; 12,13 the pool's declared word-sum; 14 the
-    // declared word-xor (HDR "<4sHHHHIIIII", byte 24 -> word 12, little-endian pairs). Word 15 - the
-    // xor's high half - is deliberately NOT read: see cr_pool_xor, where both sides of that comparison
-    // are provably 16 bits wide, so reading a fifth word to compare two zeros is dead logic that an
-    // audit has to flag and a reader has to re-derive.
-    wire [9:0] dir_word = (dir_ph <= 10'd1) ? {7'b0, dir_ph[2:0]}
-                              : (dir_ph <= 10'd5) ? (10'd9 + {7'b0, dir_ph[2:0]})
-                              : (dir_base + {4'b0, ent_page});
+    // Addressed EXPLICITLY, because the arithmetic version was wrong and looked right. It read
+    // 9 + dir_ph[2:0] = words 11,12,13,14 and the case below called word 11 the declared part count.
+    // Word 11 is pool_bytes' HIGH HALF: for aw-all.bin, 0x002e = 46. np clamps to 8, so with an
+    // eight-part image the bug was invisible - and an image declaring THREE parts would have had all
+    // eight treated as declared, with the undeclared tables installed from whatever their words held.
+    // "The count is what makes an absent part detectable rather than merely empty" was, until this
+    // line, a sentence about a field the sweep never read. The bench could not see it either: it wrote
+    // its header the way the RTL read it, not the way build_combined_image.py writes it - a bench that
+    // agrees with the design about a field the emitter never wrote verifies nothing about the interface.
+    //
+    // Six header reads then the table, all of them from page 0, which the sweep is already sitting on.
+    // HDR = "<4sHHHHIIIII": 0,1 magic | 2 ver | 3 frames | 4 page_shift | 5 parts
+    //                        6,7 view_bytes | 8,9 frames_base | 10,11 pool_bytes | 12,13 wsum | 14,15 wxor
+    // Word 15 is deliberately NOT read: both sides of the xor comparison are provably 16 bits (see
+    // cr_pool_xor), so a read that compares two zeros is dead logic an audit has to flag and every
+    // reader has to re-derive. Words 6..9 are not read either: the core takes the view size from its
+    // own geometry and the pool start from the page table, so a header field it cannot act on would
+    // only be a number to disagree with.
+    wire [9:0] dir_word =
+          (dir_ph == 10'd0) ? 10'd0
+        : (dir_ph == 10'd1) ? 10'd1
+        : (dir_ph == 10'd2) ? 10'd5              // declared part count
+        : (dir_ph == 10'd3) ? 10'd12             // pool_wsum.lo
+        : (dir_ph == 10'd4) ? 10'd13             // pool_wsum.hi
+        : (dir_ph == 10'd5) ? 10'd14             // pool_wxor.lo
+        : (dir_base + {4'b0, ent_page});
 
     reg  [6:0]           tbl_rdat;                       // synchronous (M10K) read result
     reg  [2+PGTBL_AW:0]  tbl_rdat_idx;                   // ... and which {part, page} it belongs to

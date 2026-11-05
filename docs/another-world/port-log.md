@@ -2721,3 +2721,92 @@ because the boot banner once lied for two releases.
 Gates: `tb_dir` 8 runs / 210 checks; `make sim` green. Bench-only changes since `f01a4ad0a9b2f358`, so
 that identity still describes HEAD. Nothing paged has been in a Pocket; `AW 1042`
 (`579746d33d45b594`) is still the only bitstream installed, and the hardware order is #15 → #21 → #23.
+
+---
+
+## 2026-11-05 — a real bug in the header read, a wrong theory about the pool, and two regressions my own fix caused
+
+The card came back, so #15 (does a >2 MiB dataslot upload arrive at all) moved to the front: an
+installer for the paged probe (`scripts/sd_install_1044p.sh`) and the combined image beside the eight
+single-part packs. While checking what the probe would actually be able to say, I found one real bug,
+invented a hardware-fatal flaw that did not exist, and shipped two regressions of my own before
+catching them. All three are recorded here because the middle one is the instructive one.
+
+### The real bug: the declared part count was read from the wrong word
+`dir_word` computed the header fields as `9 + dir_ph[2:0]` = words **11,12,13,14**, and the capture
+case called word 11 the declared part count. Word 11 is `pool_bytes`' high half - **0x002e = 46** for
+`aw-all.bin`. `np` clamps to 8, so with an eight-part image every part looked declared and the value
+was indistinguishable from the truth. An image declaring three parts would have had all eight treated
+as declared, with the undeclared tables installed from whatever their words held: the sentence in this
+file that says "the count is what makes an absent part detectable rather than merely empty" described a
+field the sweep never read. The mapping is now an explicit case per field (words 0,1,5,12,13,14).
+
+The bench could not see it because **the bench wrote its header the way the RTL read it, not the way
+`build_combined_image.py` writes it** - `write_dir` wrote the magic and nothing else, and `hdr_parts`
+picked up whatever the pack happened to have at word 11, which was nonzero. Same class of mistake as
+checking a file against your own calculation of it. `write_hdr()` now writes the real layout, and the
+builder's `verify()` refuses an image where `pool_bytes != nframes * PAGE` or the pool runs off die 0.
+
+### The wrong theory, and why it mattered
+I claimed `pool_ok` would read 0 on a perfect upload because the census sweeps all of die 0 (128
+pages) while the image fills 94, summing 34 pages of undefined PSRAM. **It does not.** `census_last`
+stops at `cw_max` - the highest word the core saw written - so the sweep already covered exactly the
+uploaded bytes and the declared sum matched for the right reason. I wrote a hardware-fatal story
+without reading the range definition, then built on it. The rule this file already carries - explain
+the passing case before you believe the failing one - is the one I skipped, and the cost was the next
+two paragraphs rather than an afternoon on a bench.
+
+Bounding the sum by `pool_bytes` anyway (it is not worthless: it makes the range the image's own
+declaration rather than a side-effect of the write path) produced two regressions, both real:
+
+1. **It needed the header before the census, and no gate could provide that.** The census is armed a
+   few cycles *before* the directory sweep can even be pending: `census_go` is the raw edge of
+   `vfy_arm`, while `dir_pend` waits on a request handshake. Gating on `dir_done` was open from the
+   first cycle because **`dir_done` resets HIGH on purpose** - an unloaded chip has a legitimate
+   identity map, and the file already records a build where waiting on sweep-readiness turned `tb_write`
+   into `rom_ready=0` with 231 errors. So I armed the census from the sweep's completion pulse instead,
+   which fixed the ordering and starved the upload: `tb_soc`'s paged run went to `rom_error=2` with
+   `cw_max` frozen mid-file (0x100001 at PACE 10, 0xaaaac at PACE 16 - the split moving with the pacing
+   is what identified it). Cause: `pack_written` rises when the trailer word lands and the queue goes
+   quiet, and the trailer sits at `0x1fffe0`, which in a 2.94 MiB image is **two MiB in, not at the
+   end**. "Trailer written" has never meant "file complete".
+2. **An off-by-one that dropped the pool's last word** whenever the pool ends exactly where the upload
+   does - which is every real image, since `aw-all.bin` is 94 pages and the pool is the last 93. It is
+   also what the mysterious 913-count difference between two sums had been telling me.
+
+The A/B that settled it took one run: `git stash` the RTL, run the identical command, old code
+**passes** (`pool_ok=1`, `measured == declared = 9ca26b21`, 78 frames, 0 shifted) - so the regression
+was mine, not the bench's. Reverted to the proven census behaviour; after the revert the paged run
+reproduces the old numbers byte for byte (78 frames, 41,956 bytes to the VM, 18 swaps, 0 shifted),
+which is the check that nothing else drifted.
+
+### What `+POOLSUM` became instead, which is better than what it was
+The census measuring "every page written except the directory" is exactly the quantity that answers
+#15, and because `relaunch()` in `tb_dir` sets `cw_max`, the bench can now model a truncated upload:
+
+| situation | declared | pool_ok |
+|---|---|---|
+| full upload | sum of everything written | **1** |
+| upload truncated at word 24576 | the whole pool's sum | **0** |
+| same truncation | sum of what actually arrived | **1** |
+
+That is the bench's authority to read `G01` on hardware as *the upload was short* rather than *the chip
+is corrupt*, which is the distinction the whole probe turns on. `relaunch()` also corrects a statement
+the old run made about the chip being unmeasurable on demand: it is not, a relaunch re-measures it -
+which is also the only remedy a user has, since `census_done` clears only in reset and the VM's reset
+pin is tied low.
+
+`scripts/sim_dir.sh` gained a `RUNS` filter (eight cases take seven minutes; iterating one should not),
+and `RUNS` was added to `docker/run-silice.sh`'s env allow-list for the fourth time - a filter that is
+silently dropped does not look like a failure, it looks like it ran what you asked.
+
+### Gates and identity
+`tb_dir` 8 runs / **214 checks**, `make sim` green (tb_write, tb_keys 13, tb_rom 550 + tripwire with
+the census reading `sum_r == sum_w`, tb_iv 24, tb_reset_gen, tb_dbg_console, tb_top), paged `tb_soc
++PART=1` PASS with `measured == declared`, builder `--verify` clean with the new invariants.
+
+**Bitstream `build/aw/bitstream.rbf_r` = `a786f317510af3aa`**: 0 errors, 0 critical warnings, worst
+setup 1.254 ns (slow) / 0.404 ns (fast), hold 0.278 ns, scoped `make check-build` clean. This supersedes
+`f8b7b23eea01099c`, which contained both regressions and must not go on a card. `AW 1042`
+(`579746d33d45b594`) remains the only bitstream that has ever been installed; nothing paged has been in
+a Pocket, and the card was unmounted again before the install could run.

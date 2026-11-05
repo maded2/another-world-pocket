@@ -32,6 +32,12 @@ module tb_dir;
 
     localparam integer PACK_BYTES = 2097136;          // one pack: 2 MiB - 16
     localparam integer PACK_WORDS = PACK_BYTES / 4;
+    // The DUT's census range, in PSRAM words, named ONCE. It is both the sweep's end and the top of
+    // what cw_max will count (aw_rom ignores writes above CEN_LAST in the write-side sums), so a
+    // relaunch that wants the census to cover the range has to write INSIDE it - the first version
+    // wrote the top of the 2 MiB file, was ignored, and produced a one-word census and pool_ok=0 for
+    // every declaration. Two literals with one meaning is how that cost a run to find.
+    localparam [21:0] CEN_RANGE = 22'h8000;
     localparam integer PG         = 32768;            // one view page, bytes
 
     real T_CORE = 1000.0/24.75;
@@ -68,7 +74,7 @@ module tb_dir;
     wire [2:0]  dir_part;
     wire [7:0]  dir_err;
 
-    aw_rom #(.CENSUS_RANGE(22'h8000)) dut (
+    aw_rom #(.CENSUS_RANGE(CEN_RANGE)) dut (
         .clk_core(clk_core), .rst_core(rst_core),
         .mem_in_ready(mem_in_ready), .mem_addr(mem_addr), .vm_running(~rst_core),
         .mem_data(mem_data), .mem_data_available(mem_data_available), .mem_busy(mem_busy),
@@ -187,11 +193,31 @@ module tb_dir;
     // Page 3 is the moving page - part 0 reads it from physical page 5, part 1 from page 6,
     // the rest keep it. Entry 0 can never be 0: page 0 IS the directory, and an entry pointing
     // there is the corrupted-table case the layout is designed to make harmless.
+    // The header, written the way build_combined_image.py writes it, because that is the whole point.
+    // Until now this bench wrote the magic and nothing else, and the RTL read its header fields from
+    // words 11..14 - so hdr_parts took whatever the PACK happened to hold at word 11, which was
+    // nonzero, and every test passed on a coincidence instead of on a declared part count. A bench that
+    // writes what the design happens to read, rather than what the emitter writes, verifies nothing
+    // about the interface between them - the same mistake as checking a file against your own
+    // calculation of it. Field meanings are the builder's HDR = "<4sHHHHIIIII".
+    task automatic write_hdr(input [31:0] pbytes = 0, input [31:0] psum = 0, input [31:0] pxor = 0);
+        begin
+            put_words(0,  16'h5741, 16'h3150);                 // magic "AWP1"
+            put_words(2,  16'd1,     16'd93);                  // version, frames
+            put_words(4,  16'd15,    16'd8);                   // page_shift (2^15 = 32 KiB), parts
+            put_words(6,  16'hfff0,  16'h001f);                // view_bytes = 0x1ffff0
+            put_words(8,  16'h8000,  16'h0000);                // frames_base = physical page 1
+            put_words(10, pbytes[15:0], pbytes[31:16]);        // pool_bytes - the SUM'S RANGE
+            put_words(12, psum[15:0],   psum[31:16]);          // pool_wsum
+            put_words(14, pxor[15:0],   pxor[31:16]);          // pool_wxor (word 15 unread: both sides 16b)
+        end
+    endtask
+
     task automatic write_dir;
         int n, k;
         bit [15:0] e0, e1;
         begin
-            put_words(0, 16'h5741, 16'h3150);              // "AW", "P1"
+            write_hdr();                                       // no pool declared: pool_ok must stay low
             for (n = 0; n < 8; n = n + 1) begin
                 for (k = 0; k < 64; k = k + 2) begin
                     e0 = (k == 0) ? 16'd1 : k[15:0];      // entry 0 is never 0: page 0 is the dir
@@ -231,7 +257,7 @@ module tb_dir;
     task automatic write_dir_high;
         int n, k;
         begin
-            put_words(0, 16'h5741, 16'h3150);
+            write_hdr();
             for (n = 0; n < 8; n = n + 1)
                 for (k = 0; k < 64; k = k + 2)
                     put_words(16 + n*72 + k, hi_ent(k), hi_ent(k + 1));
@@ -359,6 +385,52 @@ module tb_dir;
             repeat (120) @(negedge clk_psram);      // status crosses clocks; let it land
             $display("  settle (%s): dir_valid=%b bad=%b part=%0d err=%02h after %0d",
                      why, dir_valid, dir_bad, dir_part, dir_err, g);
+        end
+    endtask
+
+    // A RELAUNCH, spelled out: reset every domain, re-establish what the write path remembered, then
+    // the upload-complete pulse. Re-establishing it is not ceremony - census_last is min(cw_max, range) and
+    // cw_max counts words the core SAW written since reset, so resetting without re-uploading leaves
+    // the census sweeping one word (first attempt printed census_last=0 and
+    // cr=0 for every declaration: a bench that measures nothing, calling everything bad). The Pocket
+    // re-uploads the dataslot on every launch, so this is also the honest model of what the user does
+    // when they pick a different file - which is the only remedy that exists, since the census runs
+    // once per power-up and the VM's reset pin is tied low.
+    // topw is where the write-extent word goes, and it is the whole point of the parameter: it lets a
+    // test model an upload that STOPPED EARLY, which is the question task #15 is asking the hardware.
+    task automatic relaunch(input [31:0] psum = 0, input [31:0] pxor = 0, input string why = "",
+                            input int topw = CEN_RANGE - 2);
+        int g = 0;
+        begin
+            rst_core <= 1'b1; rst_psram <= 1'b1; rst_bridge <= 1'b1;
+            repeat (40) @(negedge clk_core);
+            rst_core <= 1'b0; rst_psram <= 1'b0; rst_bridge <= 1'b0;
+            repeat (10) @(negedge clk_bridge);
+            // The model keeps the file across a reset. A Pocket re-uploads, but 1 MiB of bridge
+            // writes is ~85 ms of simulated time and four of them blow this bench's 300 ms watchdog
+            // - the first version of this task died there, not on anything about the design. What the
+            // design needs is its WRITE EXTENT: census_last is min(cw_max, CENSUS_RANGE)-1 and cw_max
+            // counts words written since reset, so one 32-bit write at the top of the file puts it
+            // back. The value is the file's own top words, so nothing inside the summed range moves.
+            write_dir;
+            // pool_bytes (words 10/11) is written as 0 and that is deliberate: the core does not read
+            // that field. It measures the pages it SAW written, so declaring a pool length would be a
+            // number with no reader - see aw_rom's pool_ok comment for why bounding the sum by it was
+            // tried and dropped.
+            write_hdr(32'd0, psum, pxor);
+            put_words(topw,
+                      {ref_mem[topw*2 + 1], ref_mem[topw*2]},
+                      {ref_mem[(topw+1)*2 + 1], ref_mem[(topw+1)*2]});
+            repeat (6) @(negedge clk_bridge);
+            dataslot_allcomplete <= 1'b1;
+            repeat (8) @(negedge clk_bridge);
+            dataslot_allcomplete <= 1'b0;
+            @(negedge clk_core);
+            while (!rom_ready && g < 4000000) begin @(negedge clk_core); g++; end
+            repeat (200) @(negedge clk_psram);      // status crosses clocks; let it land
+            $display("  relaunch (%s): dir_valid=%b bad=%b part=%0d err=%02h pool_ok=%b cr=%08h cw_max=%0h last=%0h census_done=%b after %0d",
+                     why, dir_valid, dir_bad, dir_part, dir_err, pool_ok_w,
+                     dut.cr_pool_sum, dut.cw_max, dut.census_last, dut.census_done, g);
         end
     endtask
 
@@ -550,37 +622,92 @@ module tb_dir;
                 $display("  FAIL rom_error=%0d after recovery - a cleared fault must stop reporting", rom_error);
             end
         end else if (poolrun) begin
-            bit [31:0] psum, pxor;
-            int w;
-            // The sum the core will measure: pages 1.. only (page 0 is the directory, and its own
-            // bytes are not part of what the directory declares), over the words the sweep reaches.
-            // PSRAM word w is ref_mem bytes 2w (low) and 2w+1 (high), little-endian.
-            psum = 32'd0; pxor = 32'd0;
-            for (w = 16384; w < 32768; w = w + 1) begin
-                psum = psum + {ref_mem[w*2+1], ref_mem[w*2]};
-                pxor = pxor ^ {ref_mem[w*2+1], ref_mem[w*2]};
+            bit [31:0] pall, xall;      // every word the census will see on a full upload
+            bit [31:0] pshort, xshort;  // the same, up to a modelled early stop
+            int w;          // PSRAM word w is ref_mem bytes 2w (low) and 2w+1 (high), little-endian
+            localparam int SHORT = 24576;   // where the modelled truncation stops
+            // What the core measures, and so what has to be declared: the census runs pages
+            // 1..census_last, and census_last stops at cw_max, the highest word the core SAW written
+            // since reset. pool_ok is therefore "the pages the framework wrote, except the directory,
+            // add up to what the image declares". Because relaunch() is what sets cw_max, this run can
+            // also model an upload that STOPPED EARLY - the question task #15 is asking the Pocket -
+            // and say what the reading on the console means.
+            //
+            //   full upload,    sum of everything written            -> 1   the good case
+            //   TRUNCATED at word 24576, full-pool sum declared      -> 0   #15's failure mode: the
+            //                                                                 directory page arrived, the
+            //                                                                 table installs, it boots, and
+            //                                                                 the pool disagrees -> G01
+            //   same truncation, sum of what actually arrived        -> 1   the measured range really
+            //                                                                 does follow the write extent;
+            //                                                                 without this the case above
+            //                                                                 could pass for the wrong reason
+            pall = 32'd0; xall = 32'd0; pshort = 32'd0; xshort = 32'd0;
+            for (w = 16384; w < CEN_RANGE; w = w + 1) begin
+                pall = pall + {ref_mem[w*2+1], ref_mem[w*2]};
+                xall = xall ^ {ref_mem[w*2+1], ref_mem[w*2]};
+                if (w < SHORT) begin
+                    pshort = pshort + {ref_mem[w*2+1], ref_mem[w*2]};
+                    xshort = xshort ^ {ref_mem[w*2+1], ref_mem[w*2]};
+                end
             end
-            write_dir;
-            put_words(12, psum[15:0], psum[31:16]);      // image words 12,13 = declared sum
-            put_words(14, pxor[15:0], pxor[31:16]);      // and 14,15 = declared xor
-            rearm("directory with a declared pool sum");
+            // If the two sums were equal the truncation case would be vacuous - a control that cannot
+            // distinguish the situations is how +POOLSUM passed for runs while the range was wrong.
+            checks = checks + 1;
+            if (pall == pshort) begin
+                errors = errors + 1;
+                $display("  FAIL the full and truncated sums are both %08h - words %0d..%0d of the pack are all zero, so this run cannot see a truncation", pall, SHORT, CEN_RANGE);
+            end
+
+            relaunch(pall, xall, "everything written, sum of everything written");
             expect_status(1, 0, 0, "pool installed with sums");
-            $display("        poolsum: cr=%08h declared=%08h census_done=%b active=%b installed=%b cw_max=%0h last=%0h",
-                     dut.cr_pool_sum, {dut.hdr_hi, dut.hdr_lo}, dut.census_done, dut.census_active,
-                     dut.dir_installed, dut.cw_max, dut.census_last);
+            $display("        poolsum: cr=%08h declared=%08h cw_max=%0h census_last=%0h census_done=%b installed=%b",
+                     dut.cr_pool_sum, {dut.hdr_hi, dut.hdr_lo}, dut.cw_max, dut.census_last,
+                     dut.census_done, dut.dir_installed);
             checks = checks + 1;
             if (pool_ok_w !== 1'b1) begin
                 errors = errors + 1;
-                $display("  FAIL pool_ok=%b with a correct declared sum - the census, the page-0 skip, or the comparison is wrong", pool_ok_w);
+                $display("  FAIL pool_ok=%b with the sum of every written word declared - the census, the page-0 skip, or the comparison is wrong (%08h measured, %08h declared)",
+                         pool_ok_w, dut.cr_pool_sum, pall);
             end
-            // The negative control. The DECLARED sum is changed, not the pool: the census measures the
-            // chip once per power-up (a second sweep would steal the chip from a streaming VM), so the
-            // chip cannot be re-measured on demand here - and a sum check cannot tell which side moved
-            // anyway. Moving the other side is the same event to the comparator, and it is a real field
-            // condition: an image whose declared sum disagrees with the bytes in the chip. Without this
-            // control, pool_ok=1 would mean either "matched" or "never compared" - the exact ambiguity
-            // this port has been bitten by over and over.
-            put_words(12, psum[15:0] ^ 16'h0001, psum[31:16]);   // declared sum, off by one
+
+            // The modelled truncation. Same image, same declared pool sum - only the write extent is
+            // shorter, exactly as if the framework had stopped pushing at 1.5 MiB. The directory is
+            // still in page 0, so the table installs and the core boots; the pool must not certify.
+            // This is the bench's authority to read G01 on hardware as "the upload was short" rather
+            // than "the chip is corrupt".
+            relaunch(pall, xall, "TRUNCATED upload (write extent forced to 24576), full pool declared",
+                     SHORT - 2);
+            checks = checks + 1;
+            if (pool_ok_w !== 1'b0) begin
+                errors = errors + 1;
+                $display("  FAIL pool_ok=%b on a truncated upload with the whole pool declared - a short upload would look GOOD on the console, which is the one thing this probe must not do", pool_ok_w);
+            end
+            checks = checks + 1;
+            if (!(dut.cw_max == SHORT && dut.census_last == SHORT - 1)) begin
+                errors = errors + 1;
+                $display("  FAIL the truncated case measured cw_max=%0h census_last=%0h, wanted %0h/%0h - the bench did not build the situation it claims to",
+                         dut.cw_max, dut.census_last, SHORT, SHORT - 1);
+            end
+            // ... and the mirror: declare only what arrived, and it certifies. Proves the measured
+            // range tracks the write extent rather than being stuck, zero, or coincidental.
+            relaunch(pshort, xshort, "same truncated upload, sum of what actually arrived", SHORT - 2);
+            checks = checks + 1;
+            if (pool_ok_w !== 1'b1) begin
+                errors = errors + 1;
+                $display("  FAIL pool_ok=%b when the declaration matches the truncated write extent - measured=%08h, declared=%08h",
+                         pool_ok_w, dut.cr_pool_sum, pshort);
+            end
+            // Back to the full upload for the two comparator controls below.
+            relaunch(pall, xall, "full upload again, before the comparator controls");
+            // The negative control, and it deliberately moves the DECLARED side with an ordinary rearm
+            // rather than a relaunch: a sum check cannot say which side moved, so moving either one is
+            // the same event to the comparator, and the declared side is the one that does not need the
+            // chip re-swept. (relaunch() above can re-measure the chip too, and does - for the
+            // truncation cases, where the write extent is the variable.) Without this control pool_ok=1
+            // would mean either "matched" or "never compared" - the exact ambiguity this port keeps
+            // being bitten by.
+            put_words(12, pall[15:0] ^ 16'h0001, pall[31:16]);   // declared sum, off by one
             rearm("declared pool sum now disagrees with the chip");
             checks = checks + 1;
             if (pool_ok_w !== 1'b0) begin
@@ -592,8 +719,8 @@ module tb_dir;
             // bit off. If pool_ok came back 1 here, the xor would be decoration - which matters because
             // a checksum alone is satisfied by two words trading places, and a page table trading pages
             // is exactly the failure this feature can produce.
-            put_words(12, psum[15:0], psum[31:16]);
-            put_words(14, pxor[15:0] ^ 16'h0001, pxor[31:16]);
+            put_words(12, pall[15:0], pall[31:16]);
+            put_words(14, xall[15:0] ^ 16'h0001, xall[31:16]);
             rearm("declared sum correct, declared xor one bit off");
             checks = checks + 1;
             if (pool_ok_w !== 1'b0) begin

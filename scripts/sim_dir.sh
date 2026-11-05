@@ -55,38 +55,48 @@ if ! verilator --binary -j 4 --timing --top-module tb_dir \
     exit 1
 fi
 
+# Which cases to run. Eight cases take minutes, and iterating on one of them should not cost that;
+# RUNS is read from the environment, so remember that docker/run-silice.sh forwards an ALLOW-LIST of
+# variables and silently drops anything not on it - which has bitten this repo three times (TRACE,
+# IMG, LATESEL_TEST). RUNS is on that list now; a filter that quietly did nothing would run
+# everything and look like it ran what you asked, which is the safe direction, but would waste the
+# time the filter exists to save.
+RUNS="${RUNS:-1 2 3 4 5 6 7 8}"
+TOTAL=0
+
+run_case() {              # run_case <n> <label> [plusargs...]
+    local n="$1" label="$2"; shift 2
+    case " $RUNS " in
+        *" $n "*) ;;
+        *) echo "=== run $n: $label - SKIPPED (RUNS='$RUNS') ==="; return 0 ;;
+    esac
+    echo "=== run $n: $label ==="
+    ./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" "$@"
+    local rc=$?
+    TOTAL=$(( TOTAL + rc ))
+    [ "$rc" -eq 0 ] || echo "    !! run $n exited $rc"
+}
+
 # Two runs, because the thing under test is a window: a part select is honoured only until the VM
 # accepts its first byte, and a run that reads bytes before selecting cannot observe a select
 # succeeding. The default run covers the installed default, the late refusal and the plain-pack
 # fallback; +PART=1 covers an actual select.
-echo "=== run 1: directory installs, part 0's map is live, late select refused, plain pack falls back ==="
-./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}"
-rc_a=$?
+run_case 1 "directory installs, part 0's map is live, late select refused, plain pack falls back"
+run_case 2 "part 1 selected by an address write before the first byte" +PART=1
+run_case 3 "a plain pack presented over an installed pool falls back to identity" +NOMAGIC
 
-echo "=== run 2: part 1 selected by an address write before the first byte ==="
-./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +PART=1
-rc_b=$?
-
-echo "=== run 3: a plain pack presented over an installed pool falls back to identity ==="
-./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +NOMAGIC
-rc_c=$?
-
-echo "=== run 4: bytes written above the old 2 MiB window land, and the view can be pointed there ==="
 # PACE 10, like every other run. An earlier revision of this run used PACE=6 "to go faster" and the
 # loader FIFO overflowed - ERR_OVERFLOW, with the directory bytes among those dropped, which read as
 # "the design lost my table above 2 MiB" and was in fact the bench writing faster than the chip can
 # take. The rate that overflows is tested on purpose in tb_rom (+TRIPWIRE); it is not a rate to test
 # anything else at.
-./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +HIGH
-rc_d=$?
+run_case 4 "bytes written above the old 2 MiB window land, and the view can be pointed there" +HIGH
 
-echo "=== run 5: the core checks the pool against the sum the image declares, and notices corruption ==="
-./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +POOLSUM
-rc_e=$?
-
-echo "=== run 6: an out-of-range entry in the viewed part refuses it and names the entry ==="
-./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +BADENT
-rc_f=$?
+# Three declarations of one chip state, each with a fresh census: the sum must cover exactly the
+# pool_bytes the image declares - no further (that is what the pages above the pool are undefined
+# for on hardware) and no shorter (a sum that ignores the declaration is a number, not a range).
+run_case 5 "the core checks the pool against the sum the image declares, and notices corruption" +POOLSUM
+run_case 6 "an out-of-range entry in the viewed part refuses it and names the entry" +BADENT
 
 # run 7: a part select that lands AFTER the boot sweep. It is back in the default sequence, and what
 # changed is the design rather than the expectation: the boot sweep now loads all eight parts' tables,
@@ -94,14 +104,9 @@ rc_f=$?
 # rst_core, and no dependence on whether the framework delivers the interact write before or after the
 # dataslot upload (the ordering task #21 exists to measure). It passes in both benches now - tb_dir
 # here, tb_soc +PART=1 with the VM rendering part 1's intro through part 1's table.
-echo "=== run 7: a part select that lands AFTER the boot sweep still installs its own part ==="
-./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +PART=1 +LATESEL
-rc_g=$?
+run_case 7 "a part select that lands AFTER the boot sweep still installs its own part" +PART=1 +LATESEL
+run_case 8 "a corrupt entry in SOMEBODY ELSE's part - boots, reports, and refuses that select" +PART=1 +PARTBAD
 
-echo "=== run 8: a corrupt entry in SOMEBODY ELSE's part - boots, reports, and refuses that select ==="
-./obj/tb_dir "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" +PART=1 +PARTBAD
-rc_h=$?
+[ "$TOTAL" -eq 0 ] || echo "tb_dir: $TOTAL failing exit status across RUNS='$RUNS'"
+exit $TOTAL
 
-rc=$(( rc_a + rc_b + rc_c + rc_d + rc_e + rc_f + rc_g + rc_h ))
-[ "$rc" -eq 0 ] || echo "tb_dir: run1=$rc_a run2=$rc_b run3=$rc_c run4=$rc_d run5=$rc_e run6=$rc_f run7=$rc_g"
-exit $rc
