@@ -96,7 +96,7 @@ def frame_of(page_bytes: bytes) -> bytes:
     return page_bytes + bytes(PAGE - len(page_bytes))
 
 
-def build(packs, out_path, part0_last=False):
+def build(packs, out_path, part0_last=False, pad_to=0):
     pool = {}          # sha1 -> frame index
     frames = []        # frame index -> bytes
     tables = []        # part -> [frame index] * PAGES
@@ -117,6 +117,21 @@ def build(packs, out_path, part0_last=False):
                                            # directory, so the core can never address the header
         tables.append(table)
 
+    if pad_to:
+        # Filler frames, unreferenced by any part's table. Two uses, and the second is the real one:
+        # a zero frame changes no declared sum, so a file padded with them keeps the SAME pool_wsum /
+        # pool_wxor as the unpadded build, and:
+        #   * with --part0-last the pool is padded up to a target size and then part 0's frames are
+        #     swept to the end, which makes "renders" mean "the framework delivered the WHOLE file"
+        #     at that size. Bisecting the size at which that stops is a direct measurement of the
+        #     dataslot upload limit, and it needs nothing but the screen.
+        #   * zeros are also the honest filler: the pool sum is the same whether or not the tail
+        #     arrived, so a truncated upload cannot be mistaken for a bad declaration.
+        need = (pad_to - HEADER_BYTES + PAGE - 1) // PAGE
+        while len(frames) < need:
+            frames.append(bytes(PAGE))
+            per_frame_uses.append(0)
+
     if part0_last:
         # Put every frame part 0 references at the END of the pool, and point part 0's table there.
         #
@@ -130,9 +145,15 @@ def build(packs, out_path, part0_last=False):
         # was opened for and the one thing no simulation of our own chip can answer: the bench IS the
         # host. Frame indices are physical pool pages (index 0 = page 1), so the permutation has to
         # rewrite both the layout and every table entry that names it.
-        p0 = set(tables[0])
+        # FRAME INDICES, not page numbers: the tables hold physical page = frame index + 1 (page 0 is
+        # the directory). The first version tested frame indices against the page-number set, so the
+        # off-by-one made the membership test miss almost everything and part 0 stayed spread across
+        # the whole pool - a probe that looked right in the header summary and would have answered the
+        # wrong question. Verified below by asserting part 0 really does end up at the tail.
+        p0 = {v - 1 for v in tables[0]}
         order = ([i for i in range(len(frames)) if i not in p0]
                  + [i for i in range(len(frames)) if i in p0])
+        assert all(order.index(i) >= len(frames) - len(p0) for i in p0), "part 0 did not move to the tail"
         remap = {old: new for new, old in enumerate(order)}
         frames = [frames[o] for o in order]
         per_frame_uses = [per_frame_uses[o] for o in order]
@@ -382,6 +403,8 @@ def main():
     ap.add_argument("--parts", type=int, default=PART_COUNT,
                     help="only the first N parts (a small paged image proves the FORMAT works "
                          "on hardware independently of the file being 2.94 MiB)")
+    ap.add_argument("--pad-to", type=int, default=0, metavar="BYTES",
+                    help="pad the pool with zero frames up to this total file size")
     ap.add_argument("--part0-last", action="store_true",
                     help="move part 0's frames to the end of the file (same size, same sums) so a "
                          "launch answers 'did the tail arrive?' from the screen alone")
@@ -407,7 +430,8 @@ def main():
         print("\nOK: every part's view is byte-identical to its pack")
         return 0
 
-    blob, frames, tables, uses, _ = build(packs, a.out, part0_last=a.part0_last)
+    blob, frames, tables, uses, _ = build(packs, a.out, part0_last=a.part0_last,
+                                          pad_to=a.pad_to)
     print("wrote %s: %d bytes (%.3f MiB), %d frames, %d parts"
           % (a.out, len(blob), len(blob) / 2.0 ** 20, len(frames), len(packs)))
     print("      vs %d separate packs = %.2f MiB, or %.2f MiB uploaded per load today"
