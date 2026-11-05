@@ -70,7 +70,18 @@ module tb_dir;
     wire [3:0]  cen_qmism;
     wire [2:0]  cen_stat;
     wire        tbl_loaded;
-    wire        dir_valid, dir_bad, dir_busy, part_late, pool_ok_w;
+    wire        dir_valid, dir_bad, dir_busy, part_late, pool_ok_w, vm_restart_w;
+    // Counts restart pulses rather than sampling the level: the pulse is 16 clk_core cycles and any
+    // check that catches it by polling can miss it and conclude "the VM was never restarted", which is
+    // the wrong conclusion from a right design.
+    int         rstr_seen = 0;
+    reg         vm_restart_d = 1'b0;
+    // Rising edges, not cycles: the pulse is held 16 clocks, so a cycle count reports 17 for one
+    // restart and would make "how many switches happened" unreadable.
+    always @(posedge clk_core) begin
+        vm_restart_d <= vm_restart_w;
+        if (vm_restart_w & ~vm_restart_d) rstr_seen = rstr_seen + 1;
+    end
     wire [2:0]  dir_part;
     wire [7:0]  dir_err;
 
@@ -94,7 +105,7 @@ module tb_dir;
         .tbl_wr(1'b0), .tbl_widx(6'd0), .tbl_wval(8'd0), .rom_tbl_loaded(tbl_loaded),
         .rom_dir_valid(dir_valid), .rom_dir_bad(dir_bad), .rom_part(dir_part),
         .rom_dir_err(dir_err), .rom_dir_busy(dir_busy), .rom_part_late(part_late),
-        .rom_pool_ok(pool_ok_w)
+        .rom_pool_ok(pool_ok_w), .rom_vm_restart(vm_restart_w)
     );
 
     aw_psram_model psram0 (
@@ -761,7 +772,7 @@ module tb_dir;
             // same part - that pair is the whole test, and it is why this is not just "write the value
             // and hope": a decode that assumed one lane would pass with one write and fail with the
             // other, and the failing one would look like a data-dependent bug on hardware.
-            bridge_write32(32'h00F0_0000, want_part << 8);      // part in byte 1 (big-endian write)
+            bridge_write32(32'h00F0_0020, want_part << 8);      // part in byte 1 (big-endian write)
             rearm("part selected by VALUE, byte 1");
             expect_status(1, 0, want_part, "part selected from a value in byte lane 1");
             checks = checks + 1;
@@ -773,7 +784,7 @@ module tb_dir;
             // having: a decode that assumed little-endian would pass the line above and fail this one,
             // and the failure would look data-dependent rather than endian-dependent. Both lanes have
             // to land on the same part.
-            bridge_write32(32'h00F0_0000, want_part << 24);     // part in byte 3 (little-endian write)
+            bridge_write32(32'h00F0_0020, want_part << 24);     // part in byte 3 (little-endian write)
             rearm("part selected by VALUE, byte 3");
             checks = checks + 1;
             if (dir_part !== want_part[2:0]) begin
@@ -817,27 +828,53 @@ module tb_dir;
             check_at(63*PG + 16, 63*PG + 16, "page 63 (the trailer page) stayed identity");
         end
 
-        // Late refusal. Bytes are flowing, so a part change must be reported and NOT obeyed, and no
-        // sweep is expected either - the directory is frozen. rearm() is not used here because it
-        // waits for rom_ready to fall, and nothing is going to fall any more: that is the point.
+        // CHAPTER SWITCH. This block used to assert the opposite - that a part write after the first
+        // accepted byte was REFUSED and reported late - and the reason it did so was sound at the
+        // time: the view could not be moved under a running game because the VM's reset pin was tied
+        // to constant 0 inside the generated netlist.
+        //
+        // That premise turned out to be a property of OUR top, not of the VM: upstream's a5k.si binds
+        // the VM's algorithm reset to a board button, and aw_pocket.si now exposes it as vm_restart. So
+        // the contract is different and deliberately so - a select while the game runs switches the
+        // view AND restarts the VM, which is what makes continuous play possible. What must NOT change
+        // is the old guarantee that nothing is swapped under a running game silently: the switch is
+        // only legitimate if the restart actually fires, so that is what this checks, and a part the
+        // image does not declare is still refused and reported (run 8's +PARTBAD covers that).
         begin
             int k;
+            int r0;
+            r0 = rstr_seen;
             bridge_write32(32'h00F0_0000 + ((want_part == 0) ? 4 : 0), 32'h0000_0000);
             @(negedge clk_bridge); dataslot_allcomplete <= 1'b1;
             repeat (8) @(negedge clk_bridge);
             dataslot_allcomplete <= 1'b0;
-            for (k = 0; k < 20000 && !part_late; k = k + 1) @(negedge clk_core);
+            // The restart is a pulse in clk_core; count them rather than sampling once, or a pulse
+            // that fired while this loop was elsewhere would read as "never happened".
+            for (k = 0; k < 20000 && (rstr_seen == r0); k = k + 1) @(negedge clk_core);
             checks++;
-            if (!part_late) begin
+            if (rstr_seen == r0) begin
                 errors++;
-                $display("  FAIL: a part write after the first accepted byte was not reported late");
+                $display("  FAIL: a part select while the game runs moved the view without restarting the VM -");
+                $display("        the game would keep executing the old chapter's code over the new part's bytes");
             end
             repeat (200) @(negedge clk_core);
-            // +BADENT ends with a REFUSED install, so the map under test here is identity and the
-            // table is flagged bad; the point of the check (a late write changes nothing) still holds.
-            expect_status(nomagic ? 0 : 1, 0, want_part,
-                          "a late write changes neither the part nor the map");
-            check_at(3*PG + 8, phys3*PG + 8, "still the same part's page 3 after a refused switch");
+            // The view moved to the part the WRITE names. For want_part==0 this block writes +4, i.e.
+            // address-decodes as part 1, so "the switch obeyed the write" reads as part 1 here; for
+            // any other want_part it writes the base address with value 0, which is part 0. Computing
+            // the expectation instead of hardcoding 0 is what turns this from a tautology into a test.
+            checks++;
+            if (dir_part !== ((want_part == 0) ? 3'd1 : 3'd0)) begin
+                errors++;
+                $display("  FAIL: the switch landed on part %0d, wanted %0d", dir_part,
+                         (want_part == 0) ? 1 : 0);
+            end
+            // And the map followed the part: page 3 is the page the directory moved (part 0 reads it
+            // from physical page 5, part 1 from page 6).
+            // (nomagic || highmap) means the map under test is identity for page 3 - the same rule
+            // phys3 already encodes above, reused rather than restated, because restating it is how
+            // the first version of this check broke runs 3 and 4 while passing runs 1 and 2.
+            check_at(3*PG + 8, ((nomagic || highmap) ? 3 : ((want_part == 0) ? 6 : 5))*PG + 8,
+                     "page 3 now reads what the switched-to part's table names");
         end
 
         $display("tb_dir: %0d checks, %0d errors -> %s", checks, errors,

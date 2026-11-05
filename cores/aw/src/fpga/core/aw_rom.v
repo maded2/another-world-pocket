@@ -186,6 +186,11 @@ module aw_rom (
     output wire        rom_dir_busy,     // a sweep owns the chip right now
     output wire        rom_pool_ok,      // the chip's pages 1.. equal the pool sum the image claims
     output wire        rom_part_late,    // a part write arrived after the first byte: next launch
+    // Restart the VM. A pulse in clk_core, long enough for Silice's algorithm reset to take.
+    // This is what turns "choose a part" into "play the next chapter": the VM re-enters its first
+    // statement, which re-reads the trailer at 0x1FFFE0 - now through the NEW part's table - and the
+    // next chapter boots. No upload, no core restart, no bitstream change.
+    output wire        rom_vm_restart,
 
     // ---- the chip ----
     output wire [5:0]  cram0_a,
@@ -691,39 +696,52 @@ module aw_rom (
     // number nobody asked for, but no writer produces that for a 0..7 selection, and part_ok then
     // refuses a part the image does not declare - the failure is a refusal, not a silent wrong part.
     //
-    // Both encodings are live because they cost one comparator: the base address is value-selected
-    // (that is where the list writes), and +4..+1C stays address-selected so the benches and any
-    // future per-part action keep working unchanged. At the base address a zero value means part 0,
-    // which is also what the address says - the two decodings agree exactly where they overlap.
+    // Both encodings are live, at DIFFERENT addresses: 0x00F00020 is value-selected (that is where the
+    // persisted list writes), and 0x00F00000..1C stays address-selected so the benches and any future
+    // per-part action keep working unchanged. Sharing one address was the first attempt and it is
+    // ambiguous by construction - see is_val_addr for the run that proved it.
     wire [2:0] addr_part = bridge_addr[4:2];
     wire [3:0] val_nib   = bridge_wr_data[3:0]  | bridge_wr_data[11:8]
                          | bridge_wr_data[19:16] | bridge_wr_data[27:24];
-    wire [2:0] sel_part  = (addr_part == 3'd0 && val_nib != 4'd0) ? val_nib[2:0] : addr_part;
-    reg  [1:0] streamed_s = 2'b00;
+    // The list gets its OWN address, so the two encodings cannot collide. The first version decoded
+    // the value at the BASE address (0x00F00000), which meant any nonzero data written there overrode
+    // the address - and tb_soc selects part 0 by writing the base address with a dummy 1, so its
+    // "part 0" turned into part 1 and the paged gate reported `part=1 (wanted part 0)`. A bench that
+    // writes data it considers meaningless is exactly the writer this ambiguity punishes.
+    // 0x00F00020 is inside the same decode window and outside the 0..7 address-selected slots, so
+    // address writes never reach the value path and value writes never reach the address path.
+    wire       is_val_addr = (bridge_addr[7:0] == 8'h20);
+    wire [2:0] sel_part  = is_val_addr ? val_nib[2:0] : addr_part;
     reg        part_push = 1'b0;   // explicit power-up: a 1 here would push a garbage request
     reg  [2:0] part_din    = 3'd0;
     always @(posedge clk_bridge) begin
-        streamed_s <= {streamed_s[0], streamed_q};
         part_push  <= 1'b0;
-        // Honoured until the VM has taken its first byte, and not after. That boundary is chosen
-        // rather than rom_ready: the framework writes persisted interact values "immediately before
-        // Reset Exit", which can be AFTER the upload-complete sweep, so a rom_ready gate would drop
-        // the part the user actually picked. Nothing has been streamed at that point, because the VM
-        // is held off. After the first acceptance a switch could not work anyway - the VM's reset
-        // pin is tied to 0 inside the generated netlist (see core_top), so the game would keep
-        // running over another part's bytes - and `part_late` says so out loud instead of failing
-        // as a wrong-looking picture. The variable is persisted, so it arrives again next boot.
+        // No streamed gate here, and that is the chapter-change feature rather than an oversight.
+        // The gate this replaces existed because the VM's reset was believed unreachable; it is not
+        // (aw_pocket.si binds it to vm_restart), so a select arriving while the game runs switches the
+        // view and restarts the VM instead of being refused. The chosen boundary is accept_vm rather
+        // than rom_ready for the ORIGINAL reason, which still holds: the framework writes persisted
+        // interact values "immediately before Reset Exit", which can be after the upload-complete
+        // sweep, so a rom_ready gate would drop the part the user actually picked.
         // Two reasons a select is refused, one flag, because both mean "the view did not move and
         // you will be told": bytes were already flowing, or that part has no usable table in the
         // image that is loaded. Checking it HERE (at the decode, single driver) rather than at the
         // commit keeps part_late on one process; part_ok is a psram-domain register, so the test
         // costs a compare and no crossing.
-        if (bridge_wr && bridge_addr[31:12] == 20'h00F00 && !streamed_s[1]
+        // A select is accepted at ANY time now, provided the image declares the part. While the game
+        // is running it means "switch to that chapter", and the commit below clears streamed_q and
+        // pulses the VM's reset - the VM re-reads the trailer through the new table and starts the new
+        // chapter. It used to be refused once the VM had taken a byte, on the belief that the VM could
+        // not be restarted; upstream's a5k.si binds that reset to a button, and aw_pocket.si now wires
+        // it out (see rom_vm_restart).
+        if (bridge_wr && bridge_addr[31:12] == 20'h00F00
             && (!dir_installed || part_ok[sel_part])) begin
             part_push <= 1'b1;
             part_din  <= sel_part;
         end else if (bridge_wr && bridge_addr[31:12] == 20'h00F00) begin
-            part_late <= 1'b1;      // refused. Reported, not fixed.
+            // Refused: the image does not declare that part, or its table failed the sweep. Reported,
+            // not fixed - the view does not move and the console says why.
+            part_late <= 1'b1;
         end
     end
 
@@ -1776,10 +1794,17 @@ module aw_rom (
         else           arm_req_s <= {arm_req_s[1:0], arm_req};
     end
 
-    // Drain the request FIFO into part_val as soon as one is waiting and nothing has streamed, so a
-    // sweep start finds a HELD part instead of racing a registered FIFO output. Own process, one
-    // driver; the timeout is here because a read side that never answers must not leave this in
-    // P_WAIT forever - the census watchdog's reasoning, one level down.
+    // Drain the request FIFO into part_val as soon as one is waiting, so a sweep start finds a HELD
+    // part instead of racing a registered FIFO output. Own process, one driver; the timeout is here
+    // because a read side that never answers must not leave this in P_WAIT forever - the census
+    // watchdog's reasoning, one level down.
+    //
+    // `!streamed_q` was a condition here and it is gone: it existed so a select could only be taken
+    // before the game started, which was the same "the VM cannot be restarted" premise that has now
+    // been falsified twice in this file. With it in place a mid-session select was pushed into the
+    // FIFO and then sat there forever - tb_dir's chapter switch printed empty=0 p_state=0 with the
+    // request still queued, so the view never moved and no restart fired. The FIFO is the only place
+    // a request can wait, and nothing else should be allowed to decide whether it is read.
     always @(posedge clk_psram) begin
         if (rst_psram) begin
             p_state   <= P_IDLE;
@@ -1791,7 +1816,7 @@ module aw_rom (
             part_pop <= 1'b0;
             if (dir_start) part_held <= 1'b0;   // consumed at the sweep start, right or wrong part
             case (p_state)
-            P_IDLE: if (!part_empty && !streamed_q) begin
+            P_IDLE: if (!part_empty) begin
                         part_pop <= 1'b1;
                         p_wcnt   <= 8'd0;
                         p_state  <= P_WAIT;
@@ -1823,6 +1848,57 @@ module aw_rom (
             view_part <= part_fw;
     end
 
+    // ---- chapter change: a part select that arrives while the game is RUNNING ----
+    // This used to be refused outright (part_late) on the argument that the VM's reset pin is tied
+    // to constant 0 in the generated netlist, so the view could not be moved under a running game.
+    // That argument was airtight and the premise was wrong: upstream's own a5k.si binds the VM's
+    // algorithm reset to a board button (`vm_reset = btns.back`), so the VM has always been
+    // restartable - see aw_pocket.si's vm_restart input. With all eight tables resident (#28), a
+    // chapter change is therefore: point view_part at the new part, pulse the VM's reset, and the VM
+    // re-reads the trailer through the new table and boots the next chapter.
+    //
+    // The ordering is the whole correctness argument: view_part commits on this same edge, so by the
+    // time the pulse has crossed into clk_core and the VM has restarted, the table already names the
+    // new part. The pulse is generated from a TOGGLE rather than a level and then stretched in
+    // clk_core, because Silice's algorithm reset is level-sensitive - a level left high would park the
+    // game on the first statement of the trailer read forever.
+    reg        restart_tog;
+    always @(posedge clk_psram) begin
+        if (rst_psram) restart_tog <= 1'b0;
+        else if (part_rv && (p_state == P_WAIT) && streamed_q && part_ok[part_fw])
+            restart_tog <= ~restart_tog;
+    end
+
+    // In clk_core, where the SoC lives: synchronise the toggle, turn the change into a pulse, and
+    // hold it for 16 clocks (640 ns) - comfortably past Silice's 4-clock clean_reset and short
+    // enough that a player never sees it. `armed` makes the first observation after reset harmless:
+    // a fresh bitstream must not power up into a spurious restart.
+    reg  [2:0] rstr_s;
+    reg        rstr_armed;
+    reg  [4:0] rstr_cnt;
+    reg        rstr_pulse;
+    always @(posedge clk_core) begin
+        if (rst_core) begin
+            rstr_s     <= 3'b000;
+            rstr_armed <= 1'b0;
+            rstr_cnt   <= 5'd0;
+            rstr_pulse <= 1'b0;
+        end else begin
+            rstr_s <= {rstr_s[1:0], restart_tog};
+            if (!rstr_armed) begin
+                rstr_armed <= 1'b1;              // take the current value as the baseline
+            end else if (rstr_s[2] != rstr_s[1]) begin
+                rstr_cnt   <= 5'd16;             // a toggle arrived: start the pulse
+                rstr_pulse <= 1'b1;
+            end else if (rstr_cnt != 5'd0) begin
+                rstr_cnt <= rstr_cnt - 5'd1;
+            end else begin
+                rstr_pulse <= 1'b0;
+            end
+        end
+    end
+    assign rom_vm_restart = rstr_pulse;
+
     // The one-way gate on part requests. Once the VM has taken a byte, re-pointing the page table
     // would swap the bytes under a running game, and the game cannot be restarted from here: the
     // VM's reset pin is tied to constant 0 inside the generated netlist (see the reset section of
@@ -1834,8 +1910,13 @@ module aw_rom (
     // tb_dir's second run reported streamed=1 late=1 with no reads at all, and the select was
     // refused for a reason that had nothing to do with the game running. The event meant here is the
     // rising edge of the VM's in_ready: the first byte genuinely asked for.
+    // Cleared by a chapter switch as well as set by the first accepted byte: the restart puts the VM
+    // back at its first statement, so "the game has started consuming" is false again the moment the
+    // switch commits. Without the clear, a second switch would be indistinguishable from the first
+    // and the restart would fire on a VM that had not yet re-read anything.
     always @(posedge clk_psram) begin
         if (rst_psram) streamed_q <= 1'b0;
+        else if (part_rv && (p_state == P_WAIT) && part_ok[part_fw]) streamed_q <= 1'b0;
         else if (accept_vm) streamed_q <= 1'b1;
     end
     wire [7:0] c_byte = c_addr[0] ? c_word[15:8] : c_word[7:0];

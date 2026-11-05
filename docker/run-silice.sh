@@ -94,7 +94,7 @@ fi
 # task #28, so a dropped LATESEL_TEST silently turns "the late-select case was checked and passed"
 # into "the case was not run" while the suite still prints its usual PASS. Same failure shape as IMG
 # above, which is why it is on this list on the same day it was needed.
-for _v in TRACE READTRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS EXTRA WORK STALL FRAMEDIR PACK_KIND IMG LATESEL_TEST RUNS; do
+for _v in TRACE READTRACE FRAMES PACE JOBS SIGTAP QUARTUS_ARGS PART SECS SHOTS REF_DIR REF_OUT PERIPHERALS EXTRA WORK STALL FRAMEDIR PACK_KIND IMG LATESEL_TEST RUNS SWITCH SWITCHAFTER; do
     [ -n "${!_v:-}" ] && docker_args+=(-e "$_v")
 done
 

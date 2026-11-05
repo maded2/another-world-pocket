@@ -119,6 +119,7 @@ reg design_run = 1'b0;
         .rom_part            (dir_part_w),
         .rom_part_late       (dir_late_w),
         .rom_pool_ok         (pool_ok_w),
+        .rom_vm_restart      (vm_restart_w),
         .cram0_a             (cram0_a),
         .cram0_dq            (cram0_dq),
         .cram0_wait          (cram0_wait),
@@ -254,6 +255,7 @@ reg design_run = 1'b0;
         .in_mem_data_available(mem_data_available),
         .in_mem_busy          (mem_busy),
         .in_jstick            (js),
+        .in_vm_restart        (vm_restart_w),
         .out_mem_in_ready     (mem_in_ready),
         .out_mem_addr         (mem_addr),
         .out_video_r          (game_r),
@@ -276,7 +278,7 @@ reg design_run = 1'b0;
     reg [7:0] img_mem [0:IMG_BYTES-1];               // uploaded image when +IMG is given
     int         img_bytes = 0;                       // its real length, from +IMG_BYTES
     int         part_sel  = -1;                      // +PART: which part to select before byte 0
-    wire        dir_valid_w, dir_bad_w, dir_busy_w, dir_late_w, pool_ok_w;
+    wire        dir_valid_w, dir_bad_w, dir_busy_w, dir_late_w, pool_ok_w, vm_restart_w;
     wire [2:0]  dir_part_w;
     wire [7:0]  dir_err_w;
     string    pack_hex;
@@ -314,6 +316,20 @@ reg design_run = 1'b0;
     integer   pause_at = 0;
     integer   pause_ms = 30;
     integer   max_frames = 40;
+    // +SWITCH=<part>: change chapter mid-run, the way the OSD list does, and watch whether the VM
+    // really restarts. This exists because "the page table moved" and "the game is now running the
+    // new chapter" are different claims, and only the second one is the feature. The proof used is
+    // the VM's own boot sequence: it reads four segment offsets from 0x1FFFE0 and never looks again,
+    // so a SECOND read of that address can only mean the VM re-ran its start - and the bytes it got
+    // must be the new part's, which is checked against that part's pack directly.
+    integer   switch_part = -1;
+    integer   switch_after = 6;
+    int       trailer_reads = 0;
+    reg       mem_addr_trailer_d = 1'b0;
+    reg [7:0] trailer_bytes [0:15];
+    int       trailer_n = 0;
+    reg       switch_done = 1'b0;
+    int       switch_at = 0;
     integer   errors = 0;
     reg       s1_pass = 1'b0;   // decides the process exit status, not just the printed verdict
 
@@ -1263,6 +1279,8 @@ reg design_run = 1'b0;
         void'($value$plusargs("PAUSEAT=%d", pause_at));
         void'($value$plusargs("PAUSEMS=%d", pause_ms));
         void'($value$plusargs("FRAMES=%d", max_frames));
+        void'($value$plusargs("SWITCH=%d", switch_part));
+        void'($value$plusargs("SWITCHAFTER=%d", switch_after));
         void'($value$plusargs("NOINPUT=%d", noinput));
         void'($value$plusargs("PACK_KIND=%s", pack_kind));
         void'($value$plusargs("IMG=%s", img_hex));
@@ -1440,13 +1458,92 @@ reg design_run = 1'b0;
         begin : run_until_frames
             integer c;
             c = 0;
+            // Frames are counted from time zero, so the idle screen's frames are already in the
+            // total by the time the game starts. A switch keyed to an absolute frame number therefore
+            // fires during boot - which is what the first version of this did, and it moved the part
+            // before the paged gate had even looked at it. Keying it to "four frames into the run"
+            // makes the test say what it means regardless of how long boot takes.
+            if (switch_part >= 0) switch_at = frames + switch_after;
             while (frames < max_frames) begin
                 @(negedge clk_core);
+                // The VM's boot sequence announces itself: addr = 0x1FFFE0 with in_ready high. Count
+                // the starts and keep the sixteen bytes it reads, so "it restarted" can be checked
+                // against "and it read the part we switched to".
+                // The last 32 bytes of the view: addr[23:5] == 0x0FFFF covers 0x1FFFE0..0x1FFFFF.
+                // Exact equality with 0x1FFFE0 was the first version and it never fired, because the
+                // VM's trailer read is a STREAM - the address advances as bytes are consumed, so the
+                // one cycle that matches exactly is easy to miss and the count stayed 0 while the
+                // feature was actually working.
+                if (mem_in_ready && (mem_addr[23:5] == 19'h0FFFF) && !mem_addr_trailer_d) begin
+                    trailer_reads = trailer_reads + 1;
+                    trailer_n     = 0;
+                    $display("  trailer read #%0d at t=%0t (dir_part=%0d)", trailer_reads, $time, dir_part_w);
+                    $fflush;
+                end
+                mem_addr_trailer_d <= (mem_in_ready && (mem_addr[23:5] == 19'h0FFFF));
+                if (mem_data_available && trailer_n < 16) begin
+                    trailer_bytes[trailer_n] = mem_data;
+                    trailer_n = trailer_n + 1;
+                end
+                // The chapter change, once, after the given number of frames.
+                if (switch_part >= 0 && frames >= switch_at && !switch_done) begin
+                    switch_done = 1'b1;
+                    $display("  SWITCH to part %0d at frame %0d (streamed_q=%b dir_part=%0d)",
+                             switch_part, frames, u_rom.streamed_q, dir_part_w); $fflush;
+                    wr32(32'h00F0_0020, switch_part << 8);
+                end
                 c = c + 1;
                 if (c == 250000) begin   // every ~10 ms of design time
                     c = 0;
                     $display("  t=%0t frames=%0d bytes_to_vm=%0d addr=%h starving=%0d leds=%b",
                              $time, frames, bytes_to_vm, mem_addr, starving, leds); $fflush;
+                end
+            end
+        end
+
+        // ---- did the chapter change actually happen? ----
+        // Three claims, in increasing strength, and each one has failed on its own somewhere in this
+        // port's history: the table moved, the VM restarted, and the VM is running the NEW part's
+        // bytes. The third is checked against the image itself, fetched through the page table the
+        // core is actually using - not against a copy the bench made, which is how a broken map can
+        // agree with itself.
+        if (switch_part >= 0) begin
+            int k;
+            int bad = 0;
+            int tpage;
+            // reported inline; tb_soc counts errors, not a check tally
+            if (trailer_reads < 2) begin
+                errors = errors + 1;
+                $display("tb_soc: FAIL - the VM read the trailer %0d time(s): the part switch did not restart it",
+                         trailer_reads);
+            end else begin
+                $display("  ok   the VM re-ran its boot after the switch (%0d trailer reads)", trailer_reads);
+            end
+            // reported inline; tb_soc counts errors, not a check tally
+            if (dir_part_w !== switch_part[2:0]) begin
+                errors = errors + 1;
+                $display("tb_soc: FAIL - the view is on part %0d after switching to %0d", dir_part_w, switch_part);
+            end else begin
+                $display("  ok   the view moved to part %0d", dir_part_w);
+            end
+            // The trailer the VM got must be the one the table names for the new part.
+            // reported inline; tb_soc counts errors, not a check tally
+            if (img_bytes == 0) begin
+                $display("  --   trailer bytes not checked: no image loaded (plain pack run)");
+            end else begin
+                tpage = u_rom.pgtbl[{switch_part[2:0], 6'd63}];
+                for (k = 0; k < 16; k = k + 1)
+                    if (trailer_bytes[k] !== img_mem[tpage*32768 + 16'h7FE0 + k]) begin
+                        bad = bad + 1;
+                        if (bad <= 4)
+                            $display("  MISMATCH trailer byte %0d: VM got %02h, the table's page %0d holds %02h",
+                                     k, trailer_bytes[k], tpage, img_mem[tpage*32768 + 16'h7FE0 + k]);
+                    end
+                if (bad != 0) begin
+                    errors = errors + 1;
+                    $display("tb_soc: FAIL - %0d of 16 trailer bytes are not the new part's", bad);
+                end else begin
+                    $display("  ok   the trailer the VM re-read is part %0d's (physical page %0d)", switch_part, tpage);
                 end
             end
         end
@@ -1665,9 +1762,16 @@ reg design_run = 1'b0;
             // page stays untouched is not "drawing the copy-protection screen", it is drawing
             // nothing - which is exactly what this branch is for, since the rich-frame test
             // below cannot say anything true about a pack that is black by design.
+            // A chapter switch legitimately changes what is drawn, and this verdict compares against
+            // the pack named on the command line. Skipping it is the honest form; letting it fail as
+            // "no strip was laid down" would be a false alarm with authority.
+            if (switch_part >= 0) begin
+                $display("tb_soc: (text verdict skipped: a chapter switch was performed, so the original part's reference no longer applies)");
+            end else begin
             $display("tb_soc: FAIL - pack kind is %s and %0d bytes reached the VM, but op_drawString never laid down a single strip in %0d frames",
                      pack_kind, bytes_to_vm, frames);
             s1_pass = 0;
+            end
         end else if (pack_kind != "text" && rich_frames == 0) begin
             $display("tb_soc: FAIL - %0d frames, no rich frame (best %0d colours, %0d non-black, %0d bytes to the VM); a uniform fill is not a rendering",
                      frames, max_colours, frames - black_frames, bytes_to_vm);

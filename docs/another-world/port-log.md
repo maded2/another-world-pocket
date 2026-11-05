@@ -2995,3 +2995,68 @@ worst setup 0.988 ns (slow) / 1.255 ns (fast), hold 0.292 ns, scoped `make check
 Bitstream **`2bdcce831ce41dac`**, banner `AW 1046a`. The installer additionally validates interact.json
 on the card - eight options, persisted, addressed at `0x00F00000` - because a build whose selector is
 missing would otherwise look exactly like one whose selector is broken.
+
+---
+
+## 2026-11-05 — P2 (continuous play): the mechanism is found and half-built; the VM restarts onto an unquiesced stream
+
+The question was "can the game continue into the next part by itself". The plan doc's answer was that
+the engine cannot ask - it reads four segment offsets from the trailer once (`vm.si:363`) and never
+revisits the question - so a switch has to be triggered from outside. What that document did *not*
+establish is whether a switch is even possible, and the RTL had been written on the assumption that it
+was not:
+
+```
+aw_rom.v: "the VM cannot be restarted from here: the VM's reset pin is tied to constant 0
+           inside the generated netlist, which is upstream's choice"
+```
+
+**That premise was wrong, and it was wrong about us, not about upstream.** `a5k.si:610` declares
+`uint1 vm_reset(0); vm vm<!vm_reset>(...)` and `a5k.si:642` drives it from a board button
+(`vm_reset = btns.back`). The VM has always been restartable; *our* SoC top (`aw_pocket.si`) was the
+thing tying it to zero. Its boot sequence starts at a `++:` label, waits for `mem.busy`, reads the
+trailer and enters `while (1)`. So a VM reset re-reads the trailer - and with all eight page tables
+already resident (#28), pointing `view_part` at the next part and pulsing that reset *is* "start the
+next chapter", with no upload and no core restart.
+
+### What is built and verified
+
+- `aw_pocket.si` exposes `vm_restart` and binds it to the VM's algorithm reset; the netlist regenerates
+  with `in_vm_restart` and Silice's per-register `_q_x <= (reset) ? init : d` form, which is a genuine
+  synchronous restart. `tb_dir` proves the netlist port, the pulse and the view change independently.
+- `aw_rom` decodes a select at **any** time now: before the first byte it is the boot choice, after it
+  the commit clears `streamed_q` and toggles a restart request that `clk_core` turns into a 16-cycle
+  pulse. The two-decoding split moved the value-addressed list to **0x00F00020**, because sharing
+  0x00F00000 with the address decoding was ambiguous - `tb_soc` selects part 0 by writing the base
+  address with a dummy `1`, which the value decode read as part 1 (`part=1 (wanted part 0)`). A bench
+  that writes data it considers meaningless is exactly the writer that ambiguity punishes.
+- `tb_dir` run 1's late-select check was rewritten from "must be refused" to "must move the view AND
+  restart the VM", because the contract changed by design; all 9 runs pass (214 checks).
+
+### What does not work yet, measured
+
+`tb_soc +SWITCH=1 SWITCHAFTER=4` on the paged image: the switch fires, `dir_part` becomes 1, the pulse
+fires - and the VM then asks for `0x200000`, `0x2010C3`, i.e. **past the end of its 2 MiB view**,
+`bytes_to_vm` freezes at 1040 and `starving` climbs to 536,255.
+
+The shape says what happened: the trailer read is `mem.addr = 0x1FFFE0` plus a byte-counting loop, so a
+consumer that over-reads by a few bytes walks to 0x200000, shifts a garbage segment offset into
+`segOffsets`, and then asks for addresses derived from it. The restart itself lands (registers reset),
+but `aw_rom`'s consumer-side stream state is still mid-acceptance when the pulse arrives - it is left
+holding a pending acceptance for a consumer that no longer exists, so the new read starts inside the old
+stream. That is the `starving` counter doing exactly its job and finding the bug.
+
+**Fix identified, not yet written:** the restart has to quiesce `aw_rom`'s fetch state machine
+(`c_state`, pending acceptance, prefetch) in the same event, not just the VM. `restart_tog` already
+lives in `clk_psram`, which is where that state machine is, so the crossing exists. Until that is done,
+a mid-session select can hang the game - so this work stays off the card, and `AW 1046`
+(`2bdcce831ce41dac`) remains the installed build with the manual, boot-time selector.
+
+### What this means for the "continuous" question
+
+The reply to the original question is now specific rather than a shrug: continuity is reachable, the
+pieces are (a) all tables resident - done, (b) a resettable VM - the VM always had one, now wired,
+(c) a trigger - the OSD list, and (d) a clean handover of the ROM stream across the restart - the
+missing piece. And it should be said plainly that even when it works, the switch will be *player*
+initiated (or heuristic), because the engine cannot ask for the next part: nothing in `vm.si` knows what
+a part is.

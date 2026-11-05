@@ -829,6 +829,13 @@ M_main u_soc (
     .in_mem_data_available( rom_data_available ),
     .in_mem_busy          ( rom_busy           ),
     .in_jstick            ( jstick             ),
+    // Restart the VM from its first statement - which re-reads the trailer at 0x1FFFE0 and so starts
+    // whatever part the page table names. This is the whole "continuous play" mechanism: aw_rom pulses
+    // it when the player picks a different part from the OSD while the game is running, and because
+    // all eight tables are already resident the switch costs one pulse and no upload. The comment in
+    // aw_rom's part-select block used to say this was impossible because the pin was tied to 0; that
+    // was true of OUR top, not of the VM - aw_pocket.si now drives it.
+    .in_vm_restart        ( rom_vm_restart     ),
 
     .out_mem_in_ready     ( mem_in_ready       ),
     .out_mem_addr         ( mem_addr           ),
@@ -851,7 +858,7 @@ M_main u_soc (
 
 // Directory / paging state. These were left unconnected the moment they were added, which is how a
 // core can spend a week verifying things nobody is allowed to find out about.
-wire        rom_dir_valid, rom_dir_bad, rom_dir_busy, rom_part_late, rom_pool_ok;
+wire        rom_dir_valid, rom_dir_bad, rom_dir_busy, rom_part_late, rom_pool_ok, rom_vm_restart;
 wire [2:0]  rom_part_sel;
 wire [6:0]  rom_dir_err;
 
@@ -907,6 +914,7 @@ aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .rom_part             ( rom_part_sel         ),
     .rom_part_late        ( rom_part_late        ),
     .rom_pool_ok          ( rom_pool_ok          ),
+    .rom_vm_restart       ( rom_vm_restart       ),
 
     .cram0_a              ( cram0_a              ),
     .cram0_dq             ( cram0_dq             ),

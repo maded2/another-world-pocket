@@ -412,6 +412,15 @@ unit main(
   input  uint1  mem_busy,
   // controls: bit5 fire, bit3 down, bit2 up, bit1 left, bit0 right (upstream order)
   input  uint6  jstick,
+  // Restart the VM from its first statement, which re-reads the trailer at
+  // 0x1FFFE0 and therefore starts whatever part the page table now names. This
+  // is the whole mechanism behind "continuous" play: upstream's a5k binds the
+  // VM's algorithm reset to a board button (a5k.si: `vm_reset = btns.back`),
+  // so the VM has always been restartable - our top was the thing tying it to
+  // a constant. With all eight page tables resident (aw_rom), a chapter change
+  // is then: point view_part at the next part, pulse this, and the VM boots the
+  // next chapter with no upload and no core restart.
+  input  uint1  vm_restart,
   // video to the Pocket scaler
   output uint8  video_r,
   output uint8  video_g,
@@ -482,8 +491,15 @@ unit main(
   );
 
   // ---- virtual machine
-  uint1 vm_reset(0);
-  vm vm<!vm_reset>( mem     <:> mem_vm,
+  // Bound directly to our restart input instead of the constant upstream's Pocket
+  // port uses: Silice takes the binding as a signal, so no intermediate variable is
+  // needed (and a bare `vm_reset = vm_restart;` at this point is a syntax error - the
+  // assignment has to live in a statement region, which is why upstream's a5k.si sets
+  // it inside its board algorithm instead).
+  // Level-sensitive by construction: Silice's algorithm reset holds the VM at its
+  // first statement while high, so core_top pulses it rather than leaving it on - a
+  // level would park the game at the trailer read forever.
+  vm vm<!vm_restart>( mem     <:> mem_vm,
                     polygon <:> polygon,
                     palette <:> palette,
                     vblank  <:: vblank,

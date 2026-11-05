@@ -168,9 +168,15 @@ echo "pack  : $PACK"
 echo "role  : $role"
 echo "kind  : $kind (what the verdict is graded on)"
 echo "=== run: load, boot, capture $FRAMES frames ==="
+# SWITCH/SWITCHAFTER: change chapter mid-run and check that the VM really re-runs its boot. Passed
+# as plusargs here because forwarding the environment variable is not enough - the bench only sees
+# what is on this command line. That distinction cost a run: the variable arrived in the container,
+# the plusarg did not exist, and the bench silently did nothing, which reads exactly like a design
+# that failed to switch.
 ./obj/tb_soc "+PACK=$WORK/pack.hex" "+PACE=${PACE:-10}" "+FRAMES=$FRAMES" \
              "+FRAMEDIR=$FRAMEDIR" "+PACK_KIND=$kind" \
-             ${IMG:+"+IMG=$WORK/img.hex" "+IMG_BYTES=$IMG_BYTES" "+PART=$PART"} ${EXTRA:-}
+             ${IMG:+"+IMG=$WORK/img.hex" "+IMG_BYTES=$IMG_BYTES" "+PART=$PART"} \
+             ${SWITCH:+"+SWITCH=$SWITCH" "+SWITCHAFTER=${SWITCHAFTER:-4}"} ${EXTRA:-}
 # EXTRA carries bench plusargs that are not the pack, e.g.
 #   EXTRA=+FUZZ_BRAM=1 ./docker/run-silice.sh scripts/sim_soc.sh
 # (the positional argument is the pack, so "$@" could not be used for both)
