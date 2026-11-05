@@ -2810,3 +2810,20 @@ setup 1.254 ns (slow) / 0.404 ns (fast), hold 0.278 ns, scoped `make check-build
 `f8b7b23eea01099c`, which contained both regressions and must not go on a card. `AW 1042`
 (`579746d33d45b594`) remains the only bitstream that has ever been installed; nothing paged has been in
 a Pocket, and the card was unmounted again before the install could run.
+
+### Installed on the card (2026-11-05), and the false alarm that got fixed first
+
+`Cores/Eddie Chan.AW 1044` (`a786f317510af3aa`, read back and verified) sits beside `AW 1042`
+(`579746d33d45b594`, untouched), and `Assets/anotherworld/common/aw-all.bin` (3,080,192 B) sits beside
+the eight single-part packs.
+
+The installer's first run reported **"NOT INSTALLED cleanly"** on a card where every byte of every file
+was in place. `core.json` is the one file the installer rewrites after copying - shortname,
+description, version, date - so hashing it against the repo copy can only ever fail. A verification
+step that cannot pass is not a verification step; it is a false alarm with authority, and the one that
+fires last in a script is the one people read as the verdict. It is replaced by checking the four facts
+that decide whether the core boots, read back off the card: `magic == APF_VER_1`, `platform_ids` names
+`anotherworld`, `cores[0].filename == bitstream.rbf_r`, `chip32_vm == loader.bin`, plus a structural
+diff proving nothing outside the four rewritten metadata fields changed. The second run is clean, and
+re-copying from scratch was deliberate: it re-proves the bitstream and image paths too rather than
+trusting the first pass.

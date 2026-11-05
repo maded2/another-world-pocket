@@ -107,6 +107,12 @@ cp "$BS" "$DST/bitstream.rbf_r" || { echo "FATAL: bitstream copy failed"; exit 1
 # Describe what this build is, in the OSD, the way 1042's installer did. Short name and description
 # only - the framework reads core.json for the dataslot and the bitstream name, and silently ignores
 # a description that is a lie, so it is written for the human.
+#
+# Note what this does to the verification at the bottom: core.json is the ONE file this installer
+# edits, so a hash against the repo copy can only ever disagree - which is exactly what the first run
+# of this script reported, as "NOT INSTALLED cleanly", on a card that had every byte of every file in
+# place. A check that cannot pass is not a check; the fields that decide whether this core boots are
+# validated by name instead, further down.
 python3 - "$DST/core.json" <<'PY'
 import json, sys, datetime
 p = sys.argv[1]
@@ -143,9 +149,48 @@ echo
 echo "verifying what is actually on the card (sha256, read back):"
 fail=0
 for f in $FILES; do
+    [ "$f" = "core.json" ] && continue      # patched here, so validated by field, not by hash
     a=$(sha256sum < "$SRC/$f" | cut -d' ' -f1); b=$(sha256sum < "$DST/$f" | cut -d' ' -f1)
     [ "$a" = "$b" ] && echo "  ok   $f" || { echo "  FAIL $f  card=$b repo=$a"; fail=1; }
 done
+# core.json: what the framework actually reads, read back off the card. This replaces a hash
+# comparison that could never pass (this script rewrites the file after copying it) with the four
+# facts that decide whether the core boots at all, plus a structural diff against the repo copy so a
+# field nobody meant to drop cannot quietly go missing. A check that cannot pass is not a check.
+python3 - "$DST/core.json" "$SRC/core.json" <<'PY' || fail=1
+import json, sys
+card, repo = (json.load(open(p)) for p in sys.argv[1:3])
+REWRITTEN = {"shortname", "description", "version", "date_release"}
+c, r = card["core"], repo["core"]
+bad = []
+if c.get("magic") != "APF_VER_1":
+    bad.append("magic is %r, framework expects APF_VER_1" % c.get("magic"))
+if "anotherworld" not in c.get("metadata", {}).get("platform_ids", []):
+    bad.append("platform_ids %r does not name anotherworld - the core will not offer the dataslot"
+               % c["metadata"].get("platform_ids"))
+cores = c.get("cores", [])
+if not cores or cores[0].get("filename") != "bitstream.rbf_r":
+    bad.append("cores[0].filename is %r, but the bitstream was written as bitstream.rbf_r"
+               % (cores[0].get("filename") if cores else None))
+if c.get("framework", {}).get("chip32_vm") != "loader.bin":
+    bad.append("chip32_vm is %r but loader.bin is what was copied" % c["framework"].get("chip32_vm"))
+if c.get("metadata", {}).get("shortname") != "AW 1044":
+    bad.append("shortname is %r - the OSD label is how the user picks this build" % c["metadata"].get("shortname"))
+# Everything outside the four fields we rewrite must be byte-identical in meaning to the repo copy.
+def strip(d):
+    d = json.loads(json.dumps(d))
+    m = d["core"]["metadata"]
+    for k in REWRITTEN:
+        m.pop(k, None)
+    return d
+if strip(card) != strip(repo):
+    bad.append("core.json differs from the repo copy outside the rewritten metadata fields")
+for b in bad:
+    print("  FAIL core.json  %s" % b)
+if not bad:
+    print("  ok   core.json  (magic, platform, bitstream name, chip32 vm, label; rest identical to repo)")
+sys.exit(1 if bad else 0)
+PY
 a="$BSHA";                    b=$(sha256sum < "$DST/bitstream.rbf_r" | cut -d' ' -f1)
 [ "$a" = "$b" ] && echo "  ok   bitstream.rbf_r  $b" || { echo "  FAIL bitstream  card=$b repo=$a"; fail=1; }
 a="$ISHA";                    b=$(sha256sum < "$ADF/aw-all.bin" | cut -d' ' -f1)
@@ -157,7 +202,8 @@ a="$ISHA";                    b=$(sha256sum < "$ADF/aw-all.bin" | cut -d' ' -f1)
 
 cat <<'DONE'
 
-DONE. Eject, put the card back in the Pocket, boot.
+DONE. Eject safely (sync happened; umount if your desktop did not), put the card back in the Pocket,
+boot.
 
 Start a UART capture BEFORE launching:
     python3 scripts/capture_serial.py /dev/ttyUSB1
