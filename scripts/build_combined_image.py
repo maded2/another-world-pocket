@@ -96,7 +96,7 @@ def frame_of(page_bytes: bytes) -> bytes:
     return page_bytes + bytes(PAGE - len(page_bytes))
 
 
-def build(packs, out_path):
+def build(packs, out_path, part0_last=False):
     pool = {}          # sha1 -> frame index
     frames = []        # frame index -> bytes
     tables = []        # part -> [frame index] * PAGES
@@ -116,6 +116,27 @@ def build(packs, out_path):
             table.append(pool[h] + 1)      # PHYSICAL page: pool index 0 is page 1, page 0 is the
                                            # directory, so the core can never address the header
         tables.append(table)
+
+    if part0_last:
+        # Put every frame part 0 references at the END of the pool, and point part 0's table there.
+        #
+        # Why the file layout would ever be reordered for a test: to ask the POCKET a question it can
+        # answer without a UART. Same total size, same declared sums, same parts - only part 0's data
+        # moves to the last pages of the file. Launch it and look at the screen:
+        #   renders part 0  -> the framework delivered the WHOLE file, tail included
+        #   black/broken    -> the upload stopped before the end, and part 0's frames are what fell off
+        # Comparing that against the normal layout (part 0 at the front) separates "the framework will
+        # not carry 2.94 MiB" from "the core mishandles the bytes", which is the entire question #15
+        # was opened for and the one thing no simulation of our own chip can answer: the bench IS the
+        # host. Frame indices are physical pool pages (index 0 = page 1), so the permutation has to
+        # rewrite both the layout and every table entry that names it.
+        p0 = set(tables[0])
+        order = ([i for i in range(len(frames)) if i not in p0]
+                 + [i for i in range(len(frames)) if i in p0])
+        remap = {old: new for new, old in enumerate(order)}
+        frames = [frames[o] for o in order]
+        per_frame_uses = [per_frame_uses[o] for o in order]
+        tables = [[remap[v - 1] + 1 for v in t] for t in tables]
 
     if len(frames) > MAX_FRAMES:
         raise SystemExit("pool is %d frames, limit is %d: the pool must stay on die 0 (pages 1..127) "
@@ -358,10 +379,16 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--report", action="store_true")
     ap.add_argument("-o", "--out", default=OUT)
+    ap.add_argument("--parts", type=int, default=PART_COUNT,
+                    help="only the first N parts (a small paged image proves the FORMAT works "
+                         "on hardware independently of the file being 2.94 MiB)")
+    ap.add_argument("--part0-last", action="store_true",
+                    help="move part 0's frames to the end of the file (same size, same sums) so a "
+                         "launch answers 'did the tail arrive?' from the screen alone")
     a = ap.parse_args()
 
     packs = []
-    for i in range(PART_COUNT):
+    for i in range(a.parts):
         p = os.path.join(PACK_DIR, "part%d.bin" % i)
         with open(p, "rb") as fh:
             packs.append(fh.read())
@@ -380,7 +407,7 @@ def main():
         print("\nOK: every part's view is byte-identical to its pack")
         return 0
 
-    blob, frames, tables, uses, _ = build(packs, a.out)
+    blob, frames, tables, uses, _ = build(packs, a.out, part0_last=a.part0_last)
     print("wrote %s: %d bytes (%.3f MiB), %d frames, %d parts"
           % (a.out, len(blob), len(blob) / 2.0 ** 20, len(frames), len(packs)))
     print("      vs %d separate packs = %.2f MiB, or %.2f MiB uploaded per load today"
