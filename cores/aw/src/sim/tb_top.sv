@@ -415,6 +415,23 @@ module tb_top;
         slot_write32(32'h101FFFEc, 32'h0000_4000);   // off3 = 16384
 
         $display("tb_top: trailer written; waiting for the quiet timer + boot check");
+        // ... AND the framework's own completion command, which this bench never sent.
+        //
+        // 0x008F "Data slot access all complete" is what sets dataslot_allcomplete, and it is the only
+        // statement the framework makes about the end of an upload. This bench used to omit it and
+        // still booted, because the sweep armed on "trailer region written + quiet" instead - which is
+        // the same moment only while a pack is one 2 MiB file whose trailer really is the last sixteen
+        // bytes. A combined image is 2.94 MiB with its trailer two thirds of the way in, and on
+        // hardware that difference is a black screen: aw_rom armed a 2-million-word census mid-upload,
+        // the census took the PSRAM from the loader, and the console printed C2 (ERR_OVERFLOW) with
+        // Y00000000 - not one byte reaching the VM. A 754 KiB paged image plays on the same bitstream
+        // because it never writes a trailer at all and can only be armed by this command.
+        //
+        // So the bench now drives the signal the field path drives. Without it, a design that waits for
+        // the framework looks broken here and a design that guesses looks fine, which is exactly
+        // backwards.
+        bridge_write(32'hF800_0000, 32'h434D_008F);   // "CM" + command 0x008F
+        repeat (10) @(posedge clk_74a);
         begin : wait_ready
             integer i;
             reg ready = 1'b0;

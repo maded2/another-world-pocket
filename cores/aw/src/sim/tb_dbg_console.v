@@ -351,7 +351,7 @@ module tb_dbg_console;
         c_rst_n = 1'b0;
         repeat (5) @(posedge clk);
         c_rst_n = 1'b1;
-        recv_line_c("AW 1044a up\n", 12);     // dut_c takes the defaults: BUILD_ID 1044, suffix 'a'
+        recv_line_c("AW 1045a up\n", 12);     // dut_c takes the defaults: BUILD_ID 1045, suffix 'a'
         // C<err>:<32 hex chk> W<match>/<all> S<status> - the loader counters
         recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75 Z.0 1a2b3c4d/1a2b3c4d G25 E00\n", 156);
 

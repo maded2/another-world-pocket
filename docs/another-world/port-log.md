@@ -2868,3 +2868,88 @@ whether the bytes ever arrive.
 
 The `+PAUSEAT` capability stays - it is cheap, and it is the first thing to reach for if a future
 symptom looks host-rate shaped.
+
+---
+
+## 2026-11-05 — the combined image's black screen: measured, diagnosed, fixed (`AW 1045`)
+
+### What the Pocket actually said
+
+The debug cable was attached the whole time, so instead of more screenshots the console answered it.
+Every CHK line carries the loader's own error code in `C<err>:` and two fields that say whether the VM
+is being fed at all.
+
+**`aw-probe-small.bin` (754 KiB, paged, part 0 only) — plays:**
+
+```
+AW 1044a up
+... S42df ... V0000f0 ... L000bb Y00023c05 X6d ZP1 ... G01 E00
+```
+
+`G01` = part 0, table installed; `E00` = directory accepted; `Y00023c05` = ROM bytes climbing into the
+VM. **The paged datapath works on silicon.** "Selecting the individual parts works" had proven nothing
+about paging, because a plain pack uses the identity map and never touches a table.
+
+**`aw-all.bin` (2.94 MiB) — black:**
+
+```
+... Sc7ff ... V0003c0 ... L00000 Y00000000 X64 Z.0 0bce958e/0bce958e G01 E00
+```
+
+- **`C2`** — `rom_error = 2`, `ERR_OVERFLOW`: *the bridge wrote faster than the chip took it.*
+- **`Y00000000`, `L00000`** — not one byte reached the VM, nothing drawn: that is the black screen.
+- **`G01 E00`, `Z.0` sums equal** — the directory installed cleanly and the census read back what it
+  wrote. So the file arrived, the table was right, and the upload still overflowed.
+
+`S42df` vs `Sc7ff`: `S` is `{seen_overflow, allc_seen, dbg_last_match}` - `4` vs `c` is that one sticky
+overflow bit, set for the big file and clear for the small one.
+
+### The cause, in one line of RTL
+
+`pack_written = tr_c[1] & qt_c[1]` - **trailer region written, queue quiet** - armed both the directory
+sweep and the 2-million-word census. For every build before this one that was the end of the file,
+because a pack is `VIEW_BYTES = 0x1FFFF0` and the trailer sits at `0x1FFFE0`, the last sixteen bytes.
+A combined image is 3,080,192 bytes, so `0x1FFFE0` is **two thirds of the way in**: the census started
+mid-upload, owned the PSRAM controller while it swept, and the loader FIFO overflowed behind it.
+
+The small image is the proof of the correct behaviour rather than a coincidence: it is too short to
+ever write the trailer region, so it *could only* have been armed by `dataslot_allcomplete` - and it
+armed, installed, and played.
+
+### The fix, and the two traps it walked into on the way
+
+`pack_written` is now `upload_done & qt_c[1]`, where `upload_done` is `dataslot_allcomplete` latched in
+**clk_bridge** - the domain the signal arrives in - and synchronised as a level.
+
+Getting there cost two failed gates, both worth writing down because both are the same shape:
+
+1. **`tb_rom` failed with "census never finished, read 00000000"** on the first attempt. My flag lived in
+   clk_core and was cleared by `rst_core`, but APF delivers the slot **while the core is still in
+   reset**, so the flag was cleared after the event it was meant to remember. Latching in clk_bridge
+   with `rst_bridge` fixes that - the same "request must be a level, not an edge" rule this file
+   already carries.
+2. **The one-cycle pulse.** `tb_rom` drives `dataslot_allcomplete` for a single 74.25 MHz cycle, which a
+   24.75 MHz synchroniser walks straight past. Latching at the source makes the synchroniser carry a
+   level, which is why the second attempt passed.
+
+And one bench that was lying: **`tb_top` never sent the completion command at all** (bridge command
+`0x008F`, "Data slot access all complete"). It booted anyway, because the old arming rule was
+"trailer + quiet" - so the bench encoded the very assumption the hardware had just falsified. It now
+sends `0x434D_008F` like the framework does. Without that, a design that waits for the framework looks
+broken here and a design that guesses looks fine, which is backwards.
+
+### Gates and identity
+
+- `tb_dir` 8 runs / 214 checks PASS; `make sim` green (tb_write, tb_keys 13, tb_rom 550 + tripwire with
+  `sum_r == sum_w`, tb_iv 24, tb_reset_gen, tb_dbg_console, tb_top).
+- Paged `tb_soc +PART=1` reproduces its previous numbers exactly: 78 frames, 41,956 bytes to the VM,
+  18 swaps, 0 shifted - so the arming change altered no data path.
+- **Bitstream `75ba5281d760069e`**, 0 errors, 0 critical warnings, worst setup 1.127 ns (slow) /
+  1.245 ns (fast), hold 0.287 ns, scoped `make check-build` clean.
+- `BUILD_ID` bumped to 1045 so the banner says `AW 1045a`: installing a different bitstream under the
+  1044 label would repeat exactly the banner lie that was fixed in #20.
+- `AW 1045` installed beside **AW 1044** (`a786f317510af3aa`, the build the `C2` reading was taken on)
+  and **AW 1042** (`579746d33d45b594`, untouched). Installer verification caught its own bug on the way:
+  the 1045 description landed on the card as a one-element *list* (a stray trailing comma in the
+  generating Python), so `len()` read 1 - fixed, then re-validated against the card with the
+  installer's own field checks.

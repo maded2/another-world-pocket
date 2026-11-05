@@ -313,7 +313,17 @@ module aw_rom (
     // clocks are asynchronous. So the facts are latched here and only the resulting
     // levels cross.
     // ---------------------------------------------------------------------------
-    reg ld_overflow_b, ld_trailer_b, ld_quiet_b;
+    reg ld_overflow_b, ld_quiet_b;
+    // "APF has said the dataslot is complete, at least once since reset", latched HERE, in the clock
+    // that carries the signal. Not in clk_core, for two reasons that both bit me in one build:
+    //   * dataslot_allcomplete can be a single cycle at 74.25 MHz (tb_rom drives exactly that), which a
+    //     24.75 MHz synchroniser walks straight past - the core would then wait for an arming event
+    //     that already happened, and tb_rom reported "census never finished" with read 00000000;
+    //   * the framework delivers the slot while the core is still in reset, so a flag cleared by
+    //     rst_core is cleared after the event it is supposed to remember.
+    // A level latched at the source is immune to both, and rst_bridge is the right reset because that
+    // is the domain the signal belongs to.
+    reg ld_allc_seen_b;
     reg [19:0] quiet_cnt_b;
 
     // Debug counters. clk_bridge is clk_74a and dataslot_allcomplete comes from
@@ -326,8 +336,8 @@ module aw_rom (
     always @(posedge clk_bridge) begin
         if (rst_bridge) begin
             ld_overflow_b <= 1'b0;
-            ld_trailer_b  <= 1'b0;
             ld_quiet_b    <= 1'b0;
+            ld_allc_seen_b<= 1'b0;
             quiet_cnt_b   <= 20'd0;
             dbg_wr_match  <= 32'd0;
             dbg_wr_all    <= 32'd0;
@@ -342,8 +352,12 @@ module aw_rom (
             if (ld_full && bridge_wr) ld_overflow_b <= 1'b1;
 
             if (bridge_wr) begin
-                // at or past the last 32 bytes, which covers the trailer
-                if (bridge_addr[20:5] >= 16'hFFFF) ld_trailer_b <= 1'b1;
+                // "the trailer region was written" used to be latched here and armed the boot sweep.
+                // It is gone rather than unreferenced, because it was WRONG for anything larger than
+                // one 2 MiB pack (the trailer then sits in the middle of the file) and leaving a
+                // signal that is written and never read is the dead logic an audit has to chase.
+                // What replaced it is upload_done below: only the framework can say the slot is
+                // complete, and it says so on dataslot_allcomplete.
                 quiet_cnt_b <= 20'd0;
                 ld_quiet_b  <= 1'b0;
 
@@ -357,7 +371,10 @@ module aw_rom (
             end else begin
                 quiet_cnt_b <= quiet_cnt_b + 20'd1;
             end
-            if (dataslot_allcomplete) dbg_allc_seen <= 1'b1;
+            if (dataslot_allcomplete) begin
+                ld_allc_seen_b <= 1'b1;
+                dbg_allc_seen  <= 1'b1;      // the console's report of the same fact
+            end
         end
     end
 
@@ -370,8 +387,9 @@ module aw_rom (
     // seen_overflow is the clk_psram-synchronised copy of ld_overflow_b; a debug
     // display does not need another synchroniser stage.
     assign rom_dbg_status   = {seen_overflow, dbg_allc_seen, dbg_last_match};
-    // ld_trailer_b and ld_quiet_b are needed where the check is issued, in clk_core,
-    // and are synchronised there rather than relayed through this domain.
+    // ld_quiet_b is needed where the sweep is armed, in clk_core, and is synchronised there rather
+    // than relayed through this domain. (ld_trailer_b used to sit beside it; see pack_written for why
+    // "the trailer was written" stopped being the same question as "the upload is finished".)
 
     // ---------------------------------------------------------------------------
     // Drain state machine.
@@ -2124,15 +2142,41 @@ module aw_rom (
     // started anyway would run the VM over 0x5A5A-filled memory.
     reg  [20:0] retry_cnt;
     reg  [2:0] ac_s;
-    reg  [1:0] tr_c, qt_c;
+    reg  [1:0] qt_c;
+    // The upload-complete level, synchronised. Two flops because it is a level that has already been
+    // latched at the source in its own domain (see ld_allc_seen_b); no edge detection here, because an
+    // edge is exactly what a one-cycle pulse at 3x this clock does not reliably provide.
+    reg  [1:0] ad_s;
 
     always @(posedge clk_core) begin
         ac_s <= {ac_s[1:0], dataslot_allcomplete};
-        tr_c <= {tr_c[0], ld_trailer_b};
         qt_c <= {qt_c[0], ld_quiet_b};
+        ad_s <= {ad_s[0], ld_allc_seen_b};
     end
     wire allc_edge    = ac_s[2] & ~ac_s[1];
-    wire pack_written = tr_c[1] & qt_c[1];
+    wire upload_done  = ad_s[1];
+
+    // THE END OF THE UPLOAD IS WHEN THE FRAMEWORK SAYS IT IS, NOT WHEN THE TRAILER WORD LANDS.
+    //
+    // This used to be `tr_c[1] & qt_c[1]` - "the trailer region has been written and the bridge has
+    // gone quiet" - and for every build before 1044 that was the same moment, because a pack is
+    // VIEW_BYTES = 0x1FFFF0 and the trailer sits at 0x1FFFE0, the last sixteen bytes of the file.
+    // A combined image is 3,080,192 bytes and 0x1FFFE0 is TWO THIRDS OF THE WAY IN, so this fired
+    // while the framework was still writing. It armed the directory sweep and the 2-million-word
+    // census, the census owns the PSRAM controller while it sweeps, and the loader FIFO filled and
+    // overflowed behind it: ERR_OVERFLOW, rom_ready held low, the VM fed zero bytes, black screen.
+    //
+    // Measured on hardware, not argued: the console printed `C2:` (= rom_error 2, ERR_OVERFLOW) with
+    // `L00000 Y00000000` and `G01 E00` - table installed, directory clean, and not one byte reaching
+    // the VM. Against that, a 754 KiB paged image plays: it never writes the trailer region at all,
+    // so it can only ever have been armed by allcomplete, which is the proof that allcomplete alone
+    // is sufficient. Same bitstream, same table, same part: the only difference was the file size
+    // pushing the trailer into the middle.
+    //
+    // qt_c[1] stays: the framework's word that the slot is complete does not mean the last accepted
+    // write has drained out of the FIFO into the chip, and arming a sweep over a half-drained FIFO
+    // would be the same starvation one layer down.
+    wire pack_written = upload_done & qt_c[1];
 
     always @(posedge clk_core) begin
         if (rst_core) begin
