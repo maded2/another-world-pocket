@@ -300,6 +300,19 @@ reg design_run = 1'b0;
     // reason. The real bridge's sustained rate is unknown until measured on hardware -
     // see docs/another-world/port-log.md.
     integer   pace = 10;
+    // A host pause in the middle of ONE dataslot file. This exists because every bench in this repo
+    // uploads at a steady pace and never stops, and the field path does stop: the framework reads the
+    // file off SD, and a read gap longer than aw_rom's quiet timer looks to the core exactly like the
+    // end of the upload - IF the trailer word has already been written. For partN.bin the trailer is
+    // the last 16 bytes, so "trailer written" and "file complete" are the same moment and have been
+    // for every build ever run on hardware. aw-all.bin's trailer is at 0x1fffe0 and the file is
+    // 3,080,192 bytes: two thirds of the way in. Hardware agrees - AW 1044 plays every one of the
+    // eight packs and shows nothing at all with aw-all.bin.
+    //
+    //   +PAUSEAT=<byte offset into the upload>  (0 = never, default)
+    //   +PAUSEMS=<how long the host goes quiet> (default 30, comfortably past the quiet timer)
+    integer   pause_at = 0;
+    integer   pause_ms = 30;
     integer   max_frames = 40;
     integer   errors = 0;
     reg       s1_pass = 1'b0;   // decides the process exit status, not just the printed verdict
@@ -356,6 +369,20 @@ reg design_run = 1'b0;
             @(negedge clk_bridge);
             dataslot_wr    <= 1'b0;
             repeat (pace)  @(negedge clk_bridge);
+        end
+    endtask
+
+    // The gap itself. Nothing is driven during it - WR stays low, which is what a host waiting on its
+    // own storage does; holding WR high would be a different fault (and the design answers it by
+    // reporting an overrun, see wr32's comment).
+    task automatic host_gap(input integer byte_off);
+        begin
+            if (pause_at != 0 && byte_off == pause_at) begin
+                $display("  host gap: upload stops at byte %0d for %0d ms (models an SD read stall inside one dataslot file)",
+                         byte_off, pause_ms); $fflush;
+                #(pause_ms * 1000000);      // timescale is 1ns, so this is pause_ms milliseconds
+                $display("  host gap: writing resumes"); $fflush;
+            end
         end
     endtask
 
@@ -1233,6 +1260,8 @@ reg design_run = 1'b0;
         if (!$value$plusargs("PACK=%s", pack_hex))
             $fatal(1, "tb_soc: +PACK=<pack.hex> is required");
         void'($value$plusargs("PACE=%d", pace));
+        void'($value$plusargs("PAUSEAT=%d", pause_at));
+        void'($value$plusargs("PAUSEMS=%d", pause_ms));
         void'($value$plusargs("FRAMES=%d", max_frames));
         void'($value$plusargs("NOINPUT=%d", noinput));
         void'($value$plusargs("PACK_KIND=%s", pack_kind));
@@ -1301,13 +1330,17 @@ reg design_run = 1'b0;
             // oracles below stay honest. Addresses stay inside the loader's 4 MiB window (the image is
             // 2.94 MiB) and above the old 2 MiB limit for the tail - which is exactly the region no
             // simulation had written before tb_dir +HIGH.
-            for (integer i = 0; i < img_bytes/4; i = i + 1)
+            for (integer i = 0; i < img_bytes/4; i = i + 1) begin
                 wr32(32'h1000_0000 + i*4,
                      {img_mem[i*4+3], img_mem[i*4+2], img_mem[i*4+1], img_mem[i*4]});
+                host_gap(i*4);
+            end
         end else begin
-            for (integer i = 0; i < PACK_WORDS; i = i + 1)
+            for (integer i = 0; i < PACK_WORDS; i = i + 1) begin
                 wr32(32'h1000_0000 + i*4,
                      {ref_mem[i*4+3], ref_mem[i*4+2], ref_mem[i*4+1], ref_mem[i*4]});
+                host_gap(i*4);
+            end
         end
         // Part select BEFORE the upload-complete edge, and the order is the whole point. A part write
         // does not arm a directory sweep on its own, and must not: in the real flow the OS writes the

@@ -2827,3 +2827,44 @@ that decide whether the core boots, read back off the card: `magic == APF_VER_1`
 diff proving nothing outside the four rewritten metadata fields changed. The second run is clean, and
 re-copying from scratch was deliberate: it re-proves the bitstream and image paths too rather than
 trusting the first pass.
+
+### The paused-upload theory, tested and disproved (2026-11-05)
+
+Hardware state, from the Pocket: **AW 1044 plays every one of the eight single-part packs. With
+`aw-all.bin` the screen is black.** So the paged core, its tables, the packaging and the video path are
+all sound on hardware; the failure is specific to the 2.94 MiB file.
+
+My explanation for that was: `pack_written` rises when the trailer word is in and the queue goes quiet,
+and the trailer sits at `0x1fffe0` - for `partN.bin` that is the last 16 bytes of the file, but for
+`aw-all.bin` it is two thirds of the way in. A host pause past that point would look like the end of the
+upload, arm the directory sweep and the census (up to 4 MiB, ~126 ms), and starve or drop the remaining
+0.9 MiB.
+
+`tb_soc` could not have seen it, because it never pauses: it uploads at a steady pace and finishes. So I
+added `+PAUSEAT=<byte>` / `+PAUSEMS=<ms>` - a real gap in the middle of one dataslot file, WR held low
+the way a host waiting on its own storage behaves.
+
+**Result: PASS.** Paged part 0 with a 30 ms gap at byte 2,097,120 (just past the trailer):
+
+```
+  host gap: upload stops at byte 2097120 for 30 ms (models an SD read stall inside one dataslot file)
+  host gap: writing resumes
+  ok   PSRAM holds what was uploaded, byte-exact (1540096 words, 0..1540095)
+  census done=1 ... measured=9ca26b21 declared=9ca26b21 pool_ok=1
+  78 frames, 96841 compared, kind=text, 30592 fill writes / 0 shifted -> PASS
+```
+
+The whole image arrived, the pool certified against the declared sums, and the VM ran on it. **The
+theory is wrong**, and by this file's own rule it has to be said plainly rather than left as a plausible
+sentence: it does not explain the passing observations (the eight packs) *or* the failing one (black
+screen), because on this evidence the core delivers a full 2.94 MiB upload correctly.
+
+What that leaves is the one thing a simulation of our own chip cannot test: **whether the framework
+delivers the file at all.** Every candidate cause left - a size limit, a truncation, a file the picker
+hands over differently above 2 MiB - sits on the host side of the bridge. That is exactly the question
+`#15` was opened to answer, and the console already reports it: `G` bit 2 is `pool_ok`, `E` is why a
+directory was refused. The bench can say the core would be fine with the bytes; only the Pocket can say
+whether the bytes ever arrive.
+
+The `+PAUSEAT` capability stays - it is cheap, and it is the first thing to reach for if a future
+symptom looks host-rate shaped.
