@@ -151,6 +151,11 @@ module tb_dir;
     // depend on an edge surviving reset is to read ALL parts' tables at upload and choose the part at
     // read time - 8*64 table words is nothing in M10Ks, and then a select is a level, not an event.
     int       latesel   = 0;
+    // +VALSEL: select the part the way the OSD does - one value at the base address, not one address
+    // per part. The byte order of an interact write is not settled by the docs, so the core decodes
+    // the low nibble of every lane; this run drives that path and the check after it re-reads the
+    // part, so a decode that only ever worked in one lane fails here.
+    int       valsel    = 0;
     // +PARTBAD: an out-of-range entry in a part NOBODY IS ON. Eight tables means the blast radius of
     // a corrupt entry is one part, which is a claim about behaviour and therefore needs its own run:
     // the boot must go ahead, the corruption must still be reported, the corrupt part must be
@@ -166,6 +171,7 @@ module tb_dir;
         poolrun = $test$plusargs("POOLSUM");
         badent  = $test$plusargs("BADENT");
         latesel = $test$plusargs("LATESEL");
+        valsel  = $test$plusargs("VALSEL");
         partbad = $test$plusargs("PARTBAD");
         if (!$value$plusargs("PACK=%s", pack_hex))
             $fatal(1, "tb_dir: +PACK=<pack.hex> is required");
@@ -746,6 +752,35 @@ module tb_dir;
             settle("part write AFTER the boot sweep installed part 0");
             expect_status(1, 0, want_part,
                           "a select landing after the boot sweep still installs its own part");
+        end else if (want_part > 0 && valsel && want_part < 8) begin
+            // THE VALUE ENCODING, which is what the OSD actually uses: a persisted `list` variable
+            // writes its value to ONE address, so the part has to come out of the data.
+            //
+            // The byte order of an interact write is not documented, so the core ORs the low nibble of
+            // all four bytes. Two writes, one in each of the two plausible lanes, must both select the
+            // same part - that pair is the whole test, and it is why this is not just "write the value
+            // and hope": a decode that assumed one lane would pass with one write and fail with the
+            // other, and the failing one would look like a data-dependent bug on hardware.
+            bridge_write32(32'h00F0_0000, want_part << 8);      // part in byte 1 (big-endian write)
+            rearm("part selected by VALUE, byte 1");
+            expect_status(1, 0, want_part, "part selected from a value in byte lane 1");
+            checks = checks + 1;
+            if (dir_part !== want_part[2:0]) begin
+                errors = errors + 1;
+                $display("  FAIL value-in-lane-1 selected part %0d, wanted %0d", dir_part, want_part);
+            end
+            // The same value in the OTHER lane. This is the half that makes the OR-of-nibbles worth
+            // having: a decode that assumed little-endian would pass the line above and fail this one,
+            // and the failure would look data-dependent rather than endian-dependent. Both lanes have
+            // to land on the same part.
+            bridge_write32(32'h00F0_0000, want_part << 24);     // part in byte 3 (little-endian write)
+            rearm("part selected by VALUE, byte 3");
+            checks = checks + 1;
+            if (dir_part !== want_part[2:0]) begin
+                errors = errors + 1;
+                $display("  FAIL value-in-lane-3 selected part %0d, wanted %0d - the decode is endian-dependent",
+                         dir_part, want_part);
+            end
         end else if (want_part > 0) begin
             bridge_write32(32'h00F0_0000 + want_part*4, 32'h0000_0001);
             rearm("part write before the first byte");

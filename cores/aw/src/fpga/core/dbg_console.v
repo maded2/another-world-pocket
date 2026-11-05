@@ -85,7 +85,7 @@ localparam MID_UP      = 3'd0,   // "AW 1026a up\n"            console out of re
 // The layout is fixed at 12 bytes - "AW " + 4 digits + 1 suffix + " up\n" - because
 // msg_len and the extractor below assume char 0 sits in the MSB of a 12-byte field. Change
 // BUILD_ID / BUILD_SFX per build; never change the layout, and the length cannot drift.
-parameter [15:0] BUILD_ID  = 16'd1045;
+parameter [15:0] BUILD_ID  = 16'd1046;
 parameter [7:0]  BUILD_SFX = "a";
 
 function [7:0] dec_digit;                 // one decimal digit of a 4-digit id, as ASCII

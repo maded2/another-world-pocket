@@ -61,7 +61,7 @@ fi
 # IMG, LATESEL_TEST). RUNS is on that list now; a filter that quietly did nothing would run
 # everything and look like it ran what you asked, which is the safe direction, but would waste the
 # time the filter exists to save.
-RUNS="${RUNS:-1 2 3 4 5 6 7 8}"
+RUNS="${RUNS:-1 2 3 4 5 6 7 8 9}"
 TOTAL=0
 
 run_case() {              # run_case <n> <label> [plusargs...]
@@ -106,6 +106,13 @@ run_case 6 "an out-of-range entry in the viewed part refuses it and names the en
 # here, tb_soc +PART=1 with the VM rendering part 1's intro through part 1's table.
 run_case 7 "a part select that lands AFTER the boot sweep still installs its own part" +PART=1 +LATESEL
 run_case 8 "a corrupt entry in SOMEBODY ELSE's part - boots, reports, and refuses that select" +PART=1 +PARTBAD
+
+# run 9: the encoding the OSD actually uses. A persisted `list` variable writes ONE value to ONE
+# address, so the part has to come from the data - and the byte order of an interact write is not
+# documented, so the core ORs the low nibble of all four bytes. This run selects part 1 by value and
+# then checks the part register, which is the difference between "the write was accepted" and "the
+# view moved".
+run_case 9 "the part selected by VALUE at the base address (what the OSD list writes)" +PART=1 +VALSEL
 
 [ "$TOTAL" -eq 0 ] || echo "tb_dir: $TOTAL failing exit status across RUNS='$RUNS'"
 exit $TOTAL

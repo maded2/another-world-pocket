@@ -1,7 +1,52 @@
 {
     "interact": {
         "magic": "APF_VER_1",
-        "variables": [],
+        "variables": [
+            {
+                "name": "Game part",
+                "id": 1,
+                "type": "list",
+                "enabled": true,
+                "address": "0x00F00000",
+                "persist": true,
+                "writeonly": true,
+                "defaultval": 0,
+                "options": [
+                    {
+                        "value": 0,
+                        "name": "Part 1"
+                    },
+                    {
+                        "value": 1,
+                        "name": "Part 2"
+                    },
+                    {
+                        "value": 2,
+                        "name": "Part 3"
+                    },
+                    {
+                        "value": 3,
+                        "name": "Part 4"
+                    },
+                    {
+                        "value": 4,
+                        "name": "Part 5"
+                    },
+                    {
+                        "value": 5,
+                        "name": "Part 6"
+                    },
+                    {
+                        "value": 6,
+                        "name": "Part 7"
+                    },
+                    {
+                        "value": 7,
+                        "name": "Part 8"
+                    }
+                ]
+            }
+        ],
         "messages": []
     }
 }

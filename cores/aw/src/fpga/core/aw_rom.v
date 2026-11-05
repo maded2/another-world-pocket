@@ -675,6 +675,30 @@ module aw_rom (
     // The write is address-selected, so bridge_wr_data is never read here. The byte order of an
     // interact write is not something the docs settle (the loader's order is a declaration WE make,
     // by tying bridge_endian_little=0), and a decode that ignores the data cannot be wrong about it.
+    //
+    // ... except that address-selection is a terrible user interface, and it does not work at all for
+    // the one interact type that could drive it. Eight `action` variables (one per part, which is what
+    // this comment used to propose) are ONE-SHOT: they write when pressed and never at boot, and a
+    // select is only honoured before the VM's first byte - so the user would have to press the button
+    // during boot, which is to say never. The type that is written at boot is a PERSISTED one, and a
+    // persisted variable is a single value at a single address: one `list` with eight options, which
+    // means decoding the DATA.
+    //
+    // The byte-order worry is solved rather than tolerated. The part is 0..7, so it occupies a single
+    // byte, and every other byte of the word is zero; OR-ing the LOW NIBBLE of all four bytes gives
+    // the same number whichever lane the framework used, with no assumption about its endianness and
+    // no branch for it. A value that puts nonzero low nibbles in two different bytes would OR into a
+    // number nobody asked for, but no writer produces that for a 0..7 selection, and part_ok then
+    // refuses a part the image does not declare - the failure is a refusal, not a silent wrong part.
+    //
+    // Both encodings are live because they cost one comparator: the base address is value-selected
+    // (that is where the list writes), and +4..+1C stays address-selected so the benches and any
+    // future per-part action keep working unchanged. At the base address a zero value means part 0,
+    // which is also what the address says - the two decodings agree exactly where they overlap.
+    wire [2:0] addr_part = bridge_addr[4:2];
+    wire [3:0] val_nib   = bridge_wr_data[3:0]  | bridge_wr_data[11:8]
+                         | bridge_wr_data[19:16] | bridge_wr_data[27:24];
+    wire [2:0] sel_part  = (addr_part == 3'd0 && val_nib != 4'd0) ? val_nib[2:0] : addr_part;
     reg  [1:0] streamed_s = 2'b00;
     reg        part_push = 1'b0;   // explicit power-up: a 1 here would push a garbage request
     reg  [2:0] part_din    = 3'd0;
@@ -695,9 +719,9 @@ module aw_rom (
         // commit keeps part_late on one process; part_ok is a psram-domain register, so the test
         // costs a compare and no crossing.
         if (bridge_wr && bridge_addr[31:12] == 20'h00F00 && !streamed_s[1]
-            && (!dir_installed || part_ok[bridge_addr[4:2]])) begin
+            && (!dir_installed || part_ok[sel_part])) begin
             part_push <= 1'b1;
-            part_din  <= bridge_addr[4:2];
+            part_din  <= sel_part;
         end else if (bridge_wr && bridge_addr[31:12] == 20'h00F00) begin
             part_late <= 1'b1;      // refused. Reported, not fixed.
         end

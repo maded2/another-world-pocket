@@ -2953,3 +2953,45 @@ broken here and a design that guesses looks fine, which is backwards.
   the 1045 description landed on the card as a one-element *list* (a stray trailing comma in the
   generating Python), so `len()` read 1 - fixed, then re-validated against the card with the
   installer's own field checks.
+
+### The selector: one persisted `list`, and a decode that cannot be endian-wrong (`AW 1046`)
+
+With `AW 1045` the combined image plays - part 0, from one upload - so the next thing missing was any
+way to *choose* a part. `interact.json` had `variables: []`, which is why nothing ever switched: the
+core always booted part 0 because nothing wrote the select address.
+
+The obvious design was eight `action` variables, one per part address, which is what aw_rom's own
+comment proposed and what needs no RTL change. It cannot work, for a reason that is about interact
+semantics rather than this core: **`action` is one-shot** - it writes when the user presses it and never
+at boot - while a select is only honoured before the VM's first byte. The user would have to press the
+button during boot, which is to say never. The interact type that is written at boot is a *persisted*
+one, and a persisted variable is one value at one address. So the choice is `list` with eight options,
+and the part has to come out of the data.
+
+That reintroduces the one thing the address encoding was chosen to avoid: the byte order of an interact
+write is not documented anywhere this project could find, and the loader's order elsewhere is a
+declaration *we* make. Rather than pick a lane and hope, the core ORs the **low nibble of all four
+bytes**. The part is 0..7, so it occupies a single byte and the other three are zero; the OR is the same
+number whichever lane the framework used, with no branch and no assumption. A value with nonzero low
+nibbles in two bytes would OR into something nobody asked for - and `part_ok` then refuses a part the
+image does not declare, so the failure mode is a refusal that is reported, not a silent wrong part.
+
+Both encodings stay live because they cost one comparator: the base address is value-selected (where the
+list writes), and `+4..+1C` stays address-selected so the benches and any future per-part action work
+unchanged. At the base address a zero value means part 0, which is what the address says anyway - the
+two decodings agree exactly where they overlap.
+
+`tb_dir` run 9 drives the value path **twice, in two different lanes**, because that pair is the whole
+test: a decode that assumed one byte order would pass the first write and fail the second, and the
+failure would look data-dependent rather than endian-dependent. Both land on part 1.
+
+interact.json gained one variable - `Game part`, a persisted 8-option list at `0x00F00000`. Two details
+cost a cycle each and are worth recording: the options key is `options`, not `parameters` (checked
+against real cores on the developer's card, e.g. agg23.NES), and `persist` is what makes the value be
+rewritten at boot immediately before Reset Exit, which is the only window a boot-only select can use.
+
+Gates: `tb_dir` **9 runs** (15 checks in the new one) all PASS, `make sim` green, 0 critical warnings,
+worst setup 0.988 ns (slow) / 1.255 ns (fast), hold 0.292 ns, scoped `make check-build` clean.
+Bitstream **`2bdcce831ce41dac`**, banner `AW 1046a`. The installer additionally validates interact.json
+on the card - eight options, persisted, addressed at `0x00F00000` - because a build whose selector is
+missing would otherwise look exactly like one whose selector is broken.
