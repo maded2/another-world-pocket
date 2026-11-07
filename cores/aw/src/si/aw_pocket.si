@@ -429,6 +429,8 @@ unit main(
   output uint1  video_hs,      // one-clock pulse, once per line
   output uint1  video_vs,      // one-clock pulse, once per frame
   // status
+  output uint16 part_req,      // the chapter the game asked for (0 = none yet). See vm.si's port:
+                               // op_updateMemList with a 0x3E8N id is the engine's own "load next part".
   output uint8  leds(0),
   output uint1  vblank,        // high while nothing is being displayed
 )
@@ -503,7 +505,10 @@ unit main(
                     polygon <:> polygon,
                     palette <:> palette,
                     vblank  <:: vblank,
-                    jstick  <:: jstick_delay
+                    jstick  <:: jstick_delay,
+                    // The engine's own "the next chapter starts here", surfaced to the core so it can
+                    // switch the page table. Nothing else in the design knows what a part is.
+                    part_req :> part_req
         );
 
   // ---- video pages

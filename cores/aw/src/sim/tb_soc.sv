@@ -119,7 +119,7 @@ reg design_run = 1'b0;
         .rom_part            (dir_part_w),
         .rom_part_late       (dir_late_w),
         .rom_pool_ok         (pool_ok_w),
-        .rom_vm_restart      (vm_restart_w),
+        .rom_vm_restart      (vm_restart_w), .vm_part_req(vm_part_req_w),
         .cram0_a             (cram0_a),
         .cram0_dq            (cram0_dq),
         .cram0_wait          (cram0_wait),
@@ -256,6 +256,7 @@ reg design_run = 1'b0;
         .in_mem_busy          (mem_busy),
         .in_jstick            (js),
         .in_vm_restart        (vm_restart_w),
+        .out_part_req         (vm_part_req_w),
         .out_mem_in_ready     (mem_in_ready),
         .out_mem_addr         (mem_addr),
         .out_video_r          (game_r),
@@ -279,6 +280,7 @@ reg design_run = 1'b0;
     int         img_bytes = 0;                       // its real length, from +IMG_BYTES
     int         part_sel  = -1;                      // +PART: which part to select before byte 0
     wire        dir_valid_w, dir_bad_w, dir_busy_w, dir_late_w, pool_ok_w, vm_restart_w;
+    wire [15:0] vm_part_req_w;      // the GAME's chapter request, straight out of the SoC
     wire [2:0]  dir_part_w;
     wire [7:0]  dir_err_w;
     string    pack_hex;

@@ -105,7 +105,7 @@ module tb_dir;
         .tbl_wr(1'b0), .tbl_widx(6'd0), .tbl_wval(8'd0), .rom_tbl_loaded(tbl_loaded),
         .rom_dir_valid(dir_valid), .rom_dir_bad(dir_bad), .rom_part(dir_part),
         .rom_dir_err(dir_err), .rom_dir_busy(dir_busy), .rom_part_late(part_late),
-        .rom_pool_ok(pool_ok_w), .rom_vm_restart(vm_restart_w)
+        .rom_pool_ok(pool_ok_w), .rom_vm_restart(vm_restart_w), .vm_part_req(16'd0)
     );
 
     aw_psram_model psram0 (

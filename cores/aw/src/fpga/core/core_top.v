@@ -855,6 +855,7 @@ M_main u_soc (
     .out_video_de         ( game_de            ),
     .out_video_hs         ( game_hs            ),
     .out_video_vs         ( game_vs            ),
+    .out_part_req         ( vm_part_req        ),   // the game's own chapter request (vm.si)
     .out_leds             (                    ),   // no LEDs on the Pocket
     .out_vblank           (                    ),
 
@@ -868,6 +869,7 @@ M_main u_soc (
 // Directory / paging state. These were left unconnected the moment they were added, which is how a
 // core can spend a week verifying things nobody is allowed to find out about.
 wire        rom_dir_valid, rom_dir_bad, rom_dir_busy, rom_part_late, rom_pool_ok, rom_vm_restart;
+wire [15:0] vm_part_req;
 wire [2:0]  rom_part_sel;
 wire [6:0]  rom_dir_err;
 
@@ -924,6 +926,7 @@ aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .rom_part_late        ( rom_part_late        ),
     .rom_pool_ok          ( rom_pool_ok          ),
     .rom_vm_restart       ( rom_vm_restart       ),
+    .vm_part_req          ( vm_part_req          ),
 
     .cram0_a              ( cram0_a              ),
     .cram0_dq             ( cram0_dq             ),

@@ -191,6 +191,10 @@ module aw_rom (
     // statement, which re-reads the trailer at 0x1FFFE0 - now through the NEW part's table - and the
     // next chapter boots. No upload, no core restart, no bitstream change.
     output wire        rom_vm_restart,
+    // The chapter the GAME asked for (vm.si's part_req, op_updateMemList with a 0x3E8N id). 0 = none.
+    // 15 bits x 2 MHz-ish of traffic is not a fast bus: the engine writes this once, at the end of a
+    // chapter, so it is quasi-static and is filtered by stability below rather than handshaked.
+    input  wire [15:0] vm_part_req,
 
     // ---- the chip ----
     output wire [5:0]  cram0_a,
@@ -1843,6 +1847,42 @@ module aw_rom (
         end
     end
 
+
+    // ---- the game's own chapter request ----
+    // vm_part_req is written by the VM in clk_core and read here. It is quasi-static by construction
+    // (one write per chapter), so the crossing is two flops plus a stability filter: the value is only
+    // accepted once it has held for four clk_psram cycles, which makes a torn sample impossible to act
+    // on. Parts are numbered 0x3E80..0x3E89 and our packs are indices 0..7 in that order (part0.bin is
+    // the protection screen, which parts.h calls GAME_PART1 = 0x3E80).
+    reg  [15:0] pr_s0, pr_s1, pr_stable, pr_done;
+    reg  [1:0]  pr_cnt;
+    always @(posedge clk_psram) begin
+        if (rst_psram) begin
+            pr_s0 <= 16'd0; pr_s1 <= 16'd0; pr_stable <= 16'd0; pr_done <= 16'd0; pr_cnt <= 2'd0;
+        end else begin
+            pr_s0 <= vm_part_req;
+            pr_s1 <= pr_s0;
+            if (pr_s1 == pr_stable) pr_cnt <= 2'd0;
+            else if (pr_cnt == 2'd3) pr_stable <= pr_s1;      // held for four cycles: take it
+            else pr_cnt <= pr_cnt + 2'd1;
+        end
+    end
+    wire [15:0] pr_in_range = {16{pr_stable >= 16'h3E80 && pr_stable <= 16'h3E89}};
+    wire        pr_valid    = pr_in_range[0] && (pr_stable != pr_done);
+    // Gated on a free chip exactly like a bridge-side select: the census owns the PSRAM for ~126 ms
+    // after boot, and a chapter change landing inside it never gets served.
+    wire        vm_sw_pend  = pr_valid && streamed_q && !census_active && !dir_active;
+
+    always @(posedge clk_psram) begin
+        if (rst_psram) restart_tog <= 1'b0;
+        else if ((part_rv && (p_state == P_WAIT) && streamed_q && part_ok[part_fw]) || vm_sw_pend)
+            restart_tog <= ~restart_tog;
+    end
+    always @(posedge clk_psram) begin
+        if (rst_psram) pr_done <= 16'd0;
+        else if (vm_sw_pend) pr_done <= pr_stable;    // applied: this request will not fire again
+    end
+
     // The live view, in clk_psram - the clock of the read path that consumes it. A select is
     // therefore not a message to anyone: it is a change of state that the next table read sees, with
     // no handshake to lose and no reset window to fall into.
@@ -1854,6 +1894,9 @@ module aw_rom (
     // "reported, not fixed" contract as a select that arrived after the first byte.
     always @(posedge clk_psram) begin
         if (rst_psram)               view_part <= 3'd0;
+        // The game's request wins over a bridge-side select in the same cycle: it is the one carrying
+        // the script's own intent, and a bridge select at that instant is a stale OSD value.
+        else if (vm_sw_pend)         view_part <= pr_stable[2:0];
         else if (part_rv && (p_state == P_WAIT) && (!dir_installed || part_ok[part_fw]))
             view_part <= part_fw;
     end
@@ -1873,12 +1916,6 @@ module aw_rom (
     // clk_core, because Silice's algorithm reset is level-sensitive - a level left high would park the
     // game on the first statement of the trailer read forever.
     reg        restart_tog;
-    always @(posedge clk_psram) begin
-        if (rst_psram) restart_tog <= 1'b0;
-        else if (part_rv && (p_state == P_WAIT) && streamed_q && part_ok[part_fw])
-            restart_tog <= ~restart_tog;
-    end
-
     // In clk_core, where the SoC lives: synchronise the toggle, turn the change into a pulse, and
     // hold it for 16 clocks (640 ns) - comfortably past Silice's 4-clock clean_reset and short
     // enough that a player never sees it. `armed` makes the first observation after reset harmless:

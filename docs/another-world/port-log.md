@@ -3140,3 +3140,33 @@ timing. The half of it that is missing is still the re-entry (#31): the VM must 
 This also demotes the OSD selector from "the feature" to "a manual fallback", and it explains the shape
 of the failure that started this thread: each pack simply runs out of script because the next-chapter
 call is being drawn instead of obeyed.
+
+### vm.si now reports the engine's part request (`out_part_req`)
+
+The edit itself is small and sits where the opcode is already decoded:
+
+```silice
+} else {                       // h19 = op_updateMemList
+  if (stringId >= 16h3E80 && stringId <= 16h3E89) {
+    part_req = stringId;       // the engine asking for a chapter, not a string
+  }
+  skip     = ~stringId[15,1];
+  stringId = {1b0,stringId[0,15]};
+```
+
+with a sticky 16-bit `part_req` output (sticky because the game issues the request once, and a pulse
+would need a handshake to be reliable). `aw_pocket.si` surfaces it as `out_part_req`, `core_top` hands it
+to `aw_rom` as `vm_part_req`, and `aw_rom` accepts it through a two-flop crossing plus a four-cycle
+stability filter - the value is quasi-static by construction, but a torn sample must not be actionable -
+then maps `0x3E80 + N` to view part N, gated on a free chip exactly like a bridge-side select, and
+pulses the restart. `view_part` gained the request as a higher-priority source in its single driver.
+
+This diverges from upstream `vm.si`, which the project has kept byte-identical. The divergence is
+deliberate and this small: three lines plus a port. It is also the only place the request exists - the
+alternative (pattern-matching `19 3E 8N` in the fetched byte stream) would fire on data.
+
+**Not yet demonstrated end to end.** A paged part-0 run of 40 frames shows `restarts=0`: the game did
+not issue a chapter request in that window, so nothing exercised the switch. It also reports **770
+shifted fill writes** (35264 writes, "rewinds 328"), and a 40-frame part-0 run is longer than any
+previously passing one - so that finding is unattributed. It must be A/B'd against the previous RTL
+before it is blamed on, or cleared from, this change.
