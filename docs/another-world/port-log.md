@@ -3060,3 +3060,83 @@ pieces are (a) all tables resident - done, (b) a resettable VM - the VM always h
 missing piece. And it should be said plainly that even when it works, the switch will be *player*
 initiated (or heuristic), because the engine cannot ask for the next part: nothing in `vm.si` knows what
 a part is.
+
+### Chapter switching: two fixes landed, the VM still does not re-run its boot
+
+The unquiesced-stream bug is fixed and was real: a restarted VM inherited a pending acceptance and
+over-read past the trailer. `aw_rom` now clears the fetch state machine (`c_state`, `pend`, `c_acc`,
+prefetch, `c_served`, `busy_q`) on a one-cycle event at the leading edge of the restart pulse, and a
+mid-run select waits in the part FIFO until the chip is free (`!census_active && !dir_active`) - a
+restart landing inside the boot census was measured to never get served, which is the same shape as the
+1043 census starvation one level up.
+
+Also corrected: `mem_addr` is 24 bits with `[23:21]` as the device bank, so `0x200000` is bank 1 offset
+0 and **not** "past the 2 MiB view". An earlier diagnosis in this log treated it as an overrun; it was
+not one.
+
+What still does not work: after the switch the VM keeps consuming bytes and **never re-reads the
+trailer** - the new part's trailer is absent from the 512 bytes it consumes after the restart, and so is
+the old part's. Driving the VM's own algorithm-reset binding (`vm <!vm_restart>`) and driving the whole
+SoC's `reset` both produce this. The most likely explanation, to be confirmed by reading the generated
+`M_vm_M_main_vm` state machine rather than guessing: Silice's algorithm reset returns the VM to a state
+*after* the trailer read rather than to the top of the program, so it resumes executing bytecode without
+re-deriving `segOffsets`.
+
+Consequence: **this is not installable.** `AW 1046` (`2bdcce831ce41dac`) remains the build on the card;
+a mid-session select in this tree would move the view without restarting the game, which is worse than
+the refusal it replaced. Gates for the tree as committed: `tb_dir` 9 runs, `make sim` green - so nothing
+here regresses the shipping path, and the chapter-switch work is testable in `tb_soc` with
+`+SWITCH=n +SWITCHAFTER=k`.
+
+Next step, in order: (1) read the generated VM's reset handling to find what state it returns to;
+(2) if it cannot restart mid-program, make the *hand-over* explicit instead - hold the VM in reset,
+switch the table, and re-enter through the same path boot uses; (3) only then judge whether a
+player-initiated chapter change is worth shipping.
+
+### The game DOES ask for the next part — and the port throws the request away
+
+Correcting a claim this document has repeated since the single-image plan: *"the ported engine has no
+concept of a part, so nothing in the game can ask for the next one"*. That was taken from the plan doc
+and never checked against the extracted bytecode. It is **wrong**.
+
+The desktop interpreter's resource layer says what the mechanism is (`resource.cpp:446`):
+
+```c
+if (resourceId > _numMemList) { requestedNextPart = resourceId; }   // the game asks for a part
+```
+
+and the VM acts on it immediately (`vm.cpp:473`): `initForPart(res->requestedNextPart)` - reset the VM,
+reload that part's four segments, start running it. Parts are numbered `GAME_PART1..GAME_PART10` =
+`0x3E80..0x3E89` (`parts.h`), and `parts.cpp` lists each part's four memlist resources.
+
+**The requests are in the packs.** Scanning each bytecode segment for opcode `0x19` followed by a
+big-endian word in `0x3E80..0x3E89`:
+
+| pack | requests |
+|---|---|
+| part0 | part 1 (twice: 0x1A9, 0xD1E) |
+| part1 | part 2 |
+| part2 | part 0, part 3, part 1 |
+| part3 | part 4 |
+| part4 | part 5, part 6 |
+| part5 | part 6 |
+| part6 | part 5, part 7 |
+| part7 | - |
+
+So the game chains 0→1→2→3→4→5→6→7 by itself, with branches (part2 can return to 0 or 1; part6 goes
+back to 5). "Play from the start to the finish" is what the bytecode already does.
+
+**Why nothing happens today:** the Silice VM redirects opcode `0x19` to `op_drawString` with a `skip`
+flag (`vm.si` h12/h19 branch). It reads the same two-byte word as `stringId`, masks it to 15 bits and
+looks up a pre-rendered buffer - so `0x19 0x3E 0x81` becomes a *no-op draw with a nonsense string ID*.
+The part request is consumed and discarded. That redirection is not a mistake in upstream's port: the
+extractor bakes the pre-rendered buffers into the pack, replacing the runtime loads. But it also
+replaced the one signal that said "the next chapter starts here".
+
+**So the design is:** teach the VM to report `op_updateMemList` with an ID in the part range, and have the
+core switch the page table and re-enter. That is game-driven continuity - no OSD list, no guess about
+timing. The half of it that is missing is still the re-entry (#31): the VM must re-run its trailer read.
+
+This also demotes the OSD selector from "the feature" to "a manual fallback", and it explains the shape
+of the failure that started this thread: each pack simply runs out of script because the next-chapter
+call is being drawn instead of obeyed.
