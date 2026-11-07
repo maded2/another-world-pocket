@@ -88,12 +88,21 @@ commented - re-enabling it is the same surgical `vm.si` patch that worked for `p
 **Recommendation: (a)**, because it reuses the one upload path that is proven on hardware, and 3.64 MiB
 fits. Trigger to switch to (b): total payload above 3.9 MiB (e.g. if music is pre-rendered to PCM).
 
-**D2 - music: RTL tracker or pre-rendered PCM.** The 3 modules are 33 KB of pattern data. An RTL tracker
-(patterns + order table + 4 voices over the same mixer as the effects) is faithful and keeps
-`op_playMusic(resNum, delay, pos)` semantics. Pre-rendering to PCM at build time is far simpler but loses
-script-driven start position and tempo, and 3 modules of real music as 8-bit PCM would likely blow the
-window budget - which is why D1's trigger exists. **Recommendation: RTL tracker, after the effects work**,
-because it reuses the mixer and keeps the opcode honest.
+**D2 - music: RTL tracker or pre-rendered PCM. DECIDED (owner, 2026-11-08): RTL tracker.**
+
+The 3 modules are 33 KB of pattern data, so a tracker is small: patterns + order table + 4 voices feeding
+the same mixer the effects already need. It also keeps `op_playMusic(resNum, delay, pos)` honest - that
+opcode carries a start order position and a tempo override, and pre-rendering to PCM would have to throw
+both away and guess. The two rejected alternatives, and why:
+
+* **Pre-rendered PCM** - simplest to play, but discards the start position and tempo override, and real
+  music as 8-bit PCM would very likely push the payload past the 4 MiB upload window. It also makes the
+  music untestable against the original: a rendered stream can only be compared to itself.
+* **Reusing a soft CPU to run `sfxplayer.cpp`** - the original implementation, but there is no CPU in this
+  design and adding one to play three modules would be far larger than the state machine it replaces.
+
+Consequence for D1: with a tracker the audio payload stays at **0.70 MiB**, so the second-dataslot route is
+not expected to be needed - the trigger below remains as a guard, not as the plan.
 
 **D3 - the output format is fixed by APF**: I2S, exactly 48 kHz, MCLK 12.288 MHz, SCLK 3.072 MHz, 16-bit
 stereo, 16 active + 16 spacer bits, LRCK low = left.
@@ -127,7 +136,8 @@ play, 4-channel mix, loop, and a stop.
 *Accept:* `tb_top`'s MCLK/LRCK/frame-length checks pass with real samples; the "DAC silent" assertion is
 replaced by "the DAC carries the expected samples".
 
-**G. Music player.** Tracker state machine over the same mixer.
+**G. Music player (RTL tracker, per D2).** Pattern/order walk, 15 instruments, Amiga-period notes, tempo
+derived from `delay * 60 / 7050` ms, over the same mixer as the effects.
 *Accept:* a bench plays a module and matches a Python reference rendering of the same module, event for
 event, then sample for sample.
 
@@ -146,4 +156,10 @@ control for picture-only behaviour.
 * **Volume.** `addclamp` clamps at int8 before the 16-bit output path; four channels at full volume will
   clip the way the original clipped. Faithful is the goal, not clean.
 * **Music tempo** depends on a host timer in the original (`sys->addTimer`). The RTL must derive the same
-  `delay * 60 / 7050` ms interval from the frame clock, and that derivation needs its own check.
+  `delay * 60 / 7050` ms interval from the frame clock, and that derivation needs its own check. This is
+  the tracker-specific hazard: a wrong tempo sounds "slightly off" rather than broken, so it will not
+  announce itself the way a stuck channel will - count events per second against the reference instead of
+  trusting the ear.
+* **Tracker state is small but not free.** 15 instrument descriptors, a 0x80-byte order table, 4 channel
+  contexts and the pattern cursor must survive a part change without a sweep-level stall; keep it in
+  registers plus one small RAM, and do not let the tracker make a PSRAM read it cannot afford.
