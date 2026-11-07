@@ -50,6 +50,47 @@ mkdir -p "$BUILD"
 cp -r "$UP/common" "$BUILD/common"
 cp "$UP/vm.si" "$BUILD/vm.si"
 
+# ---------------------------------------------------------------------------
+# The ONE deliberate divergence from upstream vm.si, applied here so it survives
+# fetch_upstream.sh. ports/another-world/upstream is gitignored, so an edit made
+# directly to that tree is one fetch away from silently disappearing - the feature
+# would still "exist" on this machine and not in any checkout.
+#
+# What it does: op_updateMemList (h19) carries a resource id, and the desktop engine
+# treats an id above the memlist size as "load this game part next"
+# (resource.cpp: requestedNextPart = resourceId; vm.cpp: initForPart). The Pocket port
+# redirects h19 to op_drawString, which is right for the ids it sees - the extractor
+# bakes the pre-rendered buffers into the pack - but it also swallowed the request.
+# Recording part-range ids gives the core the chapter change the SCRIPT asks for.
+#
+# Idempotent: if the port is already there, nothing is inserted.
+# ---------------------------------------------------------------------------
+python3 - "$BUILD/vm.si" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+port_anchor = "  // leds\n  output uint8  leds(0),\n"
+port_add = """  // Part request, as the original engine issues it: op_updateMemList (h19) with an id above the
+  // memlist size means "load this game part next" (resource.cpp / vm.cpp: initForPart). Parts are
+  // numbered 0x3E80..0x3E89; the core switches the page table when this changes. See
+  // scripts/pocket_translate.sh for why this is patched here rather than in the tree.
+  output uint16 part_req(0),
+"""
+body_anchor = "                    // h19 = 00011001\n"
+body_add = """                    if (stringId >= 16h3E80 && stringId <= 16h3E89) {
+                      part_req = stringId;
+                    }
+"""
+if "output uint16 part_req" not in s:
+    assert port_anchor in s, "vm.si: leds anchor not found - upstream changed?"
+    s = s.replace(port_anchor, port_anchor + port_add, 1)
+if "part_req = stringId;" not in s:
+    assert body_anchor in s, "vm.si: h19 anchor not found - upstream changed?"
+    s = s.replace(body_anchor, body_anchor + body_add, 1)
+open(p, "w").write(s)
+print("vm.si: part_req patch applied (or already present)")
+PY
+
 # our top, with the include pointed at the staged copy of vm.si
 sed -e "s#\$include('../../../ports/another-world/upstream/hardware/vm.si')#\$include('vm.si')#" \
     -e "s#\$include('../../../ports/another-world/upstream/hardware/common/clean_reset.si')#\$include('common/clean_reset.si')#" \
