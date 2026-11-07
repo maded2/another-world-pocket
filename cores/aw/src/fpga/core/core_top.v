@@ -587,7 +587,16 @@ aw_reset_gen u_rstgen (
 // wired to 0 inside the generated netlist. It is held off instead by aw_rom's vm_running
 // gate, which declines its requests until the pack is loaded - without that, the ROM streams
 // to a VM that has nothing to do with the data and the pack load reports ERR_OVERFLOW.
-wire design_reset = ~design_run;
+// The SoC's own reset: the framework's Reset Exit releases it, and a chapter change pulses it.
+//
+// Why the SoC's reset and not the VM's own algorithm reset: aw_pocket.si binds `vm <!vm_restart>`,
+// which resets the VM's registers but does NOT restart its sequential program. Measured - with only
+// that binding driven, a mid-game switch moved the page table and the VM kept consuming the OLD
+// chapter's bytecode: bytes_to_vm kept climbing, and the new part's trailer never appeared in the next
+// 512 bytes the VM read. Resetting the whole SoC re-runs it the way boot does, which is a path this
+// port has exercised millions of times. The cost is that the framebuffers clear, so a chapter change
+// shows a brief blank frame - the honest price of "start the next chapter" and not "splice it in".
+wire design_reset = ~design_run | rom_vm_restart;
 
 ////////////////////////////////////////////////////////////////////////////////////////
 //

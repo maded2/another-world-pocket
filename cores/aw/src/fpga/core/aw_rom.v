@@ -1816,7 +1816,17 @@ module aw_rom (
             part_pop <= 1'b0;
             if (dir_start) part_held <= 1'b0;   // consumed at the sweep start, right or wrong part
             case (p_state)
-            P_IDLE: if (!part_empty) begin
+            // A MID-RUN select waits until the chip is free, and a boot select does not.
+            // The difference is not cosmetic: the boot census owns the PSRAM for ~126 ms after the
+            // upload, and a restart landing in that window kills the next chapter before it starts.
+            // Measured: switching at frame 11 (~185 ms, census still running) left the restarted VM
+            // unable to complete the trailer read - bytes_to_vm froze at 1040 and the address sat at
+            // 0x200000 - while a run WITHOUT the switch shows the same 1040/0x2010C3 dip and then
+            // recovers. So the dip is the census; a restart inside it simply never gets served.
+            // Waiting in the FIFO is the right place to wait: the request is already durable there,
+            // view_part has not moved yet, and the VM keeps running its current chapter until the
+            // switch can be done atomically.
+            P_IDLE: if (!part_empty && (!streamed_q || (!census_active && !dir_active))) begin
                         part_pop <= 1'b1;
                         p_wcnt   <= 8'd0;
                         p_state  <= P_WAIT;
@@ -1898,6 +1908,14 @@ module aw_rom (
         end
     end
     assign rom_vm_restart = rstr_pulse;
+
+    // One-cycle event at the leading edge of the pulse, which the fetch state machine consumes.
+    // The restart has to be ONE event rather than a 16-cycle condition: the VM is held in its start
+    // state for the whole pulse, and re-clearing the reader every cycle of it would also discard the
+    // very first reads the VM makes once the pulse ends.
+    reg  rstr_pulse_d;
+    always @(posedge clk_core) rstr_pulse_d <= rstr_pulse;
+    wire rstr_evt = rstr_pulse & ~rstr_pulse_d;
 
     // The one-way gate on part requests. Once the VM has taken a byte, re-pointing the page table
     // would swap the bytes under a running game, and the game cannot be restarted from here: the
@@ -2026,6 +2044,39 @@ module aw_rom (
             sf_rd        <= 1'b0;
             chk_cnt      <= 5'd0;
             chk_data     <= {128{1'b0}};
+        end else if (rstr_evt) begin
+            // ---- the VM was restarted: abandon the stream it was in the middle of ----
+            // Measured necessity, not tidiness. With the reset wired but the reader left alone, the
+            // restarted VM's first read (the trailer at 0x1FFFE0) inherited the previous stream's
+            // pending acceptance: it over-read past the trailer, shifted a garbage segment offset
+            // into segOffsets, and then asked for 0x200000 and 0x2010C3 - past the end of its 2 MiB
+            // view - with bytes_to_vm frozen at 1040 and starving climbing to 536,255.
+            //
+            // Every register here belongs to the stream that no longer has a consumer. rom_dbg_rd_bytes
+            // is deliberately NOT cleared: it counts what the VM has been fed over the whole session,
+            // and a chapter change does not un-feed it.
+            //
+            // The FIFO is left alone on purpose. Stale words in it cannot be served by accident -
+            // the reader matches c_waddr against the word it wants and C_SEEK discards what does not
+            // match - so draining it would only cost a state machine.
+            c_state      <= C_IDLE;
+            gap          <= 2'd0;
+            c_addr       <= 21'd0;
+            c_start      <= 21'd0;
+            acc_cnt      <= 7'd0;
+            start_addr_r <= 22'd0;
+            c_v          <= 1'b0;
+            c_served     <= 1'b0;
+            c_word       <= 16'd0;
+            c_waddr      <= 21'd0;
+            n_word       <= 16'd0;
+            n_addr       <= 21'd0;
+            n_v          <= 1'b0;
+            pend         <= 1'b0;
+            busy_q       <= 1'b0;
+            mem_data     <= 8'd0;
+            mem_data_available <= 1'b0;
+            sf_rd        <= 1'b0;
         end else begin
             sf_rd              <= 1'b0;
             mem_data_available <= 1'b0;
