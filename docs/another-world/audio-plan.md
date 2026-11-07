@@ -30,8 +30,16 @@ straight through. Any extractor must therefore run the same unpacker, not `dd` a
 
 `op_playSound` (`vm.cpp:387`): `u16 resourceId`, `u8 freq`, `u8 vol`, `u8 channel`.
 
-* Data at `bufPtr + 8`. Header is `u16 len`, `u16 loopLen` (both in units of 2 bytes: `len*2` is the byte
-  count), then 4 pad bytes (`vm.cpp:763-766`).
+* Data at `bufPtr + 8`. Header is `u16 loop_start`, `u16 loop_len` (both in units of 2 bytes), then 4 pad
+  bytes (`vm.cpp:763-766`). **Measured, not guessed**: the playable payload is `loop_start + loop_len`, and
+  `8 + 2*(h0 + h1)` equals the resource size for **96 of the 102 non-empty sounds exactly**; 6 are empty
+  (size 0) and one (res 4) carries 2 bytes beyond its declared payload. That matches how the mixer uses
+  the pair - `mc.loopPos = h0*2`, `mc.loopLen = h1*2`, so playback runs 0..loopPos+loopLen and repeats the
+  tail - and it replaces an earlier reading of the first field as a total length, which the data
+  contradicts for 6 of the first 10 resources checked.
+* **11 of the sounds loop** (`h1 != 0`), so the mixer's loop path is not an edge case: a machine gun or an
+  engine is one sample. Note `scripts/extract_audio.py` reports these counts on every run, so the numbers
+  above are re-derivable rather than remembered.
 * Samples are **8-bit signed PCM** - `Mixer::mixCallback` sums `int8_t` with `addclamp` (`mixer.cpp:22`).
 * `freq` indexes `frequenceTable[]` and must be `< 40`; `vol` is clamped to `0x3F`; `channel & 3` gives
   **4 channels** (`AUDIO_NUM_CHANNELS`).
