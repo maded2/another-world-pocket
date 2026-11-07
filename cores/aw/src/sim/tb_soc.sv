@@ -119,7 +119,7 @@ reg design_run = 1'b0;
         .rom_part            (dir_part_w),
         .rom_part_late       (dir_late_w),
         .rom_pool_ok         (pool_ok_w),
-        .rom_vm_restart      (vm_restart_w), .vm_part_req(vm_part_req_w),
+        .rom_vm_restart      (vm_restart_w), .vm_part_req(vmreq_force | vm_part_req_w),
         .cram0_a             (cram0_a),
         .cram0_dq            (cram0_dq),
         .cram0_wait          (cram0_wait),
@@ -281,6 +281,11 @@ reg design_run = 1'b0;
     int         part_sel  = -1;                      // +PART: which part to select before byte 0
     wire        dir_valid_w, dir_bad_w, dir_busy_w, dir_late_w, pool_ok_w, vm_restart_w;
     wire [15:0] vm_part_req_w;      // the GAME's chapter request, straight out of the SoC
+    // +VMREQ=<id>: inject a request as if the game had issued it, so the aw_rom side of the chapter
+    // change can be exercised without waiting for the script to reach its op_updateMemList. The
+    // VM-to-request half is covered separately by the bytecode scan and the netlist port; this
+    // covers request-to-view_part, which is where a plumbing bug would actually live.
+    reg  [15:0] vmreq_force = 16'd0;
     wire [2:0]  dir_part_w;
     wire [7:0]  dir_err_w;
     string    pack_hex;
@@ -1294,6 +1299,7 @@ reg design_run = 1'b0;
         void'($value$plusargs("PAUSEMS=%d", pause_ms));
         void'($value$plusargs("FRAMES=%d", max_frames));
         void'($value$plusargs("SWITCH=%d", switch_part));
+        void'($value$plusargs("VMREQ=%d", vmreq_force));
         void'($value$plusargs("SWITCHAFTER=%d", switch_after));
         void'($value$plusargs("NOINPUT=%d", noinput));
         void'($value$plusargs("PACK_KIND=%s", pack_kind));
@@ -1506,7 +1512,8 @@ reg design_run = 1'b0;
                     switch_done = 1'b1;
                     $display("  SWITCH to part %0d at frame %0d (streamed_q=%b dir_part=%0d)",
                              switch_part, frames, u_rom.streamed_q, dir_part_w); $fflush;
-                    wr32(32'h00F0_0020, switch_part << 8);
+                    if (vmreq_force != 0) $display("  injected VM part request 0x%04h", vmreq_force);
+                    else wr32(32'h00F0_0020, switch_part << 8);
                 end
                 c = c + 1;
                 if (c == 250000) begin   // every ~10 ms of design time
