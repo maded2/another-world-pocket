@@ -215,7 +215,11 @@ def main():
             else:
                 if h["payload"] < len(pcm):
                     tails.append((res_id, len(pcm) - h["payload"]))
-                entry.update(pcm_off=8, pcm_len=h["payload"],
+                # pcm_len is the PCM bytes AFTER the 8-byte header, not the whole payload. Using the
+                # payload made every sound 8 bytes too long, and it was invisible to the index-vs-JSON
+                # comparison because both sides shared the error - it only showed up when the absolute
+                # address of the LAST resource ran 8 bytes past the end of the image.
+                entry.update(pcm_off=8, pcm_len=h["payload"] - 8,
                              loop_start=h["loop_start"], loop_len=h["loop_len"])
                 if h["loop_len"]:
                     looping += 1
