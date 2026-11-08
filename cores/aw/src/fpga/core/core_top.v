@@ -924,7 +924,7 @@ aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .rom_dir_err          ( rom_dir_err          ),
     .rom_part             ( rom_part_sel         ),
     .rom_part_late        ( rom_part_late        ),
-    .rom_pool_ok          ( rom_pool_ok          ),
+    .rom_pool_ok          ( rom_pool_ok          ), .aud_req(1'b0), .aud_addr(24'd0), .aud_data(), .aud_valid(),
     .rom_vm_restart       ( rom_vm_restart       ),
     .vm_part_req          ( vm_part_req          ),
 

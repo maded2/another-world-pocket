@@ -121,7 +121,7 @@ reg design_run = 1'b0;
         .rom_dir_err         (dir_err_w),
         .rom_part            (dir_part_w),
         .rom_part_late       (dir_late_w),
-        .rom_pool_ok         (pool_ok_w),
+        .rom_pool_ok         (pool_ok_w), .aud_req(1'b0), .aud_addr(24'd0), .aud_data(), .aud_valid(),
         .rom_vm_restart      (vm_restart_w), .vm_part_req(vmreq_force | vm_part_req_w),
         .cram0_a             (cram0_a),
         .cram0_dq            (cram0_dq),

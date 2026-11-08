@@ -195,6 +195,14 @@ module aw_rom (
     // 15 bits x 2 MHz-ish of traffic is not a fast bus: the engine writes this once, at the end of a
     // chapter, so it is quasi-static and is filtered by stability below rather than handshaked.
     input  wire [15:0] vm_part_req,
+    // ---- audio sample fetch ----
+    // A BYTE address in the image; the byte comes back one cycle after the read is taken. Served only when
+    // the sequencer is otherwise idle: measured, audio is 5.4% of the PSRAM port and the VM 0.5%, so a
+    // priority scheme would solve a problem the numbers say does not exist (docs/another-world/audio-plan.md).
+    input  wire        aud_req,
+    input  wire [23:0] aud_addr,
+    output reg  [7:0]  aud_data,
+    output reg         aud_valid,
 
     // ---- the chip ----
     output wire [5:0]  cram0_a,
@@ -782,7 +790,8 @@ module aw_rom (
     wire [15:0] st_wdata = (st_seq == 3'd1) ? ST_PAT_BE : ST_PAT;
     // The directory sweep reads image page 0 (physical word = image word, since the directory IS
     // physical page 0): words 0 and 1 for the magic, then the 64 entries of the selected part.
-    wire [21:0] st_rd_addr = census_active ? {{(22-CEN_AW){1'b0}}, census_addr}
+    wire [21:0] st_rd_addr = aud_active  ? aud_addr[22:1]          // PSRAM words are 16 bits: byte >> 1
+                           : census_active ? {{(22-CEN_AW){1'b0}}, census_addr}
                            : dir_active    ? {12'd0, dir_word}
                            : (st_seq == ST_SEQ_P0) ? ST_ADDR_P0 : ST_ADDR_D0;
 
@@ -796,6 +805,13 @@ module aw_rom (
     reg  [2:0] st_seq;             // which probe of the round is in flight (0..4)
     reg  [15:0] st_cnt, st_wcnt;
     reg  [2:0] st_gap;
+    // Audio fetch state. ONE always block owns these (below), and the sequencer only READS `aud_take`,
+    // combinationally - the alternative was setting them from the sequencer's block as well, which is the
+    // multi-driver pattern Quartus rejects and Verilator happily simulates.
+    reg        aud_pend, aud_active;
+    // Take the port only when nobody else wants it. dir and cen are one-shot and must not be delayed;
+    // an audio read has 20.8 us of slack per tick.
+    wire       aud_take = aud_pend && !aud_active && (st_s == ST_IDLE) && !dir_pend && !cen_pend;
     wire       st_active  = (st_s != ST_IDLE);
     wire       st_rd_take = (st_s == ST_RD);
 
@@ -916,6 +932,8 @@ module aw_rom (
                 // live view is view_part, which only a part select changes.
                 st_seq        <= ST_SEQ_DIR;
                 st_s          <= ST_RD;
+            end else if (aud_take) begin
+                st_s <= ST_RD;              // aud_active is set by the audio block on this same cycle
             end else if (cen_pend) begin
                 // Read-only pass: no write phase, and the periodic probes wait for it.
                 // The end of the sweep is snapshotted so a late write cannot move the
@@ -1116,7 +1134,11 @@ module aw_rom (
                 end else census_stall <= census_stall + 18'd1;
             end
 
-            if (rd_q_valid && st_s == ST_WAIT && !census_active && !dir_active) begin
+            // `&& !aud_active`: this is the ONE point where a returning read is claimed, and audio is a
+            // fourth claimant. Without it the probe path and the audio path can both take the same
+            // rd_q_valid and one of them silently loses a read - which stays invisible until a sample is
+            // missing or a probe reports a stale word.
+            if (rd_q_valid && st_s == ST_WAIT && !census_active && !dir_active && !aud_active) begin
                 case (st_seq)
                 3'd0: rom_selftest_die0  <= rd_q;
                 3'd1: rom_selftest_be    <= rd_q;
@@ -1131,6 +1153,26 @@ module aw_rom (
                     // the NEXT sequence's first phase: seq 4 is read-only, the rest write
                     st_s   <= (st_seq == 3'd3) ? ST_RD : ST_WR;
                 end
+            end
+        end
+    end
+
+    // Audio fetch: owns its own registers, and only ever takes the port when aud_take said so.
+    always @(posedge clk_psram) begin
+        if (rst_psram) begin
+            aud_pend <= 1'b0; aud_active <= 1'b0; aud_valid <= 1'b0; aud_data <= 8'd0;
+        end else begin
+            aud_valid <= 1'b0;
+            if (aud_req) aud_pend <= 1'b1;              // a request is never lost: this is the census lesson
+            if (aud_take) begin
+                aud_pend   <= 1'b0;
+                aud_active <= 1'b1;
+            end
+            if (aud_active && rd_q_valid && (st_s == ST_WAIT)) begin
+                // the byte the caller asked for, selected from the 16-bit word it lives in
+                aud_data   <= aud_addr[0] ? rd_q[15:8] : rd_q[7:0];
+                aud_valid  <= 1'b1;
+                aud_active <= 1'b0;
             end
         end
     end
