@@ -283,3 +283,31 @@ next step is a stash-and-rerun bisect rather than an audio change.
 One signature worth keeping: the shift reports `gaps=0` and `rewinds=0`, so the stream never broke - it
 started misaligned. That is a different shape from the 1040/1041 resume-policy failures and must not be
 diagnosed as one.
+
+### The paged regression is real and is NOT audio: bisected (2026-11-08)
+
+With `aw_rom.v` and `tb_soc.sv` reverted to `f69583e` - the last known-good paged state, before the
+chapter-switch work - part 1 on the game-only image returns exactly its old numbers:
+
+| code under test | bytes to VM | fill shifted | verdict |
+|---|---|---|---|
+| HEAD (`5ec0369`) | 23,021 | **509** | FAIL |
+| `f69583e` (aw_rom + tb_soc) | **41,956** | **0** | PASS |
+
+So there is a **regression in the paged path** introduced since `f69583e`, and it is not related to the audio
+work at all - the audio image and the game-only image behave identically at HEAD, which is what ruled that
+out first.
+
+What changed in between, in the two files that were reverted together: the chapter-switch additions to
+`aw_rom` (`vm_part_req` input, `rom_vm_restart` output, the `pr_*` stability filter, `view_part`'s second
+source, `restart_tog`, the `rstr_evt` fetch reset, the `P_IDLE` streamed-gate removal, the `streamed_q`
+clear on a part commit) and the corresponding `tb_soc` changes (audio event harvest, `+VMREQ` injection,
+`+SWITCH` machinery, 4 MiB image buffer).
+
+Narrowing it needs one more run, and the halves can be separated cheaply: keep the NEW `aw_rom` and revert
+only `tb_soc` (an unconnected `vm_part_req` input is legal and reads as 0). If that passes, the fault is in
+the bench; if it fails, it is in `aw_rom`'s new chapter logic.
+
+Why this matters beyond the bug: #36, #37's integration and the tracker (#39) all build on the paged path, so
+a 50 % loss of bytecode delivery would have been inherited by every audio test as "mysterious starvation".
+The measurement that found it was the plain part-1 run, not any audio bench.
