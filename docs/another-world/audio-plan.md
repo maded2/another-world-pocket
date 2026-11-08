@@ -353,3 +353,29 @@ to do: it moved `view_part` to 2 and pulsed the restart.
 
 So: no regression, no audio fault, and the two half-built features together behave exactly as their separate
 diagnoses predicted.
+
+### PSRAM arbitration: measured headroom before designing anything (2026-11-08)
+
+`aw_rom` owns the only PSRAM port, so audio reads have to share it. Before touching that sequencer - the file
+that has caused the most regressions in this port - the demand is quantified:
+
+| | reads/s | share of the port |
+|---|---|---|
+| PSRAM sequencer capacity (92.812 MHz, 13 cycles/read) | 7,139,423 | 100 % |
+| audio, worst case (48 kHz x 4 channels x 2 reads: b1 and b2) | 384,000 | **5.4 %** |
+| VM bytecode stream, measured (41,956 bytes over 78 frames at 60 Hz) | 32,274 | 0.5 % |
+| **combined** | | **5.8 %** |
+
+Per 48 kHz tick: 20.83 us is 1934 PSRAM clocks, and audio needs 104 of them.
+
+So the arbitration does not need to be clever, and it must not be clever: **5.8 % occupancy means the design
+should be "serve the audio read when the port is idle, hold a pending latch so a request is never lost"** -
+exactly the pattern the sequencer already uses for the self-test probes. A priority scheme that can starve
+either side would be solving a problem that the numbers say does not exist, and the census already showed what
+happens when a sweep takes the port away from the VM mid-stream: a 126 ms stall, ERR_OVERFLOW on the upload,
+and the VM fed zero bytes.
+
+The one quantity that IS constrained is latency: an audio read must complete within a tick (20.83 us) or the
+mixer runs out of samples. With 1934 clocks available and a VM burst measured at a few hundred bytes per
+frame, that is not close - but it is the thing the integration bench should assert (`bytes_to_vm` climbing,
+`starving` at 0) rather than assume.
