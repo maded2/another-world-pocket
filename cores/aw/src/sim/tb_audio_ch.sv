@@ -50,6 +50,7 @@ module tb_audio_ch;
                        .cmd_len(cmd_len), .cmd_lp(cmd_lp), .cmd_ll(cmd_ll), .cmd_base(cmd_base));
 
     integer i, k, pulses, errors = 0, checked = 0;
+    reg probe_run = 1'b0;   // flip to 1 to trace the controller/resolver handshake
     reg [7:0] got_vol; reg [23:0] got_base, got_len, got_lp, got_ll; reg [1:0] got_ch; reg [5:0] got_freq;
 
     task automatic do_play(input [15:0] r, input [5:0] f, input [7:0] v, input [1:0] c);
@@ -59,6 +60,9 @@ module tb_audio_ch;
             @(negedge clk); play <= 0;
             for (k = 0; k < 3000; k = k + 1) begin
                 @(negedge clk);
+                if (probe_run && k < 24)
+                    $display("   cyc %0d: st=%0d start=%b busy=%b found=%b idx_res=%0d rd=%0h",
+                             k, u_ch.st, idx_start, idx_busy, idx_found, idx_res, idx_addr);
                 if (cmd_valid) begin
                     pulses = pulses + 1;
                     got_vol = cmd_vol; got_base = cmd_base; got_len = cmd_len;
@@ -93,16 +97,25 @@ module tb_audio_ch;
         for (i = 0; i < 4096; i = i + 1) mem[i] = 8'd0;
         // index: tag, count=2
         mem[0] = 8'h41; mem[1] = 8'd2;
-        // record 0: res 8, sound, blob_off 0, pcm_off 8, pcm_len 0x1234, loop_start 0x0010, loop_len 0x0020
-        {mem[4], mem[5]}   = 16'd8;        {mem[6]} = 8'd0;  {mem[7]} = 8'd0;
-        {mem[8], mem[9], mem[10], mem[11]} = 32'd0;
-        {mem[12], mem[13]} = 16'd8;        {mem[14], mem[15]} = 16'h1234;
-        {mem[16], mem[17]} = 16'h0010;     {mem[18], mem[19]} = 16'h0020;
+        // Records are LITTLE-ENDIAN. The first version wrote them with {hi, lo} concatenations, which put the
+        // high byte first - so res 8 became 0x0800 and no lookup could ever match. The RTL was right; the
+        // stimulus was wrong, and the probe (busy=1, rd walking the record) is what located it.
+        // record 0: res 8, sound, blob_off 0, pcm_off 8, pcm_len 0x1234, loop_start 0x10, loop_len 0x20
+        mem[4] = 8'd8;   mem[5] = 8'd0;                 // res
+        mem[6] = 8'd0;   mem[7] = 8'd0;                 // type, flags
+        mem[8] = 8'd0;   mem[9] = 8'd0; mem[10] = 8'd0; mem[11] = 8'd0;   // blob_off
+        mem[12] = 8'd8;  mem[13] = 8'd0;                // pcm_off
+        mem[14] = 8'h34; mem[15] = 8'h12;               // pcm_len
+        mem[16] = 8'h10; mem[17] = 8'd0;                // loop_start
+        mem[18] = 8'h20; mem[19] = 8'd0;                // loop_len
         // record 1: res 9, sound, blob_off 0x100, pcm_off 8, pcm_len 0x0100, no loop
-        {mem[20], mem[21]} = 16'd9;        {mem[22]} = 8'd0;  {mem[23]} = 8'd0;
-        {mem[24], mem[25], mem[26], mem[27]} = 32'h0000_0100;
-        {mem[28], mem[29]} = 16'd8;        {mem[30], mem[31]} = 16'h0100;
-        {mem[32], mem[33]} = 16'd0;        {mem[34], mem[35]} = 16'd0;
+        mem[20] = 8'd9;   mem[21] = 8'd0;
+        mem[22] = 8'd0;   mem[23] = 8'd0;
+        mem[24] = 8'h00;  mem[25] = 8'h01; mem[26] = 8'd0; mem[27] = 8'd0;
+        mem[28] = 8'd8;   mem[29] = 8'd0;
+        mem[30] = 8'h00;  mem[31] = 8'h01;
+        mem[32] = 8'd0;   mem[33] = 8'd0;
+        mem[34] = 8'd0;   mem[35] = 8'd0;
 
         repeat (4) @(posedge clk);
         rst <= 0;
