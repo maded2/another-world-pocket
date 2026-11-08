@@ -42,9 +42,13 @@ module aw_audio_ch #(
     // Explicit states, because the first version was combinational-looking and wrong: after the lookup
     // finished, idx_found stayed high and idx_start stayed low, so the command re-issued EVERY cycle and
     // would have restarted the sound continuously. An issue-once state is not decoration here.
-    localparam [1:0] S_IDLE = 2'd0, S_REQ = 2'd1, S_WAIT = 2'd2, S_ISSUE = 2'd3;
+    // S_SEEN_BUSY exists because the resolver's `busy` is REGISTERED: one cycle after `start` it can still be
+    // low, so a controller that went straight to "wait for !busy" concluded "not found" before the walk had
+    // begun and issued a stop. Measured: both real plays came out as vol=0/base=0 - the unknown-id path -
+    // while the two stop cases passed, which is exactly what that race looks like.
+    localparam [2:0] S_IDLE = 3'd0, S_REQ = 3'd1, S_SEEN = 3'd2, S_WAIT = 3'd3, S_ISSUE = 3'd4;
 
-    reg [1:0]  st;
+    reg [2:0]  st;
     reg        stop_req;      // this request is a stop (vol == 0), so no lookup
 
     always @(posedge clk) begin
@@ -78,8 +82,9 @@ module aw_audio_ch #(
             end
             S_REQ: begin
                 idx_start <= 1'b0;
-                st        <= S_WAIT;
+                st        <= S_SEEN;
             end
+            S_SEEN: if (idx_busy) st <= S_WAIT;      // the walk has actually started
             S_WAIT: begin
                 if (!idx_busy) begin
                     if (idx_found) begin
