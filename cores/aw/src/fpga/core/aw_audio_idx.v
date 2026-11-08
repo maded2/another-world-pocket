@@ -32,7 +32,7 @@ module aw_audio_idx #(
     output reg  [23:0] rd_addr,
     input  wire [7:0]  rd_data
 );
-    localparam [1:0] S_IDLE = 2'd0, S_ADDR = 2'd1, S_CAP = 2'd2;
+    localparam [1:0] S_IDLE = 2'd0, S_ADDR = 2'd1, S_CAP = 2'd2, S_LATCH = 2'd3;
 
     reg [1:0]  st;
     reg [7:0]  count;
@@ -79,33 +79,37 @@ module aw_audio_idx #(
                             rd_addr  <= INDEX_OFF + 24'd4 + {16'd0, k} * 24'd16;
                             st       <= S_ADDR;
                         end else if (bi == 5'd15) begin
+                            // Capture the last byte and latch on the NEXT cycle: f16(14) reads rec[15], and
+                            // latching here read its pre-write value, so every loop_len was wrong (measured:
+                            // id 1 gave 154 instead of 3482 - the high byte was stale).
                             rec[bi] <= rd_data;
-                            // compare the res id (bytes 0,1) and finish this record either way
-                            // bytes 0 and 1 are the res id and were captured in earlier cycles; rd_data here
-                            // is byte 15. Comparing against rd_data was the first version's bug.
-                            if ({rec[1], rec[0]} == want) begin
-                                r_type       <= rec[2];
-                                r_blob_off   <= f32(5'd4);
-                                r_pcm_off    <= f16(5'd8);
-                                r_pcm_len    <= f16(5'd10);
-                                r_loop_start <= f16(5'd12);
-                                r_loop_len   <= f16(5'd14);
-                                found        <= 1'b1;
-                                busy         <= 1'b0;
-                                st           <= S_IDLE;
-                            end else if (k + 8'd1 >= count) begin
-                                busy <= 1'b0;                    // walked everything: not found
-                                st   <= S_IDLE;
-                            end else begin
-                                k       <= k + 8'd1;
-                                bi      <= 5'd0;
-                                rd_addr <= INDEX_OFF + 24'd4 + ({16'd0, k} + 16'd1) * 24'd16;
-                                st      <= S_ADDR;
-                            end
+                            st      <= S_LATCH;
                         end else begin
                             rec[bi] <= rd_data;
                             bi      <= bi + 5'd1;
                             rd_addr <= rd_addr + 24'd1;
+                            st      <= S_ADDR;
+                        end
+                    end
+            S_LATCH: begin
+                        if ({rec[1], rec[0]} == want) begin
+                            r_type       <= rec[2];
+                            r_blob_off   <= f32(5'd4);
+                            r_pcm_off    <= f16(5'd8);
+                            r_pcm_len    <= f16(5'd10);
+                            r_loop_start <= f16(5'd12);
+                            r_loop_len   <= f16(5'd14);
+                            found        <= 1'b1;
+                            busy         <= 1'b0;
+                            st           <= S_IDLE;
+                        end else if (k + 8'd1 >= count) begin
+                            busy  <= 1'b0;                  // walked everything: not found
+                            found <= 1'b0;
+                            st    <= S_IDLE;
+                        end else begin
+                            k       <= k + 8'd1;
+                            bi      <= 5'd0;
+                            rd_addr <= INDEX_OFF + 24'd4 + ({16'd0, k} + 16'd1) * 24'd16;
                             st      <= S_ADDR;
                         end
                     end

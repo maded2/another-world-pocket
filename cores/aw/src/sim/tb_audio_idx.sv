@@ -61,6 +61,10 @@ module tb_audio_idx;
         for (i = 0; i < n; i = i + 1) begin
             lookup(e_res[i][15:0]);
             checked = checked + 1;
+            if (i == 0)
+                $display("  probe: st=%0d count=%0d k=%0d rec0=%02h rec1=%02h found=%b want=%0d idx_cnt=%02h idx_rec0=%02h%02h",
+                         dut.st, dut.count, dut.k, dut.rec[0], dut.rec[1], found, e_res[i],
+                         idx[1], idx[1], idx[0]);
             if (!found) begin
                 errors = errors + 1;
                 $display("  FAIL id %0d not found", e_res[i]);
