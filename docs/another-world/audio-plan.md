@@ -259,3 +259,27 @@ Two properties that will otherwise be mistaken for RTL bugs:
 
 `python3 scripts/ref_mixer.py` runs four hand-checkable cases (full-scale constant, truncation toward zero,
 end-of-sample stop, loop wrap) and is the oracle the RTL mixer will be graded against.
+
+### Correction: the audio image did not cause the shifted fills (measured, 2026-11-08)
+
+After packaging the audio into the image I reported 509 shifted fill writes on part 1 and attributed them to
+the longer boot census (1.9M words instead of 1.5M). **The control disproves that.** The game-only image,
+same part, same frame count, gives the identical result:
+
+| image | bytes to VM | fill writes shifted | frame swaps |
+|---|---|---|---|
+| `aw-all-audio.bin` (3,813,404 B) | 23,021 | 509 | 18 |
+| `aw-all.bin` (3,080,192 B) | 23,021 | 509 | 18 |
+
+So the audio section is not the cause and the "bound the census to the pool" recommendation derived from it
+does not stand on this evidence. Recorded rather than quietly dropped, because a plausible causal story with
+a number attached is exactly the kind of thing that gets acted on later.
+
+What the comparison does point at: the last *passing* paged part-1 run (41,956 bytes, 0 shifted) predates the
+chapter-switch RTL work - the `P_IDLE` streamed-gate removal, the `streamed_q` clear, the restart toggle and
+the `rstr_evt` stream reset. Those were introduced together and one of them is the likely regression, so the
+next step is a stash-and-rerun bisect rather than an audio change.
+
+One signature worth keeping: the shift reports `gaps=0` and `rewinds=0`, so the stream never broke - it
+started misaligned. That is a different shape from the 1040/1041 resume-policy failures and must not be
+diagnosed as one.
