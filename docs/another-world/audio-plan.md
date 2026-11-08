@@ -231,3 +231,31 @@ subsetting step that would need re-doing the moment someone plays further.
 
 `res=88 freq=7 vol=16 ch=0` repeating 13 times is the harvest earning its keep: that is a footstep-like
 cue, and a sampled monitor would have reported it once.
+
+### The mixer's arithmetic, and one quirk that must be copied rather than fixed
+
+`scripts/ref_mixer.py` is a faithful transcription of `mixer.cpp` (`Mixer::mix` / `MixerChannel`), built to
+grade the RTL against something that is not Verilog. Four C semantics change samples and are reproduced
+deliberately:
+
+* `chunkPos` is **16.8 fixed point**: low 8 bits the interpolation fraction, high bits the sample index.
+* The interpolated byte `(b1*(0xFF - ilc) + b2*ilc) >> 8` is stored back into an `int8_t`, so it **wraps**
+  to 8 bits rather than clamping.
+* Volume is `b * volume / 0x40` with C's division, which **truncates toward zero** - Python's `//` floors,
+  and the difference shows on every negative sample.
+* `addclamp` saturates the running sum to -128..127.
+
+Two properties that will otherwise be mistaken for RTL bugs:
+
+* **A constant full-scale sample does not come out at full scale.** Volume is 6-bit, so `0x40` clamps to
+  `0x3F`; and the interpolator multiplies by `0xFF/0x100`. `127` becomes `(127*255)>>8 = 126`, then
+  `126*63//64 = 124`. Two separate 1-LSB attenuations.
+* **The loop wrap writes a raw sample index into a 16.8 accumulator.** `chunkPos = loopPos`, not
+  `loopPos << 8`, so after a wrap the high byte is `loopPos >> 8` and the fraction is `loopPos & 0xFF` -
+  the reader lands at the START of the sample with a fractional offset. With data `[10,20,30,40]`,
+  `loopPos=1`, `loopLen=2` the model produces `8, 18, 28, 9, 18, 28`. That is almost certainly a bug in
+  the original, and it is the behaviour to reproduce: **11 of the 103 sounds loop**, so it is load-bearing
+  rather than a corner.
+
+`python3 scripts/ref_mixer.py` runs four hand-checkable cases (full-scale constant, truncation toward zero,
+end-of-sample stop, loop wrap) and is the oracle the RTL mixer will be graded against.
