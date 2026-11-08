@@ -138,6 +138,11 @@ module aw_mixer (
     reg [7:0]  ilc;
     reg [7:0]  b1, b2;
     reg signed [8:0] running;         // the mix accumulator, clamped to int8 on every add
+    // The interpolated sample, computed with every operand explicitly signed so the expression cannot be
+    // widened to unsigned. (b1*(255-ilc) + b2*ilc) >> 8 then wraps to 8 bits, as the C int8_t store does.
+    wire signed [15:0] interp_wide = ($signed({{8{b1[7]}}, b1}) * $signed({1'b0, ~ilc}))
+                                   + ($signed({{8{b2[7]}}, b2}) * $signed({1'b0, ilc}));
+    wire signed [7:0]  interp      = interp_wide[15:8];
     reg [23:0] next_pos;
 
     // signed 8-bit multiply-scale with truncation toward zero (C semantics for (b*vol)/64)
@@ -229,17 +234,20 @@ module aw_mixer (
                         rd_addr  <= ch_base[cur_ch] + p2;
                         st       <= S_RD2;
                     end
-            S_RD2: st <= S_W2;
-            S_W2: begin
+            // rd_data has ONE cycle of latency: the address presented in S_RD1 is valid in S_W1, and the
+            // address presented in S_W1 is valid HERE. The first version captured b2 in S_W2, one state
+            // too late, so it read the bus while no new address had been issued.
+            S_RD2: begin
                         b2 <= rd_data;
-                        st <= S_CALC;
+                        st <= S_W2;
                     end
+            S_W2: st <= S_CALC;
             S_CALC: begin
                         if (ch_active[cur_ch]) begin
-                            running <= clamp8(running + scale_vol(
-                                $signed(8'((($signed({1'b0,b1}) * (9'd255 - {1'b0,ilc}))
-                                           + ($signed({1'b0,b2}) * {1'b0,ilc})) >> 8)),
-                                ch_vol[cur_ch]));
+                            // SIGN-EXTEND b1/b2. They are int8 samples; zero-extending them turns -128 into
+                            // +128, and mixing signed with unsigned operands makes the whole expression
+                            // unsigned in Verilog, which is why this accumulated 0 before.
+                            running <= clamp8(running + scale_vol(interp, ch_vol[cur_ch]));
                         end
                         st <= S_NEXT;
                     end
