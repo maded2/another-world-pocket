@@ -60,18 +60,25 @@ class Channel:
         self.inc = 0             # chunkInc
         self.volume = 0
 
-    def play(self, data, freq_value, volume):
+    def play(self, data, freq_value, volume, length=None):
+        """`data` is the byte buffer the reader indexes; `length` is the LOGICAL sample length.
+
+        They differ on purpose: mixer.cpp reads chunk.data[p1] and chunk.data[p2] out of the resource
+        buffer, and p2 = p1 + 1 can be one past the declared length when a loop does not end at the end of
+        the sample. Handing this model only the logical slice would raise where the C reads the next byte
+        of the resource - a difference that would be blamed on the RTL.
+        """
         self.active = True
         self.data = data
-        self.length = len(data)
+        self.length = len(data) if length is None else length
         self.loop_pos = 0
         self.loop_len = 0
         self.pos = 0
         self.inc = (freq_value << 8) // OUT_RATE
         self.volume = min(volume, 0x3F)
 
-    def play_looping(self, data, freq_value, volume, loop_pos, loop_len):
-        self.play(data, freq_value, volume)
+    def play_looping(self, data, freq_value, volume, loop_pos, loop_len, length=None):
+        self.play(data, freq_value, volume, length)
         self.loop_pos, self.loop_len = loop_pos, loop_len
 
     def stop(self):
@@ -100,8 +107,9 @@ def mix(channels, n):
                     break
                 p2 = p1 + 1
             if p1 >= len(ch.data) or p2 >= len(ch.data):
-                p2 = min(p2, len(ch.data) - 1)
-                p1 = min(p1, len(ch.data) - 1)
+                raise IndexError("channel read past its buffer: p1=%d p2=%d len(data)=%d logical=%d "
+                                 "loop_pos=%d loop_len=%d pos=%d"
+                                 % (p1, p2, len(ch.data), ch.length, ch.loop_pos, ch.loop_len, ch.pos))
             b1, b2 = s8(ch.data[p1]), s8(ch.data[p2])
             b = s8((b1 * (0xFF - ilc) + b2 * ilc) >> 8)
             out[j] = addclamp(out[j], cdiv(b * ch.volume, 0x40))

@@ -173,8 +173,8 @@ module aw_mixer (
                             if (p1 >= ch_len[cur_ch] - 24'd1) p2 = 24'd0;   // never used: the channel stops
                             else                              p2 = p1 + 24'd1;
                         end
-                        b1   = 8'd0;
-                        b2   = 8'd0;
+                        b1   <= 8'd0;
+                        b2   <= 8'd0;
                         rd_addr <= ch_base[cur_ch] + p1;
                         st   <= S_W1;
                     end
