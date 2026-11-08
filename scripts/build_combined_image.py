@@ -31,6 +31,10 @@ import struct
 import sys
 
 PACK_DIR = "ports/another-world/packs"
+AUDIO_BLOB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "build", "aw-audio.bin")
+AUDIO_INDEX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "build", "aw-audio.json")
 OUT = "build/aw-all.bin"
 
 MAGIC = b"AWP1"
@@ -174,11 +178,30 @@ def build(packs, out_path, part0_last=False, pad_to=0):
     # knowing the file size - it is the first thing the upload delivers. Frames start after it.
     per_frame_sums = [word_sum(f) for f in frames]
 
-    blob = bytearray(FRAMES_BASE + pool_bytes)
-    # header
+    # ---- audio section, appended after the pool ----
+    # Decision D1(a) in docs/another-world/audio-plan.md: one file, one upload. 2.94 + 0.70 = 3.64 MiB, inside
+    # the existing 4 MiB upload window and the census range, so no second dataslot is needed.
+    #
+    # CONSEQUENCE THAT MUST NOT BE MISSED: aw_rom's census sums pages 1..cw_max and compares them against the
+    # sums the directory declares. cw_max is set by the write extent, so appending audio EXTENDS what the
+    # census measures - therefore the declared sum must cover pool + audio, not the pool alone. Declaring only
+    # the pool here would make pool_ok read 0 on a perfectly good image, which is the exact failure already
+    # recorded for the pool_bytes episode.
+    audio = b""
+    audio_index = []
+    if os.path.exists(AUDIO_BLOB):
+        import json as _json
+        audio = open(AUDIO_BLOB, "rb").read()
+        audio_index = _json.load(open(AUDIO_INDEX))["entries"]
+        payload = pool_data + audio
+    else:
+        payload = pool_data
+
+    blob = bytearray(FRAMES_BASE + len(payload))
+    # header: the sums cover the WHOLE payload after page 0 (the pool, then the audio)
     HDR.pack_into(blob, 0, MAGIC, VERSION, len(frames), PAGE_SHIFT, len(packs),
                   VIEW_BYTES, FRAMES_BASE, pool_bytes,
-                  word_sum(pool_data), word_xor(pool_data))
+                  word_sum(payload), word_xor(payload))
     # per-part records, then per-frame sums, inside the fixed header block
     off = HDR.size
     part_sums = []
@@ -192,10 +215,26 @@ def build(packs, out_path, part0_last=False, pad_to=0):
     for s in per_frame_sums:
         struct.pack_into("<I", blob, off, s)
         off += 4
+    # audio index: one record per resource, so the core can find a sample by id without parsing the blob.
+    # Layout is fixed and documented here because aw_rom will read it by offset:
+    #   u16 magic 'A', u8 count, u8 reserved, then count x <HBBHIII>
+    #   res id | type (0 sound, 1 music) | flags | pcm offset within the resource | pcm length |
+    #   loop start | loop length
+    audio_base = FRAMES_BASE + len(pool_data)
+    audio_rec = struct.Struct("<HBBHIII")
+    if audio:
+        struct.pack_into("<BBH", blob, off, 0x41, len(audio_index), 0)     # 'A', count, reserved
+        off += 4
+        for e in audio_index:
+            struct.pack_into("<HBBHIII", blob, off,
+                             e["res"], 0 if e["type"] == "SOUND" else 1, 0,
+                             e.get("pcm_off", 0), e.get("pcm_len", e["len"]),
+                             e.get("loop_start", 0), e.get("loop_len", 0))
+            off += audio_rec.size
     if off > HEADER_BYTES:
         raise SystemExit("directory needs %d bytes but the fixed header block is %d"
                          % (off, HEADER_BYTES))
-    blob[FRAMES_BASE:] = pool_data
+    blob[FRAMES_BASE:] = payload
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "wb") as fh:
@@ -271,13 +310,17 @@ def verify(image_path, packs, quiet=False):
     errs = list(img["errs"])
     if img["nparts"] != len(packs):
         errs.append("directory holds %d parts, expected %d" % (img["nparts"], len(packs)))
+    # The DECLARED sums cover everything after page 0 - the frame pool and then the audio section - because
+    # aw_rom's census sums pages 1..cw_max and cw_max follows the write extent. Comparing them against the
+    # pool slice alone would report a mismatch on a perfectly good image.
     pool = blob[img["frames_base"] : img["frames_base"] + img["pool_bytes"]]
-    if word_sum(pool) != img["pool_sum"]:
-        errs.append("pool word sum is %08x, directory says %08x"
-                    % (word_sum(pool), img["pool_sum"]))
-    if word_xor(pool) != img["pool_xor"]:
-        errs.append("pool word xor is %08x, directory says %08x"
-                    % (word_xor(pool), img["pool_xor"]))
+    payload = blob[img["frames_base"]:]
+    if word_sum(payload) != img["pool_sum"]:
+        errs.append("payload word sum is %08x, directory says %08x (the census covers the whole payload)"
+                    % (word_sum(payload), img["pool_sum"]))
+    if word_xor(payload) != img["pool_xor"]:
+        errs.append("payload word xor is %08x, directory says %08x"
+                    % (word_xor(payload), img["pool_xor"]))
     # The core's pool sum covers every page it was given except page 0 - it does not read pool_bytes.
     # So the declared sum and the measured sum describe the same bytes ONLY while the pool is a whole
     # number of pages starting at frames_base and nothing follows it in the file. That is what
