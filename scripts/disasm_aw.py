@@ -21,7 +21,7 @@ import sys
 # opcode -> argument bytes, derived from vm.cpp (see the docstring).
 ARGLEN = {
     0x00: 3, 0x01: 2, 0x02: 2, 0x03: 3, 0x04: 2, 0x05: 0, 0x06: 0, 0x07: 2,
-    0x08: 3, 0x09: 5, 0x0B: 2, 0x0C: 3, 0x0D: 1, 0x0E: 2, 0x0F: 2,
+    0x08: 3, 0x09: 3, 0x0B: 2, 0x0C: 3, 0x0D: 1, 0x0E: 2, 0x0F: 2,
     0x10: 1, 0x11: 0, 0x12: 5, 0x13: 2, 0x14: 3, 0x15: 3, 0x16: 3, 0x17: 3,
     0x18: 5, 0x19: 2, 0x1A: 5,
 }
@@ -77,18 +77,55 @@ def bytecode(path):
     return d[0:end]
 
 
-def walk(code):
-    """Yield (offset, opcode) for a linear walk; stop at the first opcode whose length is unknown."""
-    i, end = 0, len(code)
-    while i < end:
-        op = code[i]
-        nxt = arglen(code, i)      # NOT `n`: that was len(code) and shadowing it stopped the walk at i=0
-        if nxt is None:
-            yield ("unknown", i, op)
-            return
-        yield ("op", i, op)
-        i += nxt
+def decode(code, i):
+    """(total_length, [branch targets], falls_through) for the instruction at i.
 
+    Branch semantics taken from vm.cpp: op_call/op_jmp carry a word target and change pc; op_jnz carries
+    a var byte and a word target and either jumps or falls through; op_condJmp carries its target last and
+    likewise falls through; op_ret returns to the caller (nothing static to follow); op_pauseThread ends
+    the thread's turn and op_killThread parks pc at 0xFFFF, so both end a block.
+    """
+    op = code[i]
+    n = arglen(code, i)
+    if n is None:
+        return None, [], False
+    if op == 0x07:                                  # jmp
+        return n, [(code[i+1] << 8) | code[i+2]], False
+    if op == 0x04:                                  # call
+        return n, [(code[i+1] << 8) | code[i+2]], True
+    if op == 0x09:                                  # jnz: var byte then word target
+        return n, [(code[i+2] << 8) | code[i+3]], True
+    if op == 0x0A:                                  # condJmp: target is the last two bytes
+        return n, [(code[i+n-2] << 8) | code[i+n-1]], True
+    if op in (0x05, 0x06, 0x11):                    # ret / pauseThread / killThread
+        return n, [], False
+    return n, [], True
+
+
+def walk(code):
+    """Yield (offset, opcode) for every REACHABLE instruction, following branches.
+
+    A linear walk cannot work on this bytecode: after a jump the following bytes can be inline data, which
+    is why the earlier version always died on a byte in 0x1B..0x3F that the VM itself calls invalid. This
+    seeds a worklist with the entry point and adds every branch/call target.
+    """
+    seen = set()
+    stack = [0]
+    while stack:
+        i = stack.pop()
+        while 0 <= i < len(code) and i not in seen:
+            seen.add(i)
+            n, targets, falls = decode(code, i)
+            if n is None:
+                yield ("unknown", i, code[i])
+                break
+            yield ("op", i, code[i])
+            for t in targets:
+                if t not in seen:
+                    stack.append(t)
+            if not falls:
+                break
+            i += n
 
 def report(path):
     code = bytecode(path)
