@@ -25,6 +25,13 @@ module tb_mixer;
     reg [23:0] cmd_len = 0, cmd_loop_pos = 0, cmd_loop_len = 0, cmd_data_base = 0;
 
     wire signed [7:0] out_sample;
+    integer cyc = 0;
+    always @(posedge clk) begin
+        cyc = cyc + 1;
+        if (cyc < 40) $display("   cyc %0d st=%0d tick=%b cmdv=%b ch0=%b pos0=%0h rd=%0h",
+                               cyc, dut.st, tick, cmd_valid, dut.ch_active[0], dut.ch_pos[0], rd_addr);
+    end
+
     reg  tick = 0;                          // declared BEFORE the instantiation: as a forward reference
                                             // this silently became a different net and the mixer never saw
                                             // a tick at all, which read as "the mixer outputs zeros".

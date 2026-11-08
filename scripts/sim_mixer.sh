@@ -22,7 +22,10 @@ build() {   # build <outdir-that-provides-SCN-at-runtime>
 }
 
 build "$WORK"
-"$ROOT/build/obj-mixer/tb_mixer" | tail -2
+# NOT `| tail -2`: that discarded every diagnostic the bench printed, which is how three debugging
+# attempts in a row "proved" nothing was happening inside the RTL. A harness that hides the output of the
+# thing it is testing is the same fault as sim_dbg.sh filtering out its own GOT/WANT diff.
+"$ROOT/build/obj-mixer/tb_mixer"
 
 python3 - "$WORK" <<'PY'
 import sys
