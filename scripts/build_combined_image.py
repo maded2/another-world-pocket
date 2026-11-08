@@ -35,6 +35,13 @@ AUDIO_BLOB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
                             "build", "aw-audio.bin")
 AUDIO_INDEX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "build", "aw-audio.json")
+# Directory-page offset of the audio index. Fixed ABI: aw_audio_idx.v reads this address and nothing else.
+# Chosen to be past every variable-length structure that shares this page: header 32 bytes, 8 part records
+# of 144 bytes = 1184, and up to 127 frame sums of 4 = 508, so nothing legitimately reaches beyond ~0x70C.
+# 0x1000 leaves that untouched and is still far below the 32 KiB page. THE FIRST ATTEMPT USED 0x400, which
+# lands inside part 6's page table - the builder's own verifier caught it as "part 7 page 0 names physical
+# page 0", a corrupted table rather than a silent overwrite, which is exactly why that check exists.
+AUDIO_INDEX_OFF = 0x1000
 OUT = "build/aw-all.bin"
 
 MAGIC = b"AWP1"
@@ -220,17 +227,20 @@ def build(packs, out_path, part0_last=False, pad_to=0):
     #   u16 magic 'A', u8 count, u8 reserved, then count x <HBBHIII>
     #   res id | type (0 sound, 1 music) | flags | pcm offset within the resource | pcm length |
     #   loop start | loop length
+    # The index lives at a FIXED offset in the directory page, not after whatever came before it: the core
+    # has to find it without knowing how many parts or frames the image happens to contain, and an offset that
+    # moves with the image is a class of bug this project has already paid for once (a header field read from
+    # the wrong word because the layout was computed rather than named).
     audio_base = FRAMES_BASE + len(pool_data)
     audio_rec = struct.Struct("<HBBHIII")
     if audio:
-        struct.pack_into("<BBH", blob, off, 0x41, len(audio_index), 0)     # 'A', count, reserved
-        off += 4
-        for e in audio_index:
-            struct.pack_into("<HBBHIII", blob, off,
+        struct.pack_into("<BBH", blob, AUDIO_INDEX_OFF, 0x41, len(audio_index), 0)   # 'A', count, reserved
+        for k, e in enumerate(audio_index):
+            struct.pack_into("<HBBHIII", blob, AUDIO_INDEX_OFF + 4 + k * audio_rec.size,
                              e["res"], 0 if e["type"] == "SOUND" else 1, 0,
                              e.get("pcm_off", 0), e.get("pcm_len", e["len"]),
                              e.get("loop_start", 0), e.get("loop_len", 0))
-            off += audio_rec.size
+        off = max(off, AUDIO_INDEX_OFF + 4 + len(audio_index) * audio_rec.size)
     if off > HEADER_BYTES:
         raise SystemExit("directory needs %d bytes but the fixed header block is %d"
                          % (off, HEADER_BYTES))
