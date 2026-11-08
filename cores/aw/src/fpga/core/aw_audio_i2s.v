@@ -42,22 +42,13 @@ module aw_audio_i2s (
     // Same accumulator as the core template: add 48 kHz*2 every cycle, toggle when it passes 742500 (which is
     // 74.25 MHz / 100), so the toggle rate is 74.25 * 245760/742500 / 2 = 12.288 MHz.
     parameter [20:0] CYCLE_48KHZ = 21'd122880 * 2;
-    reg [21:0] audgen_accum;
 
-    always @(posedge clk_74a) begin
-        audgen_accum <= audgen_accum + CYCLE_48KHZ;
-        if (audgen_accum >= 21'd742500) begin
-            audio_mclk    <= ~audio_mclk;
-            audgen_accum  <= audgen_accum - 21'd742500 + CYCLE_48KHZ;
-        end
-    end
+    // ------------------------------------------------------------------ reset into this domain
+    reg [1:0] rst_s;
+    always @(posedge clk_74a) rst_s <= {rst_s[0], rst_core};
+    wire rst = rst_s[1];
 
-    // ------------------------------------------------------------------ reset into the MCLK domain
-    reg [1:0] rst_mclk_s;
-    always @(posedge audio_mclk) rst_mclk_s <= {rst_mclk_s[0], rst_core};
-    wire rst_m = rst_mclk_s[1];
-
-    // ------------------------------------------------------------------ sample FIFO (clk_core -> MCLK)
+    // ------------------------------------------------------------------ sample FIFO (clk_core -> clk_74a)
     wire        fifo_full, fifo_empty;
     wire [15:0] fifo_q;
     wire        fifo_q_valid;
@@ -68,7 +59,7 @@ module aw_audio_i2s (
         .wr_clk(clk_core), .wr_rst(rst_core),
         .wr_en(sample_valid && !fifo_full), .wr_data(sample),
         .wr_full(fifo_full), .wr_free(),
-        .rd_clk(audio_mclk), .rd_rst(rst_m),
+        .rd_clk(clk_74a), .rd_rst(rst),
         .rd_en(fifo_rd), .rd_q(fifo_q), .rd_q_valid(fifo_q_valid),
         .rd_empty(fifo_empty), .rd_level(fifo_level)
     );
@@ -78,62 +69,80 @@ module aw_audio_i2s (
         else if (sample_valid && fifo_full) overruns <= overruns + 16'd1;
     end
 
-    // ------------------------------------------------------------------ frame shifter, on MCLK
-    // slot = c[7:2] (0..63), phase = c[1:0]; dac changes at phase 0, when SCLK is low and has just fallen.
+    // ------------------------------------------------------------------ frame shifter
+    // EVERYTHING BELOW IS ONE CLOCK DOMAIN (clk_74a) with an enable at each rising MCLK edge.
+    //
+    // The first version ran this stage on `audio_mclk`, a toggling register used as a clock. That works, and
+    // it produced correct I2S in tb_audio_i2s, but Quartus reported "audio_mclk was determined to be a clock
+    // but was found without an associated clock assignment": a third of the new logic sat outside every
+    // timing check, and an SDC create_clock for a register-derived clock is a fight (the object is neither a
+    // pin nor a register by the name the tool prints). A clock ENABLE has none of that: one clock, one
+    // constraint, and the same waveform at the pins.
+    //
+    // slot = c[7:2] (0..63) is one SCLK period; dac changes at phase 0, while SCLK is low.
+    reg [21:0] accum;
     reg [7:0]  c;
     reg [63:0] tx;          // {left[15:0], 16'h0, right[15:0], 16'h0} for the frame being sent
-    reg [63:0] nx;          // the best available next frame: updated only when a sample actually arrives,
-                            // so an underrun repeats the previous sample instead of going to silence
+    reg [63:0] nx;          // best available next frame: updated only when a sample arrives, so an underrun
+                            // repeats the previous sample instead of going to silence
     reg        got;         // a pop was requested at slot 0 and its value is due
     wire [5:0] slot = c[7:2];
 
-    always @(posedge audio_mclk) begin
-        audio_sclk <= c[1] ^ c[0];
-        if (rst_m) begin
-            c         <= 8'd0;
-            tx        <= 64'd0;
-            nx        <= 64'd0;
-            got       <= 1'b0;
-            audio_lrck<= 1'b0;
-            audio_dac <= 1'b0;
-            audio_sclk<= 1'b0;
-            fifo_rd   <= 1'b0;
-            underruns <= 16'd0;
-        end else begin
-            c <= c + 8'd1;
-            fifo_rd <= 1'b0;
+    always @(posedge clk_74a) begin
+        accum <= accum + CYCLE_48KHZ;
+        fifo_rd <= 1'b0;
 
-            if (c[1:0] == 2'd0) begin
-                // one bit slot begins; LRCK is derived from the slot so it is one slot early
-                audio_lrck <= (slot >= 6'd31) && (slot < 6'd63);
-                case (slot)
-                6'd0: begin
-                    audio_dac <= tx[63];
-                    tx        <= {tx[62:0], 1'b0};
-                    if (!fifo_empty) begin
-                        fifo_rd <= 1'b1;
-                        got     <= 1'b1;
-                    end else begin
-                        got       <= 1'b0;
-                        underruns <= underruns + 16'd1;   // nx keeps the previous sample: repeat it
+        if (accum >= 21'd742500) begin
+            accum      <= accum - 21'd742500 + CYCLE_48KHZ;
+            audio_mclk <= ~audio_mclk;
+
+            // rising edge of MCLK = one step of the output stage
+            if (!audio_mclk) begin
+                audio_sclk <= c[1] ^ c[0];
+                if (rst) begin
+                    c          <= 8'd0;
+                    tx         <= 64'd0;
+                    nx         <= 64'd0;
+                    got        <= 1'b0;
+                    audio_lrck <= 1'b0;
+                    audio_dac  <= 1'b0;
+                    audio_sclk <= 1'b0;
+                    underruns  <= 16'd0;
+                end else begin
+                    c <= c + 8'd1;
+                    if (c[1:0] == 2'd0) begin
+                        // one bit slot begins; LRCK is derived from the slot so it is one slot early
+                        audio_lrck <= (slot >= 6'd31) && (slot < 6'd63);
+                        case (slot)
+                        6'd0: begin
+                            audio_dac <= tx[63];
+                            tx        <= {tx[62:0], 1'b0};
+                            if (!fifo_empty) begin
+                                fifo_rd <= 1'b1;
+                                got     <= 1'b1;
+                            end else begin
+                                got       <= 1'b0;
+                                underruns <= underruns + 16'd1;   // nx keeps the previous sample: repeat it
+                            end
+                        end
+                        // rd_q is valid the cycle after the pop; slot 4 is far enough past it to be
+                        // unambiguous.
+                        6'd4: begin
+                            audio_dac <= tx[63];
+                            tx        <= {tx[62:0], 1'b0};
+                            if (got) nx <= {fifo_q, 16'h0000, fifo_q, 16'h0000};
+                        end
+                        6'd63: begin
+                            audio_dac <= 1'b0;          // last spacer of the right channel
+                            tx        <= nx;            // next frame (fresh sample, or the previous repeated)
+                        end
+                        default: begin
+                            audio_dac <= tx[63];
+                            tx        <= {tx[62:0], 1'b0};
+                        end
+                        endcase
                     end
                 end
-                // rd_q is valid the cycle after the pop, but slot 0's own assignment has not happened yet;
-                // slot 4 is far enough past it to be unambiguous.
-                6'd4: begin
-                    audio_dac <= tx[63];
-                    tx        <= {tx[62:0], 1'b0};
-                    if (got) nx <= {fifo_q, 16'h0000, fifo_q, 16'h0000};
-                end
-                6'd63: begin
-                    audio_dac <= 1'b0;          // last spacer of the right channel
-                    tx        <= nx;            // next frame (fresh sample, or the previous one repeated)
-                end
-                default: begin
-                    audio_dac <= tx[63];
-                    tx        <= {tx[62:0], 1'b0};
-                end
-                endcase
             end
         end
     end

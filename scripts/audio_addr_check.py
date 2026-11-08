@@ -22,6 +22,22 @@ OFF = 0x1000
 cnt = img[OFF + 1]
 
 print("image %d bytes, audio base 0x%X, %d records" % (len(img), AUDIO_BASE, cnt))
+
+# The RTL carries AUDIO_BASE as a constant, so the image and the constant have to agree or every sample is
+# fetched from the wrong place. Read it out of the source and fail on a mismatch; a remembered number is
+# exactly the kind of thing that survives a layout change and then plays noise.
+import os, re
+rtl = sys.argv[4] if len(sys.argv) > 4 else "cores/aw/src/fpga/core/aw_audio_ch.v"
+if os.path.exists(rtl):
+    m = re.search(r"AUDIO_BASE\s*=\s*24'h([0-9A-Fa-f]+)", open(rtl).read())
+    if not m:
+        print("  FAIL: could not find AUDIO_BASE in %s" % rtl)
+        sys.exit(1)
+    rtl_base = int(m.group(1), 16)
+    print("rtl AUDIO_BASE = 0x%X (%s)" % (rtl_base, rtl))
+    if rtl_base != AUDIO_BASE:
+        print("  FAIL: RTL AUDIO_BASE 0x%X != image 0x%X" % (rtl_base, AUDIO_BASE))
+        sys.exit(1)
 bad = 0
 last_end = 0
 for k in range(cnt):

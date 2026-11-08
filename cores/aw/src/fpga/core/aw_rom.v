@@ -1908,7 +1908,11 @@ module aw_rom (
     reg  [1:0]  pr_cnt;
     always @(posedge clk_psram) begin
         if (rst_psram) begin
-            pr_s0 <= 16'd0; pr_s1 <= 16'd0; pr_stable <= 16'd0; pr_done <= 16'd0; pr_cnt <= 2'd0;
+            // pr_done is NOT reset here: it has its own block below (it is written on the cycle a request is
+            // applied). Two always blocks driving it is a Quartus error - "Can't resolve multiple constant
+            // drivers for net pr_done[15]" - and Verilator only warned, so the first Quartus build after the
+            // chapter-switch work refused to elaborate. One driver per register.
+            pr_s0 <= 16'd0; pr_s1 <= 16'd0; pr_stable <= 16'd0; pr_cnt <= 2'd0;
         end else begin
             pr_s0 <= vm_part_req;
             pr_s1 <= pr_s0;

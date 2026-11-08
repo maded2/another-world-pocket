@@ -37,6 +37,12 @@ import sys
 # the two megabytes a pack occupies.
 DEFAULT_ALLOW = [
     r'audgen',
+    # The I2S sample FIFO holds a 16-bit word whose low byte is the known-zero half of an 8-bit sample
+    # scaled by 256 ({{8{sign}}, sample} << 8). Quartus reports rd_q[0] as "stuck at GND due to stuck port
+    # data_in" - true, and harmless: the byte that carries the sound varies. Left as a scope allowance
+    # rather than restructured, because moving the shift to the read side would only move the constant to
+    # a register and hide the fact that the low byte is zero by construction.
+    r'u_samp\|rd_q\[', 
     r'aud_mclk',
     r'psram_cre',
     r'wr_addr\[2[01]',   # Quartus compacts bits: [20], [21] or [20,21]

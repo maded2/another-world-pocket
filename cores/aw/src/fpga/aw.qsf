@@ -757,6 +757,20 @@ set_global_assignment -name VERILOG_FILE core/aw_keys.v
 set_global_assignment -name VERILOG_FILE core/aw_psram.v
 set_global_assignment -name VERILOG_FILE core/aw_rom.v
 set_global_assignment -name VERILOG_FILE core/aw_reset_gen.v
+# The first build with the audio chain closed setup everywhere but missed internal HOLD by 0.009 ns on the
+# FAST 0C corner of clk_core (slow-corner hold was +0.322). "All Paths" lets the fitter spend setup margin -
+# 0.413 ns available on the 92.8 MHz clock - on the minimum-delay side, which is the side that failed.
+set_global_assignment -name OPTIMIZE_HOLD_TIMING "All Paths"
+# The one hold path left after that was a ZERO-LOGIC register-to-register hop (aw_audio_rd.data -> aw_mixer.b2)
+# with 0.514 ns of data delay against 0.523 ns of clock skew: -0.009 ns on the fast corner. A different seed
+# changes the placement of those two registers, which is all this needs.
+set_global_assignment -name SEED 2
+set_global_assignment -name VERILOG_FILE core/aw_audio_tick.v
+set_global_assignment -name VERILOG_FILE core/aw_audio_idx.v
+set_global_assignment -name VERILOG_FILE core/aw_audio_ch.v
+set_global_assignment -name VERILOG_FILE core/aw_mixer.v
+set_global_assignment -name VERILOG_FILE core/aw_audio_rd.v
+set_global_assignment -name VERILOG_FILE core/aw_audio_i2s.v
 set_global_assignment -name VERILOG_FILE core/dbg_uart_tx.v
 set_global_assignment -name VERILOG_FILE core/dbg_console.v
 set_global_assignment -name SYSTEMVERILOG_FILE core/aw_pocket_build.v

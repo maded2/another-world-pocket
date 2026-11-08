@@ -95,6 +95,13 @@ reg design_run = 1'b0;
     // runs faster but cannot measure a 2.94 MiB pool, and "pool_ok" measured over 32 Ki words would
     // be a check whose range was inherited from a smaller image - which this port has now been bitten
     // by twice. Cost: ~1.5M extra reads before design_run, a few minutes of wall time on a long run.
+    // ---- audio data-path wires (defined here because aw_rom's port list needs them) ----
+    wire        aud_req_w;
+    wire [23:0] aud_addr_w;
+    wire [7:0]  aud_data_w;
+    wire        aud_valid_w;
+    wire        audio_mclk_w, audio_lrck_w, audio_dac_w;
+
     aw_rom #(.CENSUS_RANGE(22'h20_0000)) u_rom (
         .clk_core            (clk_core),
         .rst_core            (rst_core),
@@ -121,8 +128,12 @@ reg design_run = 1'b0;
         .rom_dir_err         (dir_err_w),
         .rom_part            (dir_part_w),
         .rom_part_late       (dir_late_w),
-        .rom_pool_ok         (pool_ok_w), .aud_req(1'b0), .aud_addr(24'd0), .aud_data(), .aud_valid(),
-        .rom_vm_restart      (vm_restart_w), .vm_part_req(vmreq_force | vm_part_req_w),
+        .rom_pool_ok         (pool_ok_w),
+        .aud_req             (aud_req_w),
+        .aud_addr            (aud_addr_w),
+        .aud_data            (aud_data_w),
+        .aud_valid           (aud_valid_w),
+        .rom_vm_restart      (vm_restart_w), .vm_part_req(hold_part ? 16'd0 : (vmreq_force | vm_part_req_w)),
         .cram0_a             (cram0_a),
         .cram0_dq            (cram0_dq),
         .cram0_wait          (cram0_wait),
@@ -286,6 +297,118 @@ reg design_run = 1'b0;
         .clock                (clk_core)
     );
 
+    // ================================ AUDIO CHAIN ================================
+    // The same chain core_top instantiates, wired the same way, so this bench measures the thing that ships:
+    // the VM's play requests resolve through the image's index and drive the mixer, the mixer fetches bytes
+    // through the clock-domain shim from aw_rom's audio port, and the mixed samples leave as I2S.
+    //
+    // The point of having it here rather than only in tb_top: tb_soc runs the REAL pack and the real VM, so
+    // the bytes being fetched are the game's own samples and the bytecode stream is still flowing.
+    wire        audio_tick_w;
+    wire        idx_load_start_w, idx_load_busy_w, idx_load_done_w;
+    wire [23:0] idx_ldr_addr_w;
+    wire        idx_ldr_req_w, idx_ldr_valid_w;
+    wire [7:0]  idx_ldr_data_w;
+    wire        idx_start_w, idx_busy_w, idx_found_w;
+    wire [15:0] idx_res_w;
+    wire [7:0]  idx_type_w;
+    wire [31:0] idx_blob_w;
+    wire [15:0] idx_poff_w, idx_plen_w, idx_ls_w, idx_ll_w;
+    wire        aud_cmd_valid_w;
+    wire [1:0]  aud_cmd_ch_w;
+    wire [5:0]  aud_cmd_freq_w;
+    wire [7:0]  aud_cmd_vol_w;
+    wire [23:0] aud_cmd_len_w, aud_cmd_lp_w, aud_cmd_ll_w, aud_cmd_base_w;
+    wire signed [7:0] mix_sample_w;
+    wire        mix_valid_w;
+    wire [31:0] mix_drop_ticks_w;
+    wire [23:0] mix_rd_addr_w;
+    wire        mix_rd_req_w, mix_rd_valid_w;
+    wire [7:0]  mix_rd_data_w;
+    wire [15:0] aud_underruns_w, aud_overruns_w;
+    wire        aud_sclk_unused_w;
+    wire        aud_rd_req_w, aud_rd_valid_w;
+    wire [23:0] aud_rd_addr_w;
+    wire [7:0]  aud_rd_data_w;
+    reg         aud_port_is_idx_w;
+
+    aw_audio_tick u_audio_tick (.clk(clk_core), .rst(rst_core), .tick(audio_tick_w));
+
+    reg [7:0] snd_seq_d_w;
+    always @(posedge clk_core) begin
+        if (rst_core) snd_seq_d_w <= 8'd0;
+        else          snd_seq_d_w <= snd_seq_w;
+    end
+    wire snd_play_w = (snd_seq_w != snd_seq_d_w);
+
+    always @(posedge clk_core) begin
+        if (rst_core)            aud_port_is_idx_w <= 1'b0;
+        else if (idx_load_start_w) aud_port_is_idx_w <= 1'b1;
+        else if (idx_load_done_w)  aud_port_is_idx_w <= 1'b0;
+    end
+    assign idx_load_start_w = rom_ready & ~idx_load_done_w & ~idx_load_busy_w;
+    assign aud_rd_req_w  = aud_port_is_idx_w ? idx_ldr_req_w  : mix_rd_req_w;
+    assign aud_rd_addr_w = aud_port_is_idx_w ? idx_ldr_addr_w : mix_rd_addr_w;
+    assign idx_ldr_valid_w = aud_rd_valid_w &  aud_port_is_idx_w;
+    assign idx_ldr_data_w  = aud_rd_data_w;
+    assign mix_rd_valid_w  = aud_rd_valid_w & ~aud_port_is_idx_w;
+    assign mix_rd_data_w   = aud_rd_data_w;
+
+    aw_audio_idx u_audio_idx (
+        .clk(clk_core), .rst(rst_core),
+        .load_start(idx_load_start_w), .load_busy(idx_load_busy_w), .load_done(idx_load_done_w),
+        .ldr_addr(idx_ldr_addr_w), .ldr_req(idx_ldr_req_w), .ldr_valid(idx_ldr_valid_w), .ldr_data(idx_ldr_data_w),
+        .start(idx_start_w), .res_id(idx_res_w),
+        .busy(idx_busy_w), .found(idx_found_w), .r_type(idx_type_w), .r_blob_off(idx_blob_w),
+        .r_pcm_off(idx_poff_w), .r_pcm_len(idx_plen_w),
+        .r_loop_start(idx_ls_w), .r_loop_len(idx_ll_w));
+
+    aw_audio_ch #(.AUDIO_BASE(24'h2F0000)) u_audio_ch (
+        .clk(clk_core), .rst(rst_core),
+        .play(snd_play_w & idx_load_done_w), .res(snd_res_w), .freq(snd_freq_w[5:0]),
+        .vol(snd_vol_w), .ch(snd_ch_w[1:0]),
+        .idx_start(idx_start_w), .idx_res(idx_res_w), .idx_busy(idx_busy_w), .idx_found(idx_found_w),
+        .idx_type(idx_type_w), .idx_blob(idx_blob_w), .idx_poff(idx_poff_w), .idx_plen(idx_plen_w),
+        .idx_ls(idx_ls_w), .idx_ll(idx_ll_w),
+        .cmd_valid(aud_cmd_valid_w), .cmd_ch(aud_cmd_ch_w), .cmd_freq(aud_cmd_freq_w),
+        .cmd_vol(aud_cmd_vol_w), .cmd_len(aud_cmd_len_w), .cmd_lp(aud_cmd_lp_w),
+        .cmd_ll(aud_cmd_ll_w), .cmd_base(aud_cmd_base_w));
+
+    aw_mixer u_mixer (
+        .clk(clk_core), .rst(rst_core), .tick(audio_tick_w & idx_load_done_w),
+        .out_sample(mix_sample_w), .out_valid(mix_valid_w), .drop_ticks(mix_drop_ticks_w),
+        .cmd_valid(aud_cmd_valid_w), .cmd_ch(aud_cmd_ch_w), .cmd_freq(aud_cmd_freq_w),
+        .cmd_vol(aud_cmd_vol_w), .cmd_len(aud_cmd_len_w), .cmd_loop_pos(aud_cmd_lp_w),
+        .cmd_loop_len(aud_cmd_ll_w), .cmd_data_base(aud_cmd_base_w),
+        .rd_addr(mix_rd_addr_w), .rd_req(mix_rd_req_w), .rd_valid(mix_rd_valid_w), .rd_data(mix_rd_data_w));
+
+    aw_audio_rd u_audio_rd (
+        .clk_c(clk_core), .rst_c(rst_core), .req(aud_rd_req_w), .addr(aud_rd_addr_w),
+        .data(aud_rd_data_w), .valid(aud_rd_valid_w),
+        .clk_p(clk_psram), .rst_p(rst_psram),
+        .aud_req(aud_req_w), .aud_addr(aud_addr_w), .aud_data(aud_data_w), .aud_valid(aud_valid_w));
+
+    aw_audio_i2s u_audio_i2s (
+        .clk_74a(clk_bridge), .clk_core(clk_core), .rst_core(rst_core),
+        .sample({{8{mix_sample_w[7]}}, mix_sample_w} << 8), .sample_valid(mix_valid_w),
+        .audio_mclk(audio_mclk_w), .audio_sclk(aud_sclk_unused_w),
+        .audio_lrck(audio_lrck_w), .audio_dac(audio_dac_w),
+        .underruns(aud_underruns_w), .overruns(aud_overruns_w));
+
+    // ---- audio observation -------------------------------------------------------------------
+    // `samples` counts mixed samples, `dac_moved` is sticky on any non-zero DAC bit, and `plays` counts
+    // changes of snd_seq (one per op_playSound, including the vol == 0 stops).
+    integer aud_plays = 0, aud_samples = 0, aud_dac_moved = 0;
+    reg [7:0] aud_seq_prev = 8'd0;
+    always @(posedge clk_core) begin
+        if (snd_seq_w != aud_seq_prev) begin
+            aud_seq_prev = snd_seq_w;
+            aud_plays    = aud_plays + 1;
+        end
+        if (mix_valid_w) aud_samples = aud_samples + 1;
+    end
+    always @(posedge audio_mclk_w) if (audio_dac_w) aud_dac_moved = 1;
+
     // ---- memory image, for the bridge loader
     reg [7:0] ref_mem [0:PACK_BYTES-1];
     reg [7:0] img_mem [0:IMG_BYTES-1];               // uploaded image when +IMG is given
@@ -293,8 +416,8 @@ reg design_run = 1'b0;
     int         part_sel  = -1;                      // +PART: which part to select before byte 0
     wire        dir_valid_w, dir_bad_w, dir_busy_w, dir_late_w, pool_ok_w, vm_restart_w;
     wire [15:0] vm_part_req_w;      // the GAME's chapter request, straight out of the SoC
-    // Audio events out of the VM. Nothing consumes them yet (no mixer), so this is the observation
-    // point that proves the opcodes really execute and really carry their arguments.
+    // Audio events out of the VM. These drive the audio chain below; the event log they also feed is how
+    // the requirement table in docs/another-world/audio-plan.md was harvested.
     wire [7:0]  snd_seq_w, snd_freq_w, snd_vol_w, snd_ch_w, mus_seq_w, mus_pos_w;
     wire [15:0] snd_res_w, mus_num_w, mus_delay_w;
     // +VMREQ=<id>: inject a request as if the game had issued it, so the aw_rom side of the chapter
@@ -394,6 +517,7 @@ reg design_run = 1'b0;
     end
     integer   errors = 0;
     reg       s1_pass = 1'b0;   // decides the process exit status, not just the printed verdict
+    int       hold_part = 0;    // +HOLDPART=1: ignore the game's chapter request (study one part in isolation)
 
     // d is little-endian (the byte belonging at address a is d[7:0]); the APF wire puts
     // that byte at [31:24] for a core declaring bridge_endian_little = 0, so the word is
@@ -1355,6 +1479,12 @@ reg design_run = 1'b0;
         void'($value$plusargs("IMG_BYTES=%d", img_bytes));
         void'($value$plusargs("PART=%d", part_sel));
         void'($value$plusargs("ADDRLOG=%d", addrlog));
+        // +HOLDPART=1 masks the game's own chapter request. Part 1's bytecode asks for part 2 within the first
+        // frames, so any run long enough to measure something else (audio, bytecode throughput) will relocate
+        // the view mid-run and then be judged against the part it started on. That is correct RTL and a
+        // bench-visible behaviour change, not a fault - so the way to study one part in isolation is to hold
+        // the request at zero, in the bench, and say so.
+        void'($value$plusargs("HOLDPART=%d", hold_part));
         if (!$value$plusargs("FRAMEDIR=%s", framedir)) framedir = "/tmp/awframes";
 
         // Probe sanity check. Everything the diagnosis below rests on is a hierarchical read
@@ -1816,6 +1946,26 @@ reg design_run = 1'b0;
         // Pocket's freeze depends on, and nothing above it measures it.
         $display("tb_soc: fill buffer - %0d writes, %0d landed on the wrong byte of the pack, %0d with no acceptance open",
                  fill_writes, fill_shift, fill_unbased);
+
+        // ---- audio ------------------------------------------------------------------------------
+        // Three claims, and the first two are the ones that were impossible to make before: the index really
+        // was copied out of the image at boot, and a play issued by the GAME (not by a bench injection) put
+        // non-zero bits on the DAC line while the bytecode stream kept flowing.
+        $display("tb_soc: audio - plays %0d, mixed samples %0d, DAC moved %0d, dropped ticks %0d, I2S underruns %0d overruns %0d, index loaded %0d",
+                 aud_plays, aud_samples, aud_dac_moved, mix_drop_ticks_w,
+                 aud_underruns_w, aud_overruns_w, idx_load_done_w);
+        if (!idx_load_done_w) begin
+            $display("tb_soc: audio FAIL - the image's audio index was never loaded at boot");
+            errors = errors + 1;
+        end
+        if (aud_plays > 0 && !aud_dac_moved) begin
+            $display("tb_soc: audio FAIL - the VM issued %0d play requests but the DAC never moved", aud_plays);
+            errors = errors + 1;
+        end
+        if (mix_drop_ticks_w != 0) begin
+            $display("tb_soc: audio FAIL - the mixer dropped %0d ticks while sharing the PSRAM port", mix_drop_ticks_w);
+            errors = errors + 1;
+        end
 
         // A run that produced only black frames is not a pass, whatever else went right.
         // s1_pass is what decides the process exit status (see the end of this initial block):

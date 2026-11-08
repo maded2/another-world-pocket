@@ -1,8 +1,13 @@
 # Sound effects and music: what the data is, and how to get it out of the Pocket
 
-Status: **plan**. Every number below was measured on 2026-11-08 from `gamedata/memlist.bin` and the
-pinned upstream sources in `ports/another-world/upstream/BUILD/Another-World-Bytecode-Interpreter/src/`.
-Nothing here is implemented; today the core is silent by construction.
+Status: **implemented and verified in simulation for sound effects; music tracker and hardware not done.**
+Every number below was measured from `gamedata/memlist.bin`, the pinned upstream sources in
+`ports/another-world/upstream/BUILD/Another-World-Bytecode-Interpreter/src/`, or the benches named next to it.
+
+What is DONE (commits `cee7c9c` and after): A extraction, B packaging, C index + sample fetch in RTL, D VM
+patch, E mixer, F I2S output. Six benches run under `make sim-audio` and `tb_top`/`tb_soc` exercise the chain
+inside the core. What is NOT done: G the music tracker, H the hardware gate, and the docs pass that this file
+is part of.
 
 ## 1. The data
 
@@ -425,3 +430,88 @@ Worth saying plainly: the earlier CDC note (mixer in clk_core, bytes cross by ha
 still holds - bandwidth and domain choice are settled. What was NOT settled until now is that the mixer's
 interface has to change shape, which is a modification to a verified module rather than wiring around it. That
 should be the first task of the next session, with its bench updated in the same pass.
+
+## Implementation notes (2026-11-09): what the integration actually cost
+
+The five phases A-E were graded against oracles before anything was wired together. Wiring them exposed four
+things that no module-level bench could have found, and each is recorded here because each one looked like
+something else at first.
+
+### 1. The index left the per-lookup path (decision, measured)
+
+`aw_audio_idx` was built to walk the image's index one byte at a time on every lookup. With the index at
+`0x1000` and 106 records that is up to `1 + 106*16 = 1697` byte reads for the last record, and in the field
+every read is a PSRAM round trip through a clock-domain handshake (~24 clk_core): ~1.6 ms, ~78 dropped mixer
+ticks per play - on a channel that may be playing music, competing with the sample fetch for the one PSRAM
+port.
+
+It now copies the index out of the image **once, at boot**, into 2 x M10K (`aw_audio_idx`, 2048 x 8) and
+looks up locally: ~17 clk per record, 73 us worst case, and **no PSRAM traffic at all per play**. This is
+what phase C specified; the walk was the implementation drifting from the plan. Measured in `tb_audio_idx`:
+1700 bytes loaded in ~14k clk with a 3-cycle-delayed responder, every byte identical to the image's, all 106
+records resolving.
+
+The loader is a 4-phase handshake (`req` raised with a stable address, dropped after `valid`). The first
+version held `req` high across bytes and the responder captured the same address twice - `mem[1]` held the
+tag again. A level that never falls is not a handshake.
+
+### 2. `aw_rom`'s audio fetch had no way out of `ST_WAIT`
+
+The probe, census and directory captures each release the sequencer when their readback lands; the audio
+capture is gated by `!aud_active` (it must not steal their reads), so it could not release it - and nothing
+else did. Every audio byte therefore parked the sequencer until the 16-bit watchdog expired.
+
+Measured in `tb_top` before the fix: **~0.9 ms per byte**, the 1439-byte index load taking a second instead
+of two milliseconds, and the mixer starving identically on every sample. After adding `aud_captured` to the
+`ST_WAIT` branch: the whole load completed inside one 2.7 ms monitor interval.
+
+This is the class of bug a module bench cannot see: `aw_audio_rd`'s responder answers correctly, and the
+mixer is bit-exact; only a real `aw_rom` with a real sequencer shows the missing release.
+
+### 3. Reading silent channels was 8.6% of the ticks
+
+The mixer read `b1`/`b2` for all four channels on every tick, active or not. Measured in a 60-frame `tb_soc`
+run (part 1 of the audio image, VM streaming bytecode the whole time): **7591 dropped ticks of ~88,680**.
+`mixer.cpp` only processes active channels, so the reads were pure cost. Inactive channels now skip straight
+to the advance state: reads cost 2 per **active** channel - none in silence, four in the harvest's typical
+case. `tb_mixer` is still 64/64 bit-exact after the change.
+
+`aw_mixer` now also exposes a dropped-tick counter, so the integration benches assert it is zero rather than
+assuming it.
+
+### 4. The clock crossing, and the I2S alignment
+
+`aw_audio_rd` is the only crossing in the data path: a toggling bit through three flops into clk_psram, one
+`aud_req` pulse with the address held, and the acknowledgement toggling back. Tested against a responder
+with 4..259 `clk_psram` cycles of latency and 2% of transactions blocked for 400 cycles: 170 issued, 170
+returned, 0 errors.
+
+`aw_audio_i2s` keeps the template's MCLK generation (a fractional accumulator on clk_74a - 74.25/12.288 is
+not an integer) and runs the whole output stage on MCLK itself: 12.288 MHz / 48 kHz = exactly 256, so SCLK is
+MCLK/4 and a frame is 64 SCLK periods. LRCK changes at slot 31 and slot 63, one SCLK **before** the MSB at
+slots 32 and 0 - standard I2S, and the same timing the template's `cnt == 31` toggle implied. `tb_audio_i2s`
+decodes the pins back to samples: 400 fed, 400 received, 1 underrun at the initial fill, 0 overruns, and
+MCLK/SCLK/LRCK measured over a fixed window.
+
+### Build findings
+
+* `aw_rom`'s `pr_done` was driven from two always blocks (a reset in the part-request filter, and its own
+  "request applied" block). Verilator warned; **Quartus refused to elaborate** - 18 errors of "Can't resolve
+  multiple constant drivers". The first Quartus build after the chapter-switch work therefore did not exist.
+  Fixed by giving `pr_done` one driver.
+* The four audio modules were not in `aw.qsf` at all: no audio build had ever been attempted, so "it
+  simulates" was the whole of the evidence until now.
+
+### What `tb_top` now proves
+
+The old check was "the DAC is silent for the whole run", which the template's constant-zero shifter passed -
+the assertion could not tell a working chain from a stuck one. It is now: the index was copied out of the
+image, 480 ticks and 480 mixer samples and 479-480 I2S pops in a 10 ms window, 0 dropped ticks, **and** the
+DAC silent while the script has not asked for a sound (the synthetic pack has no bytecode, so silence is the
+correct output - produced by a running chain rather than by a constant).
+
+The window had to move to *after* the index load: the first version opened it four frames in, before the
+loader had run, and reported zero mixer samples for a working path.
+
+`tb_soc` is where the real pack runs: it instantiates the same chain against the same `aw_rom`, so a play
+issued by the game's own bytecode measures the shipping path, including the added PSRAM traffic.

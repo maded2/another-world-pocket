@@ -12,6 +12,12 @@
 # clk_core and clk_psram come from the same PLL (factor five apart), but they are
 # grouped apart too: the crossing between them is a FIFO with synchronized
 # pointers, which is deliberately not a synchronous path.
+# NOTE: the I2S output stage used to run on `audio_mclk`, a toggling register used as a clock. Quartus
+# auto-detected it, reported "determined to be a clock but was found without an associated clock assignment",
+# and left that logic outside every timing check; an SDC create_clock for it did not resolve to an object
+# (`Ignored create_clock ... empty collection`, which check-build caught). It is now a clock ENABLE on
+# clk_74a instead - one clock, one constraint, the same waveform at the pins.
+
 set_clock_groups -asynchronous \
  -group { bridge_spiclk } \
  -group { clk_74a } \

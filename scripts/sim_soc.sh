@@ -141,6 +141,8 @@ if ! verilator --binary -j 4 --timing --top-module tb_soc \
     -Wno-fatal -Wno-lint --Mdir obj \
     "${DEFINES[@]}" \
     "$CORE/aw_rom.v" "$CORE/aw_fifo.v" "$CORE/aw_psram.v" \
+    "$CORE/aw_audio_tick.v" "$CORE/aw_audio_idx.v" "$CORE/aw_audio_ch.v" \
+    "$CORE/aw_mixer.v" "$CORE/aw_audio_rd.v" "$CORE/aw_audio_i2s.v" \
     "$SIM/aw_psram_model.v" \
     "$SIM/apf_video_check.sv" \
     "$CORE/aw_pocket_build.v" "$SIM/tb_soc.sv" \

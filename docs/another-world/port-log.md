@@ -3170,3 +3170,53 @@ not issue a chapter request in that window, so nothing exercised the switch. It 
 shifted fill writes** (35264 writes, "rewinds 328"), and a 40-frame part-0 run is longer than any
 previously passing one - so that finding is unattributed. It must be A/B'd against the previous RTL
 before it is blamed on, or cleared from, this change.
+
+### Audio: the verified parts are wired, and four measured findings (2026-11-09)
+
+The mixer, the 48 kHz tick, the index resolver and the argument decoding were already graded against
+oracles. This session put them on the wires: `core_top` now instantiates `aw_audio_tick`, `aw_audio_idx`,
+`aw_audio_ch`, `aw_mixer`, `aw_audio_rd` (the byte crossing) and `aw_audio_i2s`, and the SoC's nine audio
+outputs - which had been harvested and then left unconnected - drive them. `aw_rom`'s audio port is no longer
+tied off.
+
+Four things came out of wiring it, and only one of them was predictable:
+
+**The index left the per-lookup path.** `aw_audio_idx` walked the image on every play: up to 1697 PSRAM round
+trips through a handshake, ~1.6 ms, ~78 dropped mixer ticks, competing with the sample fetch. It now copies
+the index out of the image once at boot into 2 x M10K: 73 us worst case, no PSRAM traffic per play. That was
+phase C's plan all along.
+
+**`aw_rom`'s audio fetch could not leave `ST_WAIT`.** The probe, census and directory captures each release
+the sequencer when their readback lands; the audio capture is gated by `!aud_active` and nothing else released
+it, so every audio byte waited for the 16-bit watchdog: measured at ~0.9 ms per byte, a 1439-byte index load
+taking a second instead of two milliseconds. One `aud_captured` term fixed it: the same load now finishes in
+one 2.7 ms monitor interval. `aw_audio_rd`'s own bench could not see this - only a real `aw_rom` could.
+
+**Reading silent channels was 8.6% of the ticks.** The mixer fetched `b1`/`b2` for all four channels every
+tick, active or not, while `mixer.cpp` only processes active ones. A 60-frame `tb_soc` run measured 7591
+dropped ticks of ~88,680. Inactive channels now skip to the advance state: 0 reads in silence, 4 in the
+harvest's typical case of two sounds. `tb_mixer` stays 64/64 bit-exact.
+
+**The I2S stage ran on an unconstrained clock.** `audio_mclk` (the fractional-accumulator toggle) was used as
+a clock; Quartus auto-detected it, said it had no clock assignment, and left that logic untimed. An SDC
+`create_clock` for it resolved to an empty collection - which `check-build` caught, as it is meant to. The
+stage is now a clock ENABLE on `clk_74a`: one clock, one constraint, the same waveform at the pins, and
+`tb_audio_i2s` still decodes 400 fed samples back out of the pins exactly.
+
+Also found by the first Quartus build in a week: `aw_rom`'s `pr_done` had two drivers (Verilator warns,
+Quartus refuses), so the chapter-switch RTL had never actually compiled.
+
+**Measured state.** `make sim-audio`: six benches green. `tb_top`: index loaded, 480 ticks / 480 mixer samples
+/ 479-480 I2S pops per 10 ms, 0 dropped ticks, DAC silent while nothing has played. `tb_soc` (paged part 1,
+the 3.64 MiB audio image, `+HOLDPART=1`): **41,956 bytes to the VM, 0 fill writes shifted** - the golden paged
+number - with `plays 5, DAC moved 1, dropped ticks 0`. A 3.64 MiB upload lands byte-exact at the host's real
+pace (`PACE=16`); at the bench's older default (`PACE=10`) it lost its tail above ~2.14 MB, because the
+loader's overflow tripwire aborts *all* later writes. That is the bench's pace assumption, not the image -
+but it is exactly the failure shape to look for on hardware.
+
+**Build.** Setup 0.404 ns, hold 0.112 ns, TNS 0, on the first build with audio (after one seed change and
+`OPTIMIZE_HOLD_TIMING`; the one failing path was a zero-logic `aw_audio_rd.data -> aw_mixer.b2` hop at
+-0.009 ns). Bitstream `6bf50db7...` before the clock-enable change; rebuilt after it.
+
+Not done: the music tracker, the hardware gate, and a harness that keeps running long enough to reach the
+11 looping sounds and modules 137/138.

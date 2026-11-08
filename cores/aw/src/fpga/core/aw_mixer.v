@@ -246,7 +246,14 @@ module aw_mixer (
                         cur_ch  <= 2'd0;
                         st      <= S_A1;
                     end
-            S_A1: begin
+            // An inactive channel costs NO memory reads. mixer.cpp only processes active channels, and in
+            // the field those reads are PSRAM round trips shared with the VM's bytecode stream: reading all
+            // four channels every tick (8 reads) left 7591 dropped ticks in a 60-frame tb_soc run, 8.6% of
+            // the 48 kHz ticks. Reads now cost 2 per ACTIVE channel - none in silence, four in the
+            // harvest's typical case of two sounds at once - and silence therefore never touches the port.
+            S_A1: if (!ch_active[cur_ch]) begin
+                        st <= S_NEXT;
+                    end else begin
                         // p1 and ilc are sampled BEFORE the position advances, exactly as the C does.
                         p1   = ch_pos[cur_ch] >> 8;
                         ilc  = ch_pos[cur_ch][7:0];
