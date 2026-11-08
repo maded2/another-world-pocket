@@ -37,6 +37,14 @@ module aw_mixer (
 
     // Command: play a sound on a channel, or stop it (vol == 0).
     input  wire        cmd_valid,
+    // 1 = (re)start the channel, 0 = change the volume of a channel that is already playing.
+    // The music player's setChannelVolume is not a play (sfxplayer.cpp updates the volume for a row that
+    // carries an effect but no note), and restarting there would re-trigger the sample.
+    input  wire        cmd_touch,
+    // Rate as a DIRECT increment, used by the music player: its notes are arbitrary Hz
+    // (freq = 7159092 / (period * 2)), not indexes into frequenceTable.
+    input  wire        cmd_use_inc,
+    input  wire [8:0]  cmd_inc,
     input  wire [1:0]  cmd_ch,
     input  wire [5:0]  cmd_freq,           // index into the rate table, must be < 40
     input  wire [7:0]  cmd_vol,            // 0 = stop; otherwise clamped to 6 bits
@@ -228,10 +236,12 @@ module aw_mixer (
             if (cmd_valid) begin
                 if (cmd_vol == 8'd0) begin
                     ch_active[cmd_ch] <= 1'b0;            // vol 0 is a STOP, not a silent play
+                end else if (!cmd_touch) begin
+                    ch_vol[cmd_ch] <= (cmd_vol > 8'd63) ? 6'd63 : cmd_vol[5:0];   // volume only
                 end else begin
                     ch_active[cmd_ch]  <= 1'b1;
                     ch_pos[cmd_ch]     <= 24'd0;
-                    ch_inc[cmd_ch]     <= rate_inc(cmd_freq);
+                    ch_inc[cmd_ch]     <= cmd_use_inc ? cmd_inc : rate_inc(cmd_freq);
                     ch_vol[cmd_ch]     <= (cmd_vol > 8'd63) ? 6'd63 : cmd_vol[5:0];
                     ch_len[cmd_ch]     <= cmd_len;
                     ch_looppos[cmd_ch] <= cmd_loop_pos;

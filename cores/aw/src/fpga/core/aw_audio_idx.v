@@ -41,6 +41,14 @@ module aw_audio_idx #(
     input  wire        ldr_valid,
     input  wire [7:0]  ldr_data,
 
+    // ---- local RAM read port for a second client (the music tracker) ----
+    // The tracker needs to resolve instrument resource ids too, and sharing the single-request resolver with
+    // aw_audio_ch would mean a sound effect and a module load colliding (one of them would be told "not
+    // found" while the other's walk was in flight). A read port is cheaper than an arbiter: the RAM is
+    // already there, and a scan is a few thousand cycles against a 129 ms music tick.
+    input  wire [11:0] scan_addr,
+    output reg  [7:0]  scan_q,
+
     // ---- lookup ----
     input  wire        start,          // pulse: resolve res_id
     input  wire [15:0] res_id,
@@ -52,6 +60,8 @@ module aw_audio_idx #(
 );
 
     reg [7:0] mem [0:DEPTH-1];
+
+    always @(posedge clk) scan_q <= mem[scan_addr];
 
     // ------------------------------------------------------------------ loader
     // A 4-phase handshake per byte: raise req with a stable address, wait for valid, drop req, advance. The

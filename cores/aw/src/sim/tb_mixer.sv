@@ -61,7 +61,8 @@ module tb_mixer;
     aw_mixer dut (
         .clk(clk), .rst(rst), .tick(tick),
         .out_sample(out_sample),
-        .cmd_valid(cmd_valid), .cmd_ch(cmd_ch), .cmd_freq(cmd_freq), .cmd_vol(cmd_vol),
+        .cmd_valid(cmd_valid), .cmd_touch(1'b1), .cmd_use_inc(1'b0), .cmd_inc(9'd0),
+        .cmd_ch(cmd_ch), .cmd_freq(cmd_freq), .cmd_vol(cmd_vol),
         .cmd_len(cmd_len), .cmd_loop_pos(cmd_loop_pos), .cmd_loop_len(cmd_loop_len),
         .cmd_data_base(cmd_data_base),
         .rd_addr(rd_addr), .rd_req(rd_req), .rd_valid(rd_valid_r), .rd_data(rd_data_r)
