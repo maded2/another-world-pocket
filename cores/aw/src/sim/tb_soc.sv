@@ -25,7 +25,10 @@ module tb_soc;
     // run overwrote ref_mem with the image, the oracles would compare the VM's bytes against the
     // image at the same address - and under a page table those are different bytes, so the test would
     // either fail on a working design or, worse, be comparing the wrong things and pass.
-    localparam integer IMG_BYTES  = 3 * 1024 * 1024;  // room for aw-all.bin (2.938 MiB)
+    // Room for the combined image WITH audio: 3.637 MiB (aw-all-audio.bin). The old 3 MiB bound was sized
+    // for the game-only image and silently truncated the read - "$readmem file address beyond bounds",
+    // which is a bench limit and not a design fault, but it would look like one from the log alone.
+    localparam integer IMG_BYTES  = 4 * 1024 * 1024;
     localparam integer PACK_WORDS = PACK_BYTES / 4;
     localparam [23:0]  TRAILER    = 24'h1fffe0;
     localparam integer MAXPIX     = (1 << 21);
