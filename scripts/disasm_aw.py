@@ -97,6 +97,14 @@ def decode(code, i):
         return n, [(code[i+2] << 8) | code[i+3]], True
     if op == 0x0A:                                  # condJmp: target is the last two bytes
         return n, [(code[i+n-2] << 8) | code[i+n-1]], True
+    if op == 0x08:                                  # setSetVect: threadId byte, then the thread's PC
+        # THIS is the entry model. vm.cpp op_setSetVect writes
+        #   threadsData[REQUESTED_PC_OFFSET][threadId] = pcOffsetRequested
+        # and checkThreadRequests later moves that into the thread's PC - so every thread entry point is a
+        # constant in the instruction stream, and a walk that ignores it misses the whole body of any part
+        # written as threads. That is exactly why parts 1 and 2 stopped after a dozen instructions at an
+        # op_ret: their real code starts at a thread PC, not at offset 0.
+        return n, [(code[i+2] << 8) | code[i+3]], True
     if op in (0x05, 0x06, 0x11):                    # ret / pauseThread / killThread
         return n, [], False
     return n, [], True
