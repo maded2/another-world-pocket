@@ -379,3 +379,26 @@ The one quantity that IS constrained is latency: an audio read must complete wit
 mixer runs out of samples. With 1934 clocks available and a VM burst measured at a few hundred bytes per
 frame, that is not close - but it is the thing the integration bench should assert (`bytes_to_vm` climbing,
 `starving` at 0) rather than assume.
+
+### The integration's real question: which clock the mixer lives in (answered, 2026-11-08)
+
+Not a wiring detail - a CDC decision that would otherwise be discovered halfway through the edit.
+
+`aw_rom`'s audio port is in **clk_psram** (92.8125 MHz), because that is the clock that owns the chip.
+The VM's `snd_*` outputs are in **clk_core** (24.75 MHz). The mixer has to be next to one of them.
+
+**Decision: the mixer lives in clk_core.** Commands (`play`, and its `res/freq/vol/ch`) come from the VM, so
+putting the mixer beside the VM means the *command* path needs no crossing at all - and commands are the part
+that carries a repeated-identical-request hazard (`snd_seq` exists for exactly that). Only sample BYTES then
+cross, and bytes are a simple request/response with no ordering semantics.
+
+Cost, measured: one tick is 516 clk_core cycles. A 4-phase req/ack handshake to clk_psram and back is ~12
+clk_core cycles at the slower clock; 8 bytes (4 channels x b1,b2) taken sequentially is **96 cycles = 18.6 % of
+the tick**, leaving 420 cycles of slack. So a per-byte handshake is affordable and no FIFO is needed.
+
+The alternative - mixer in clk_psram - would need a CDC on the command path instead, including a sequence
+counter crossing, which is strictly worse: it puts the hazard on the side that has ordering meaning.
+
+Corollary for the edit: `aw_audio_idx` also belongs in clk_core (it is driven by the command path), so its byte
+reads cross through the same handshake. The PSRAM-side logic stays exactly what `aw_rom` already has: latch a
+request, serve when idle, return one byte.
