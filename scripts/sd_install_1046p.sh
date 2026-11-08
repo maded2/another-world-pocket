@@ -163,22 +163,28 @@ vs = d.get("interact", {}).get("variables", [])
 bad = []
 if not vs:
     bad.append("variables[] is empty - there is no selector, so the core can only ever boot part 1")
-found = False
+# TWO ENCODINGS, TWO ADDRESSES (aw_rom: is_val_addr). 0x00F00020 is value-selected - it is where a
+# PERSISTED list writes, which is the only kind the framework rewrites at boot - and 0x00F00000..1C stays
+# address-selected for the benches. This check used to demand 0x00F00000 and therefore failed a CORRECT
+# install (the value decode was split out of the base address after a tb_soc run showed the two colliding).
+found = None
 for v in vs:
-    if v.get("type") == "list" and str(v.get("address", "")).lower().endswith("f00000"):
-        found = True
+    a = str(v.get("address", "")).lower()
+    if v.get("type") == "list" and (a.endswith("f00020") or a.endswith("f00000")):
+        found = a
         opts = v.get("options", [])
         if len(opts) != 8:
             bad.append("%r has %d options, expected 8 (one per part)" % (v.get("name"), len(opts)))
         if not v.get("persist"):
             bad.append("%r is not persisted, so its value is never rewritten at boot and the select "
                        "would only apply to the session it was pressed in" % v.get("name"))
-if not found:
-    bad.append("no list variable addressed at 0x00F00000 - the part select decodes that address")
+if found is None:
+    bad.append("no list variable at 0x00F00020 (value-selected) or 0x00F00000 (address-selected) - "
+               "aw_rom decodes both, and the OSD list must use the value-selected one")
 for b in bad:
     print("  FAIL interact.json  %s" % b)
 if not bad:
-    print("  ok   interact.json  (one persisted 8-option list at 0x00F00000)")
+    print("  ok   interact.json  (one persisted 8-option list at %s)" % found)
 sys.exit(1 if bad else 0)
 PY
 python3 - "$DST/core.json" "$SRC/core.json" <<'PY' || fail=1

@@ -147,22 +147,28 @@ vs = d.get("interact", {}).get("variables", [])
 bad = []
 if not vs:
     bad.append("variables[] is empty - there is no selector, so the core can only ever boot part 1")
-found = False
+# TWO ENCODINGS, TWO ADDRESSES (aw_rom: is_val_addr). 0x00F00020 is value-selected - it is where a
+# PERSISTED list writes, which is the only kind the framework rewrites at boot - and 0x00F00000..1C stays
+# address-selected for the benches. This check used to demand 0x00F00000 and therefore failed a CORRECT
+# install (the value decode was split out of the base address after a tb_soc run showed the two colliding).
+found = None
 for v in vs:
-    if v.get("type") == "list" and str(v.get("address", "")).lower().endswith("f00000"):
-        found = True
+    a = str(v.get("address", "")).lower()
+    if v.get("type") == "list" and (a.endswith("f00020") or a.endswith("f00000")):
+        found = a
         opts = v.get("options", [])
         if len(opts) != 8:
             bad.append("%r has %d options, expected 8 (one per part)" % (v.get("name"), len(opts)))
         if not v.get("persist"):
             bad.append("%r is not persisted, so its value is never rewritten at boot and the select "
                        "would only apply to the session it was pressed in" % v.get("name"))
-if not found:
-    bad.append("no list variable addressed at 0x00F00000 - the part select decodes that address")
+if found is None:
+    bad.append("no list variable at 0x00F00020 (value-selected) or 0x00F00000 (address-selected) - "
+               "aw_rom decodes both, and the OSD list must use the value-selected one")
 for b in bad:
     print("  FAIL interact.json  %s" % b)
 if not bad:
-    print("  ok   interact.json  (one persisted 8-option list at 0x00F00000)")
+    print("  ok   interact.json  (one persisted 8-option list at %s)" % found)
 sys.exit(1 if bad else 0)
 PY
 python3 - "$DST/core.json" "$SRC/core.json" <<'PY' || fail=1
@@ -215,35 +221,47 @@ boot.
 
 Start a UART capture BEFORE launching:
     python3 scripts/capture_serial.py /dev/ttyUSB1
-Every launch prints a CHK line; the two fields this probe exists for are at the end:
+Every launch prints a CHK line; the two fields that matter are at the end:
     ... Z<flag><quarter> <read_sum>/<written_sum> G<part><flags> E<code>
 
-RUN 1 - the probe.  Launch "AW 1047", and when the OSD asks for a file pick  aw-all-audio.bin
-                    (2.94 MiB). Read the line, then look at the screen.
+SET THE PART, OR YOU WILL HEAR NOTHING. This core boots view part 0 = part0.bin, which is the copy
+protection screen; the sounds in the harvest are in part1.bin. In the OSD set "Game part" to **Part 2**
+(option value 1 - the list is labelled from 1, and part0.bin is what its own header calls GAME_PART1).
 
-  G05 E00   whole file arrived. pool_ok=1 means the 93 pool pages in the chip add up to what the
-            image declares (wsum 9ca26b21, wxor be39) - #15 is answered YES and the single-image
-            plan stands. The picture is part 0's intro.
-  G01 E00   the directory arrived and the pool does NOT add up. Most likely the framework stopped
-            early. Note Z's quarter nibble (which quarter of the swept range disagrees) and the two
-            sums - that localises the cutoff to a 1 MiB band, and the read sum can be compared
-            against the image's own prefix sums offline.
-  G00 E40   no AWP1 magic: the framework did not deliver this file (would not select it, or picked
-            another). That is also a complete answer to #15 and the plan stops here.
+RUN 1 - the audio probe.  Launch "AW 1047", pick dataslot file  aw-all-audio.bin  (3.64 MiB), OSD
+        Game part = Part 2. Then report, in this order:
+  a) the CHK line. G05 = the whole 3.64 MiB arrived and the pool matches what the image declares
+     (that also answers the old "does a >2 MiB dataslot arrive" question). G01 = the directory
+     arrived but the pool does not add up, i.e. the upload was truncated - note Z's quarter nibble
+     and the two sums, which localise the cutoff to a 1 MiB band. G00 E40 = the file was not
+     delivered at all.
+  b) is there a picture, and is it the intro (drawn scene, not noise)?
+  c) is there AUDIO? The harvested cues, by frame, are:
+        frame ~24  res 8  freq 1 vol 45 ch 3   and   res 8  freq 5 vol 45 ch 2   (two at once)
+        frame ~96  res 9  freq 20 vol 30 ch 0  and   res 9  freq 20 vol 63 ch 1
+     Music (module 7, the intro theme) starts after ~8.5 s: 64 rows at 133 ms, then the first note.
+     Do the two-note pair and the music start at roughly those times?
 
-  Whatever G says, also answer: does it boot at all, is there a picture, and is the picture part 0's
-  intro rather than noise? A truncated pool gives wrong pixels in the pages that never arrived, not a
-  hung device - so a black screen with G01 is a different bug from a partly-wrong picture with G01.
+     A picture with NO sound is the interesting failure, and the two shapes are different:
+       * total silence from the first frame: the audio chain is not running at all (index load or
+         the mixer's tick) - the console's G/E fields are unaffected by that, so the picture being
+         normal does not clear it;
+       * sound that starts late, stutters, or matches the picture badly: the PSRAM port, i.e.
+         exactly what the dropped-tick counter was there to rule out in simulation (0 in tb_soc).
 
-RUN 2 - the control on the same core.  Launch "AW 1047" with  part0.bin  (2 MiB).
-  Expect G00 E40 (a plain pack is not an error - identity map, no directory) and a normal intro. This
-  separates "the paged core is broken" from "the bigger file did not arrive": if run 1 shows a broken
-  picture and run 2 does too, the core is the problem, not the upload.
+RUN 2 - same core, same bitstream, plain pack.  Launch "AW 1047" again and pick part0.bin (2 MiB).
+        Expect G00 E40 (a plain pack has no directory - not an error) and a normal protection screen.
+        If run 1 is broken and run 2 is fine, the fault is the big upload; if both are broken, it is
+        the core.
 
 RUN 3 - the known-good control.  Launch "AW 1042" with part0.bin and confirm it still draws straight
-  text and plays past a minute. If the control has changed behaviour, the card or the framework
-  changed under us and today's readings mean nothing until that is re-established.
+        text and runs past a minute. If the control has changed, the card or the framework changed
+        under us and today's readings mean nothing until that is re-established.
 
-Report all three, with the CHK lines. A new symptom is as valuable as a pass: if G05 arrives but the
-picture is wrong, the page table and the bytes disagree somewhere, and the bench can be aimed at it.
+WHAT WOULD FALSIFY THE SIMULATION.  Simulation says: the 3.64 MiB image uploads byte-exact at the
+host's real pace; the mixer drops 0 ticks with the VM running; I2S has 0 underruns once primed. If
+hardware shows sound that stutters while the picture runs smoothly, or music that drifts, the model
+that produced those numbers is wrong somewhere and the bench that proves it needs to be the one that
+fails first. Report which of those three it was.
 DONE
+
