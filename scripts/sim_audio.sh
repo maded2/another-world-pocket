@@ -52,6 +52,22 @@ else
 fi
 
 # 4. controller: exactly one command per request, right fields
+echo "=== tb_audio_rd: byte shim across two clocks, variable responder ==="
+if ! verilator --binary -j 4 --timing --top-module tb_audio_rd -Wno-fatal -Wno-lint \
+        --Mdir "$OBJ/rd" "$CORE/aw_audio_rd.v" "$SIM/tb_audio_rd.sv" -o tb_rd > "$OBJ/rd.log" 2>&1; then
+    echo "   build FAILED"; grep -E "%Error" "$OBJ/rd.log" | head -5; fail=1
+else
+    "$OBJ/rd/tb_rd" | grep -e "issued" || fail=1
+fi
+
+echo "=== tb_audio_i2s: the DAC stream decoded back to samples ==="
+if ! verilator --binary -j 4 --timing --top-module tb_audio_i2s -Wno-fatal -Wno-lint \
+        --Mdir "$OBJ/i2s" "$CORE/aw_audio_i2s.v" "$CORE/aw_fifo.v" "$SIM/tb_audio_i2s.sv" -o tb_i2s > "$OBJ/i2s.log" 2>&1; then
+    echo "   build FAILED"; grep -E "%Error" "$OBJ/i2s.log" | head -5; fail=1
+else
+    "$OBJ/i2s/tb_i2s" | grep -e "tb_audio_i2s" || fail=1
+fi
+
 echo "=== tb_audio_ch: play / stop / unknown id ==="
 if ! verilator --binary -j 4 --timing --top-module tb_audio_ch -Wno-fatal -Wno-lint \
         --Mdir "$OBJ/ch" "$CORE/aw_audio_idx.v" "$CORE/aw_audio_ch.v" "$SIM/tb_audio_ch.sv" -o tb_ch > "$OBJ/ch.log" 2>&1; then

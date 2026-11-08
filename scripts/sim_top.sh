@@ -32,6 +32,12 @@ if ! verilator --binary -j 4 --timing --top-module tb_top -Wno-fatal -Wno-lint \
     "$CORE/aw_fifo.v" \
     "$CORE/aw_psram.v" \
     "$CORE/aw_keys.v" \
+    "$CORE/aw_audio_tick.v" \
+    "$CORE/aw_audio_idx.v" \
+    "$CORE/aw_audio_ch.v" \
+    "$CORE/aw_mixer.v" \
+    "$CORE/aw_audio_rd.v" \
+    "$CORE/aw_audio_i2s.v" \
     "$CORE/core_bridge_cmd.v" \
     "$CORE/dbg_console.v" \
     "$CORE/dbg_uart_tx.v" \

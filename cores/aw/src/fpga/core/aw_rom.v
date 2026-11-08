@@ -777,6 +777,12 @@ module aw_rom (
     // it is used instead of rd_addr - the request mux has moved on by the time data returns,
     // and rd_addr_q exists for exactly that reason elsewhere in this file.
     wire cen_captured = rd_q_valid & (st_s == ST_WAIT) & census_active;
+    // The audio fetch has its own capture block, so it must also have its own way OUT of ST_WAIT: nothing else
+    // releases the sequencer for it (the probe capture above is gated by !aud_active, and the census/dir
+    // captures by their own `active` bits). Without this the sequencer sat in ST_WAIT after every audio byte
+    // until the 16-bit watchdog expired - measured in tb_top as ~0.9 ms per byte, i.e. an index load that
+    // took a second instead of two milliseconds, and a mixer that would starve the same way on every sample.
+    wire aud_captured = rd_q_valid & (st_s == ST_WAIT) & aud_active;
 
     always @(posedge clk_psram) begin
         if (rst_psram) vfy_arm_p <= 2'b00;
@@ -984,6 +990,8 @@ module aw_rom (
             ST_WAIT: if (&st_wcnt) begin
                 st_s   <= ST_IDLE;
                 st_seq <= 3'd0;
+            end else if (aud_captured) begin
+                st_s <= ST_IDLE;              // the audio block took its byte; the port is free again
             end else begin
                 st_wcnt <= st_wcnt + 16'd1;
             end

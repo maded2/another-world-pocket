@@ -596,7 +596,13 @@ aw_reset_gen u_rstgen (
 // 512 bytes the VM read. Resetting the whole SoC re-runs it the way boot does, which is a path this
 // port has exercised millions of times. The cost is that the framebuffers clear, so a chapter change
 // shows a brief blank frame - the honest price of "start the next chapter" and not "splice it in".
-wire design_reset = ~design_run | rom_vm_restart;
+// `~idx_load_done` holds the game off until the audio index has been copied out of the image. The copy is
+// ~1700 byte reads through the ONE PSRAM port, and the VM's bytecode stream contends for that port; measured
+// in tb_top with the VM running, the copy crawled (160 bytes in a second) because the audio fetch only wins
+// when the sequencer is idle. Holding the SoC in reset for a couple of milliseconds of boot is a smaller
+// price than an audio subsystem that may not be ready when the script asks for a sound - and it costs no
+// boot time at all in the common case, because the copy runs while the port is otherwise quiet.
+wire design_reset = ~design_run | rom_vm_restart | ~idx_load_done;
 
 ////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -856,6 +862,18 @@ M_main u_soc (
     .out_video_hs         ( game_hs            ),
     .out_video_vs         ( game_vs            ),
     .out_part_req         ( vm_part_req        ),   // the game's own chapter request (vm.si)
+    // The op_playSound / op_playMusic arguments. These nine outputs existed and were harvest-verified
+    // (docs/another-world/audio-plan.md) while nothing in this file consumed them, which is the "verified
+    // nobody is allowed to find out about" pattern: they are now wired to the mixer below.
+    .out_snd_seq          ( snd_seq            ),
+    .out_snd_res          ( snd_res            ),
+    .out_snd_freq         ( snd_freq           ),
+    .out_snd_vol          ( snd_vol            ),
+    .out_snd_ch           ( snd_ch             ),
+    .out_mus_seq          ( mus_seq            ),
+    .out_mus_num          ( mus_num            ),
+    .out_mus_delay        ( mus_delay          ),
+    .out_mus_pos          ( mus_pos            ),
     .out_leds             (                    ),   // no LEDs on the Pocket
     .out_vblank           (                    ),
 
@@ -924,7 +942,11 @@ aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .rom_dir_err          ( rom_dir_err          ),
     .rom_part             ( rom_part_sel         ),
     .rom_part_late        ( rom_part_late        ),
-    .rom_pool_ok          ( rom_pool_ok          ), .aud_req(1'b0), .aud_addr(24'd0), .aud_data(), .aud_valid(),
+    .rom_pool_ok          ( rom_pool_ok          ),
+    .aud_req              ( aud_req              ),
+    .aud_addr             ( aud_addr             ),
+    .aud_data             ( aud_data             ),
+    .aud_valid            ( aud_valid            ),
     .rom_vm_restart       ( rom_vm_restart       ),
     .vm_part_req          ( vm_part_req          ),
 
@@ -1082,51 +1104,222 @@ assign dbg_tx = uart_line;
 assign cart_tran_bank0 = {1'b1, uart_line, uart_busy, 1'b1};
 
 //
-// audio i2s silence generator
-// see other examples for actual audio generation
+// AUDIO.
 //
-
-assign audio_mclk = audgen_mclk;
-assign audio_dac = audgen_dac;
-assign audio_lrck = audgen_lrck;
-
-// generate MCLK = 12.288mhz with fractional accumulator
-    reg         [21:0]  audgen_accum;
-    reg                 audgen_mclk;
-    parameter   [20:0]  CYCLE_48KHZ = 21'd122880 * 2;
-always @(posedge clk_74a) begin
-    audgen_accum <= audgen_accum + CYCLE_48KHZ;
-    if(audgen_accum >= 21'd742500) begin
-        audgen_mclk <= ~audgen_mclk;
-        audgen_accum <= audgen_accum - 21'd742500 + CYCLE_48KHZ;
-    end
-end
-
-// generate SCLK = 3.072mhz by dividing MCLK by 4
-    reg [1:0]   aud_mclk_divider;
-    wire        audgen_sclk = aud_mclk_divider[1] /* synthesis keep*/;
-    reg         audgen_lrck_1;
-always @(posedge audgen_mclk) begin
-    aud_mclk_divider <= aud_mclk_divider + 1'b1;
-end
-
-// shift out audio data as I2S 
-// 32 total bits per channel, but only 16 active bits at the start and then 16 dummy bits
+// The VM's op_playSound arguments (above) resolve through the image's audio index and drive a four-channel
+// mixer in clk_core; the mixed sample crosses into the MCLK domain through a small dual-clock FIFO and is
+// shifted out as I2S. The chain, and why each piece lives where it does, is in
+// docs/another-world/audio-plan.md - the short version:
 //
-    reg     [4:0]   audgen_lrck_cnt;    
-    reg             audgen_lrck;
-    reg             audgen_dac;
-always @(negedge audgen_sclk) begin
-    audgen_dac <= 1'b0;
-    // 48khz * 64
-    audgen_lrck_cnt <= audgen_lrck_cnt + 1'b1;
-    if(audgen_lrck_cnt == 31) begin
-        // switch channels
-        audgen_lrck <= ~audgen_lrck;
-        
-    end 
+//   * the MIXER is in clk_core, next to the VM, so the command path (which carries the repeated-identical-
+//     request hazard that `snd_seq` exists for) needs no clock crossing at all;
+//   * only BYTES cross to clk_psram, one at a time, through aw_audio_rd's 4-phase handshake into aw_rom's
+//     audio port;
+//   * the INDEX is copied out of the image once at boot (aw_audio_idx), so a lookup costs no PSRAM traffic
+//     and cannot starve the mixer;
+//   * the MIXER's 48 kHz tick comes from aw_audio_tick (fractional accumulator: 24.75 MHz / 48 kHz = 515.625
+//     is not an integer, and a wrong tick is a wrong sample rate).
+//
+// Everything audio waits for `idx_load_done`: the mixer would otherwise fetch from the same byte port the
+// loader is using, and the boot copy takes ~1.7 ms of a boot that is already seconds long.
+//
+wire [7:0]  snd_seq, snd_freq, snd_vol, snd_ch;
+wire [15:0] snd_res;
+wire [7:0]  mus_seq, mus_pos;
+wire [15:0] mus_num, mus_delay;
+
+wire        audio_tick;
+wire        idx_load_start, idx_load_busy, idx_load_done;
+wire [23:0] idx_ldr_addr;
+wire        idx_ldr_req, idx_ldr_valid;
+wire [7:0]  idx_ldr_data;
+
+wire        idx_start, idx_busy, idx_found;
+wire [15:0] idx_res;
+wire [7:0]  idx_type;
+wire [31:0] idx_blob;
+wire [15:0] idx_poff, idx_plen, idx_ls, idx_ll;
+
+wire        aud_cmd_valid;
+wire [1:0]  aud_cmd_ch;
+wire [5:0]  aud_cmd_freq;
+wire [7:0]  aud_cmd_vol;
+wire [23:0] aud_cmd_len, aud_cmd_lp, aud_cmd_ll, aud_cmd_base;
+
+wire signed [7:0] mix_sample;
+wire        mix_valid;
+wire [31:0] mix_drop_ticks;
+
+wire [23:0] mix_rd_addr;
+wire        mix_rd_req, mix_rd_valid;
+wire [7:0]  mix_rd_data;
+
+wire [15:0] aud_underruns, aud_overruns;
+wire        aud_sclk_unused;
+
+// ---- 48 kHz tick in clk_core ----
+aw_audio_tick u_audio_tick (
+    .clk  ( clk_core   ),
+    .rst  ( rst_core   ),
+    .tick ( audio_tick )
+);
+
+// ---- one play request per CHANGE of snd_seq ----
+// The VM increments snd_seq once per op_playSound (including vol == 0, which is a stop). Comparing against a
+// delayed copy means a repeated identical request is still seen, which a level-based trigger would miss.
+reg [7:0] snd_seq_d;
+always @(posedge clk_core) begin
+    if (rst_core) snd_seq_d <= 8'd0;
+    else          snd_seq_d <= snd_seq;
+end
+wire snd_play = (snd_seq != snd_seq_d);
+
+// ---- index: copied out of the image once, at the first moment the pack is known to be complete ----
+reg idx_load_armed;
+always @(posedge clk_core) begin
+    if (rst_core)            idx_load_armed <= 1'b0;
+    else if (rom_ready)      idx_load_armed <= 1'b1;
+end
+assign idx_load_start = idx_load_armed & ~idx_load_done & ~idx_load_busy;
+
+aw_audio_idx u_audio_idx (
+    .clk        ( clk_core       ),
+    .rst        ( rst_core       ),
+    .load_start ( idx_load_start ),
+    .load_busy  ( idx_load_busy  ),
+    .load_done  ( idx_load_done  ),
+    .ldr_addr   ( idx_ldr_addr   ),
+    .ldr_req    ( idx_ldr_req    ),
+    .ldr_valid  ( idx_ldr_valid  ),
+    .ldr_data   ( idx_ldr_data   ),
+    .start      ( idx_start      ),
+    .res_id     ( idx_res        ),
+    .busy       ( idx_busy       ),
+    .found      ( idx_found      ),
+    .r_type     ( idx_type       ),
+    .r_blob_off ( idx_blob       ),
+    .r_pcm_off  ( idx_poff       ),
+    .r_pcm_len  ( idx_plen       ),
+    .r_loop_start ( idx_ls       ),
+    .r_loop_len   ( idx_ll       )
+);
+
+// ---- play request -> mixer command ----
+// AUDIO_BASE is frames_base + pool_bytes for the shipping image. scripts/audio_addr_check.py proves the
+// formula against build/aw-all-audio.bin (0x2F0000, 0 mismatches, checked on every audio build); it moves
+// whenever the layout does, so it is one constant here and a check there rather than a remembered number.
+aw_audio_ch #(.AUDIO_BASE(24'h2F0000)) u_audio_ch (
+    .clk        ( clk_core       ),
+    .rst        ( rst_core       ),
+    .play       ( snd_play & idx_load_done ),
+    .res        ( snd_res        ),
+    .freq       ( snd_freq[5:0]  ),
+    .vol        ( snd_vol        ),
+    .ch         ( snd_ch[1:0]    ),
+    .idx_start  ( idx_start      ),
+    .idx_res    ( idx_res        ),
+    .idx_busy   ( idx_busy       ),
+    .idx_found  ( idx_found      ),
+    .idx_type   ( idx_type       ),
+    .idx_blob   ( idx_blob       ),
+    .idx_poff   ( idx_poff       ),
+    .idx_plen   ( idx_plen       ),
+    .idx_ls     ( idx_ls         ),
+    .idx_ll     ( idx_ll         ),
+    .cmd_valid  ( aud_cmd_valid  ),
+    .cmd_ch     ( aud_cmd_ch     ),
+    .cmd_freq   ( aud_cmd_freq   ),
+    .cmd_vol    ( aud_cmd_vol    ),
+    .cmd_len    ( aud_cmd_len    ),
+    .cmd_lp     ( aud_cmd_lp     ),
+    .cmd_ll     ( aud_cmd_ll     ),
+    .cmd_base   ( aud_cmd_base   )
+);
+
+// ---- four-channel mixer, ticked at 48 kHz, sampling PSRAM through the shim ----
+aw_mixer u_mixer (
+    .clk        ( clk_core       ),
+    .rst        ( rst_core       ),
+    .tick       ( audio_tick & idx_load_done ),
+    .out_sample ( mix_sample     ),
+    .out_valid  ( mix_valid      ),
+    .drop_ticks ( mix_drop_ticks ),
+    .cmd_valid  ( aud_cmd_valid  ),
+    .cmd_ch     ( aud_cmd_ch     ),
+    .cmd_freq   ( aud_cmd_freq   ),
+    .cmd_vol    ( aud_cmd_vol    ),
+    .cmd_len    ( aud_cmd_len    ),
+    .cmd_loop_pos ( aud_cmd_lp   ),
+    .cmd_loop_len ( aud_cmd_ll   ),
+    .cmd_data_base( aud_cmd_base ),
+    .rd_addr    ( mix_rd_addr    ),
+    .rd_req     ( mix_rd_req     ),
+    .rd_valid   ( mix_rd_valid   ),
+    .rd_data    ( mix_rd_data    )
+);
+
+// ---- the one byte-port client, and the only clock crossing in the data path ----
+// The index loader and the mixer never overlap: the loader runs to completion before the mixer's tick is
+// enabled, so the shim serves one caller at a time by construction rather than by arbitration. The owner is
+// a REGISTER rather than a function of "busy", because the last byte's response arrives one cycle after
+// `busy` drops - and attributing that byte to the mixer would swallow it.
+wire        aud_rd_req;
+wire [23:0] aud_rd_addr;
+wire [7:0]  aud_rd_data;
+wire        aud_rd_valid;
+reg         aud_port_is_idx;
+
+always @(posedge clk_core) begin
+    if (rst_core)            aud_port_is_idx <= 1'b0;
+    else if (idx_load_start) aud_port_is_idx <= 1'b1;
+    else if (idx_load_done)  aud_port_is_idx <= 1'b0;
 end
 
+assign aud_rd_req     = aud_port_is_idx ? idx_ldr_req  : mix_rd_req;
+assign aud_rd_addr    = aud_port_is_idx ? idx_ldr_addr : mix_rd_addr;
+assign idx_ldr_valid  = aud_rd_valid &  aud_port_is_idx;
+assign idx_ldr_data   = aud_rd_data;
+assign mix_rd_valid   = aud_rd_valid & ~aud_port_is_idx;
+assign mix_rd_data    = aud_rd_data;
+
+wire        aud_req;
+wire [23:0] aud_addr;
+wire [7:0]  aud_data;
+wire        aud_valid;
+
+aw_audio_rd u_audio_rd (
+    .clk_c    ( clk_core  ),
+    .rst_c    ( rst_core  ),
+    .req      ( aud_rd_req  ),
+    .addr     ( aud_rd_addr ),
+    .data     ( aud_rd_data ),
+    .valid    ( aud_rd_valid ),
+    .clk_p    ( clk_psram ),
+    .rst_p    ( rst_psram ),
+    .aud_req  ( aud_req   ),
+    .aud_addr ( aud_addr  ),
+    .aud_data ( aud_data  ),
+    .aud_valid( aud_valid )
+);
+
+// ---- I2S out: real samples, exactly 48 kHz, MCLK 12.288 MHz ----
+// The mixer's sample is 8-bit signed; it is sign-extended and scaled by 256 in aw_audio_i2s so full scale is
+// full scale. The FIFO inside handles the two independent 48 kHz timebases.
+wire [15:0] aud_sample16 = {{8{mix_sample[7]}}, mix_sample} << 8;
+
+aw_audio_i2s u_audio_i2s (
+    .clk_74a      ( clk_74a       ),
+    .clk_core     ( clk_core      ),
+    .rst_core     ( rst_core      ),
+    .sample       ( aud_sample16  ),
+    .sample_valid ( mix_valid     ),
+    .audio_mclk   ( audio_mclk    ),
+    .audio_sclk   ( aud_sclk_unused ),
+    .audio_lrck   ( audio_lrck    ),
+    .audio_dac    ( audio_dac     ),
+    .underruns    ( aud_underruns ),
+    .overruns     ( aud_overruns  )
+);
 
 ///////////////////////////////////////////////
 

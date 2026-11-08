@@ -12,9 +12,20 @@ module tb_audio_ch;
 
     // index region + payload, built here so the expected values are visible next to the stimulus
     reg  [7:0] mem [0:4095];
-    wire [23:0] idx_addr;
-    reg  [7:0]  idx_data;
-    always @(posedge clk) idx_data <= mem[idx_addr - 24'h001000];
+
+    // The index RAM is loaded at boot through a byte port. This responder answers one cycle later - the
+    // loader's contract is req/valid, and tb_audio_idx is the bench that exercises a delayed responder;
+    // this one only needs the index resident so the controller's handshake can be checked.
+    wire        ldr_req;
+    wire [23:0] ldr_addr;
+    reg         ldr_valid = 0;
+    reg  [7:0]  ldr_data = 0;
+    always @(posedge clk) begin
+        ldr_valid <= ldr_req;
+        if (ldr_req) ldr_data <= mem[ldr_addr - 24'h001000];
+    end
+    reg         load_start = 0;
+    wire        load_busy, load_done;
 
     reg         play = 0;
     reg  [15:0] res = 0;
@@ -35,11 +46,13 @@ module tb_audio_ch;
     wire [7:0]  cmd_vol;
     wire [23:0] cmd_len, cmd_lp, cmd_ll, cmd_base;
 
-    aw_audio_idx u_idx(.clk(clk), .rst(rst), .start(idx_start), .res_id(idx_res),
+    aw_audio_idx u_idx(.clk(clk), .rst(rst),
+                       .load_start(load_start), .load_busy(load_busy), .load_done(load_done),
+                       .ldr_addr(ldr_addr), .ldr_req(ldr_req), .ldr_valid(ldr_valid), .ldr_data(ldr_data),
+                       .start(idx_start), .res_id(idx_res),
                        .busy(idx_busy), .found(idx_found), .r_type(idx_type), .r_blob_off(idx_blob),
                        .r_pcm_off(idx_poff), .r_pcm_len(idx_plen),
-                       .r_loop_start(idx_ls), .r_loop_len(idx_ll),
-                       .rd_addr(idx_addr), .rd_data(idx_data));
+                       .r_loop_start(idx_ls), .r_loop_len(idx_ll));
 
     aw_audio_ch #(.AUDIO_BASE(ABASE)) u_ch(.clk(clk), .rst(rst), .play(play), .res(res),
                        .freq(freq), .vol(vol), .ch(ch),
@@ -61,8 +74,8 @@ module tb_audio_ch;
             for (k = 0; k < 3000; k = k + 1) begin
                 @(negedge clk);
                 if (probe_run && k < 24)
-                    $display("   cyc %0d: st=%0d start=%b busy=%b found=%b idx_res=%0d rd=%0h",
-                             k, u_ch.st, idx_start, idx_busy, idx_found, idx_res, idx_addr);
+                    $display("   cyc %0d: st=%0d start=%b busy=%b found=%b idx_res=%0d a=%0h",
+                             k, u_ch.st, idx_start, idx_busy, idx_found, idx_res, u_idx.a);
                 if (cmd_valid) begin
                     pulses = pulses + 1;
                     got_vol = cmd_vol; got_base = cmd_base; got_len = cmd_len;
@@ -120,6 +133,12 @@ module tb_audio_ch;
         repeat (4) @(posedge clk);
         rst <= 0;
         repeat (2) @(posedge clk);
+
+        // load the index before any play - the controller must never see a lookup against an unloaded RAM
+        @(negedge clk); load_start <= 1;
+        @(negedge clk); load_start <= 0;
+        while (!load_done) @(negedge clk);
+        $display("  index loaded (%0d bytes)", 4 + mem[1]*16);
 
         do_play(16'd8, 6'd20, 8'd45, 2'd1);
         check_cmd(8'd45, 2'd1, 6'd20, ABASE + 24'd8, 24'h1234, 24'h0010, 24'h0020, "play res 8");

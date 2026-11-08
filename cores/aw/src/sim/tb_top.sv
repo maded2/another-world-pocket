@@ -18,7 +18,12 @@
 //      Status reads back {0x4F4B, 3}. It is "idle" (3), not "running" (4), because
 //      this core ties status_setup_done to the PLL lock, so the handler's inner
 //      if-else never reaches the running branch - that is what the design reports.
-//   5. Audio pins: MCLK is 12.288 MHz, LRCK is 48 kHz, DAC is silent for the whole run.
+//   5. Audio pins: MCLK is 12.288 MHz and LRCK is 48 kHz, the sample path is ALIVE (the index was copied out
+//      of the image, the 48 kHz tick runs, the mixer produces a sample per tick, the FIFO is popped), the
+//      mixer never drops a tick, and the DAC stays silent while no sound has been played by the script.
+//      The synthetic pack here contains no bytecode, so "silent" is the correct output - what is proved in
+//      this bench is that silence is produced by a working chain rather than by a constant. Real samples off
+//      a real script-driven play are proved in tb_audio_i2s (the shifter, bit-for-bit) and tb_soc.
 //   6. The debug-key UART line (cart bank0[6]) idles high while no console traffic is due.
 //
 // The pack is deliberately tiny: four trailer words at pack offset 0x1FFFE0. The VM
@@ -321,13 +326,26 @@ module tb_top;
 
     // ---- audio observation ------------------------------------------------------------------
     // One 10 ms window (742,500 cycles of clk_74a), opened four frames in: MCLK must then
-    // count 122,880 edges and LRCK 480 rising edges, exactly.
-    reg [31:0] mclk_edges = 0, lrck_rise = 0;
+    // count 122,880 edges and LRCK 480 rising edges, exactly, and the mixer must produce 480 samples.
+    //
+    // `dac_dirty` alone could not tell a working chain from a stuck zero, which is precisely the failure mode
+    // this feature replaces (the template held audio_dac at 0 forever and this bench passed). So the window
+    // also counts the tick, the mixer's out_valid and the I2S FIFO's pops: those must all be 480, and `pops`
+    // is the one that proves the DATA path ran rather than just the clock generator.
+    reg [31:0] mclk_edges = 0, lrck_rise = 0, tick_cnt = 0, mix_cnt = 0, pop_cnt = 0;
+    reg        at_prev = 0, mv_prev = 0, fr_prev = 0;
+    integer    aud_takes = 0, aud_vals = 0, aud_reqs = 0;
+    always @(posedge u_core.clk_psram) begin
+        if (u_core.u_rom.aud_take) aud_takes = aud_takes + 1;
+        if (u_core.aud_valid)      aud_vals  = aud_vals + 1;
+        if (u_core.aud_req)        aud_reqs  = aud_reqs + 1;
+    end
     reg        mclk_prev = 0, lrck_prev = 0;
     reg        in_window = 1'b0;
     reg [29:0] win_cnt = 0;
+    reg        win_done = 0;
     reg        dac_dirty = 1'b0;
-    reg [31:0] mclk_result = 0, lrck_result = 0;
+    reg [31:0] mclk_result = 0, lrck_result = 0, tick_result = 0, mix_result = 0, pop_result = 0;
 
     always @(posedge clk_74a) begin
         if (audio_mclk && !mclk_prev) mclk_edges <= in_window ? mclk_edges + 1 : mclk_edges;
@@ -335,17 +353,35 @@ module tb_top;
         if (audio_lrck && !lrck_prev) lrck_rise  <= in_window ? lrck_rise + 1 : lrck_rise;
         lrck_prev <= audio_lrck;
         if (audio_dac !== 1'b0) dac_dirty <= 1'b1;
+        // These are one-clk_core-cycle pulses sampled at the 3x faster clk_74a, so a level count would
+        // report three times the truth. Count rising edges instead.
+        if (u_core.audio_tick && !at_prev) tick_cnt <= in_window ? tick_cnt + 1 : tick_cnt;
+        at_prev <= u_core.audio_tick;
+        if (u_core.mix_valid && !mv_prev) mix_cnt <= in_window ? mix_cnt + 1 : mix_cnt;
+        mv_prev <= u_core.mix_valid;
+        if (u_core.u_audio_i2s.fifo_rd && !fr_prev) pop_cnt <= in_window ? pop_cnt + 1 : pop_cnt;
+        fr_prev <= u_core.u_audio_i2s.fifo_rd;
 
-        if (!in_window && win_cnt == 0 && pix_cnt > FRAME_CYCLES * 4) begin
+        // The window must start AFTER the audio index has been copied out of the image: before that the
+        // mixer is deliberately held off (its byte port belongs to the loader), so measuring samples then
+        // would report zero for a working chain. Measured the other way first, and it did.
+        if (!in_window && !win_done && pix_cnt > FRAME_CYCLES * 4 && u_core.idx_load_done) begin
             in_window  <= 1'b1;
             mclk_edges <= 0;
             lrck_rise  <= 0;
+            tick_cnt   <= 0;
+            mix_cnt    <= 0;
+            pop_cnt    <= 0;
         end else if (in_window) begin
             win_cnt <= win_cnt + 1;
             if (win_cnt == 742500 - 1) begin
                 in_window   <= 1'b0;
+                win_done    <= 1'b1;
                 mclk_result <= mclk_edges;
                 lrck_result <= lrck_rise;
+                tick_result <= tick_cnt;
+                mix_result  <= mix_cnt;
+                pop_result  <= pop_cnt;
             end
         end
     end
@@ -510,14 +546,47 @@ module tb_top;
         // shortly after the waits above; poll for the latched result.
         begin : audio_wait
             integer i;
-            for (i = 0; i < 1_000_000 && mclk_result == 0; i = i + 1)
+            for (i = 0; i < 1_000_000 && mclk_result == 0; i = i + 1) begin
                 @(posedge clk_74a);
+                if (i % 200000 == 0)
+                    $display("tb_top:   [%0t] loader n=%0d lst=%0d start=%b done=%b", $time,
+                             u_core.u_audio_idx.n, u_core.u_audio_idx.lst,
+                             u_core.idx_load_start, u_core.idx_load_done);
+            end
         end
+        if (!u_core.idx_load_done)
+            $display("tb_top:   loader diag: armed=%b start=%b lst=%0d n=%0d need=%0d cnt=%0d busy=%b | req=%b audreq=%b audvalid=%b rd_valid=%b shim_cs=%0d shim_busy=%b audpend=%b audactive=%b st_s=%0d dir_pend=%b cen_pend=%b",
+                     u_core.idx_load_armed, u_core.idx_load_start, u_core.u_audio_idx.lst,
+                     u_core.u_audio_idx.n, u_core.u_audio_idx.need, u_core.u_audio_idx.cnt,
+                     u_core.u_audio_idx.load_busy, u_core.aud_rd_req, u_core.aud_req, u_core.aud_valid,
+                     u_core.aud_rd_valid, u_core.u_audio_rd.cs, u_core.u_audio_rd.busy,
+                     u_core.u_rom.aud_pend, u_core.u_rom.aud_active, u_core.u_rom.st_s,
+                     u_core.u_rom.dir_pend, u_core.u_rom.cen_pend);
+        if (mix_result < 478 || pop_result < 478) begin
+            $display("tb_top:   audio port: req pulses=%0d takes=%0d valids=%0d t=%0t", aud_reqs, aud_takes, aud_vals, $time);
+            $display("tb_top:   mixer: st=%0d rd_req=%b rd_valid=%b rd_addr=%h out=%0d out_valid=%b drops=%0d fifo_rd=%b fifo_empty=%b level=%0d",
+                     u_core.u_mixer.st, u_core.mix_rd_req, u_core.mix_rd_valid, u_core.mix_rd_addr,
+                     u_core.mix_sample, u_core.mix_valid, u_core.mix_drop_ticks,
+                     u_core.u_audio_i2s.fifo_rd, u_core.u_audio_i2s.fifo_empty,
+                     u_core.u_audio_i2s.fifo_level);
+        end
+        check("audio: the image's audio index was copied out at boot", u_core.idx_load_done);
+        check($sformatf("audio: 48 kHz tick = %0d in 10 ms (want 480)", tick_result),
+               tick_result >= 478 && tick_result <= 482);
+        check($sformatf("audio: mixer produced %0d samples in 10 ms (want 480)", mix_result),
+               mix_result >= 478 && mix_result <= 482);
+        check($sformatf("audio: I2S consumed %0d samples in 10 ms (want 480)", pop_result),
+               pop_result >= 478 && pop_result <= 482);
+        check($sformatf("audio: mixer dropped %0d ticks (want 0)", u_core.mix_drop_ticks),
+               u_core.mix_drop_ticks == 0);
         check($sformatf("audio: MCLK = %0d edges in 10 ms (want 122880)", mclk_result),
                mclk_result >= 122875 && mclk_result <= 122885);
         check($sformatf("audio: LRCK = %0d rises in 10 ms (want 480)", lrck_result),
                lrck_result >= 478 && lrck_result <= 482);
-        check("audio: DAC silent for the whole run", !dac_dirty);
+        // The synthetic pack has no bytecode, so no play request can reach the mixer and silence is the
+        // CORRECT output. The check that matters is that the silence is produced by a running chain (above:
+        // 480 ticks, 480 mixer samples, 480 pops) rather than by a constant tied to zero.
+        check("audio: DAC stays silent while the script has not asked for a sound", !dac_dirty);
 
         // ---- verdict ------------------------------------------------------------------
         if (errors == 0) begin

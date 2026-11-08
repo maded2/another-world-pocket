@@ -28,6 +28,12 @@ module aw_mixer (
     // One-cycle pulse at exactly the output sample rate (48 kHz). Everything below happens inside it.
     input  wire        tick,
     output reg  signed [7:0] out_sample,   // one mixed sample per tick, registered
+    output reg         out_valid,          // one clk cycle after out_sample updates
+    // Ticks that arrived while the sequencer was mid-fetch and were therefore LOST. The fetch path is
+    // variable-latency (PSRAM behind a clock-domain handshake), so this is reachable rather than theoretical:
+    // the integration bench must assert it stays 0 under the real VM load, because a dropped tick is a
+    // sample-rate error that is audible but invisible.
+    output reg  [31:0] drop_ticks,
 
     // Command: play a sound on a channel, or stop it (vol == 0).
     input  wire        cmd_valid,
@@ -134,14 +140,16 @@ module aw_mixer (
     integer c;
 
     // ------------------------------------------------------------------ sequencer
-    // One tick = 4 channels x (read b1, read b2, accumulate). Two dead cycles between reads absorb the
-    // one-cycle memory latency, so the sequence is 4 x 4 = 16 cycles per tick - far below the ~515
-    // available, and it keeps the pipeline trivially checkable.
-    // rd_addr is a REGISTER driven non-blocking, so it becomes visible to the RAM one cycle after the state
-    // that assigns it, and rd_data is one cycle after that. The first version captured b1 and b2 one state
-    // early and read the PREVIOUS channel's bytes: the S_CALC probe showed channel 1 receiving b1=10 (which
-    // is ram[1], channel 0's second byte) and b2=-128 (its own first byte). The wait states below are not
-    // decoration - each one is exactly the latency of one stage.
+    // One tick = 4 channels x (read b1, then b2). Each read is a REQUEST/VALID transaction whose wait is as
+    // long as the responder needs: in the field that is a PSRAM access behind a clock-domain handshake
+    // (~24+ clk_core cycles, variable, because audio is served only when the PSRAM port is idle). The state
+    // chain is therefore S_A1 -> S_W1 -> S_A2 -> S_W2 -> S_CALC, with S_W1/S_W2 waiting for rd_valid - there
+    // is no fixed number of wait cycles to tune. Eight bytes per tick costs ~96 of the 516 clk_core cycles
+    // available at 48 kHz (18.6%), which is the margin the integration decision was made on.
+    //
+    // rd_addr is a REGISTER driven non-blocking, so it becomes visible one cycle after the state that assigns
+    // it; the first version captured b1 and b2 one state early and read the PREVIOUS channel's bytes (the
+    // S_CALC probe showed channel 1 receiving ram[1], channel 0's second byte).
     localparam [3:0] S_IDLE = 4'd0, S_A1 = 4'd1, S_W1 = 4'd2, S_A2 = 4'd3,
                      S_W2 = 4'd4, S_CALC = 4'd5, S_NEXT = 4'd6, S_OUT = 4'd7;
 
@@ -193,6 +201,8 @@ module aw_mixer (
         if (rst) begin
             st         <= S_IDLE;
             out_sample <= 8'sd0;
+            out_valid  <= 1'b0;
+            drop_ticks <= 32'd0;
             rd_addr    <= 24'd0;
             rd_req     <= 1'b0;
             running    <= 9'sd0;
@@ -208,6 +218,12 @@ module aw_mixer (
                 ch_base[i]    <= 24'd0;
             end
         end else begin
+            out_valid <= 1'b0;
+            // A tick that lands anywhere but S_IDLE cannot be honoured by this sequencer, and it is not
+            // queued: it is lost. Counted so the integration bench can assert the count is zero rather than
+            // assume it.
+            if (tick && st != S_IDLE) drop_ticks <= drop_ticks + 32'd1;
+
             // ---- commands, honoured any time ----
             if (cmd_valid) begin
                 if (cmd_vol == 8'd0) begin
@@ -296,6 +312,7 @@ module aw_mixer (
                     end
             S_OUT: begin
                         out_sample <= running;
+                        out_valid  <= 1'b1;
                         st         <= S_IDLE;
                     end
             default: st <= S_IDLE;
