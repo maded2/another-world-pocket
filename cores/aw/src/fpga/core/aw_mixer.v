@@ -176,6 +176,12 @@ module aw_mixer (
         end else begin
             // ---- commands, honoured any time ----
             if (cmd_valid) begin
+                // TEMPORARY PROBE (remove before this module is used): what the mixer itself sees and
+                // computes at the write cycle. The bench already shows freq=20 arriving, and no table
+                // entry can produce the 38 that ends up in ch_inc, so this separates "computed 56 but
+                // written somewhere else" from "computed the wrong thing".
+                $display("  MIXCMD ch=%0d freq=%0d inc=%0d vol=%0d len=%0d",
+                         cmd_ch, cmd_freq, rate_inc(cmd_freq), cmd_vol, cmd_len);
                 if (cmd_vol == 8'd0) begin
                     ch_active[cmd_ch] <= 1'b0;            // vol 0 is a STOP, not a silent play
                 end else begin

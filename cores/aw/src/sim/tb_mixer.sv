@@ -97,9 +97,13 @@ module tb_mixer;
             if (n >= 200) begin $display("tb_mixer: TIMEOUT in tick %0d", t); $finish; end
             $fdisplay(fd, "%0d", $signed(out_sample));
             if (t < 3)
-                $display("  tick %0d: st=%0d act0=%b pos0=%0h inc0=%0h vol0=%0d run=%0d out=%0d rd=%0h",
-                         t, dut.st, dut.ch_active[0], dut.ch_pos[0], dut.ch_inc[0], dut.ch_vol[0],
-                         dut.running, $signed(out_sample), rd_addr);
+                // %0d for pos/inc, NOT %0h: the first version printed hex and I read "38" as decimal
+                // thirty-eight when it was 0x38 = 56, i.e. exactly right. A display format has now cost
+                // this project a wrong diagnosis three times.
+                $display("  tick %0d: act=%b%b%b%b pos0=%0d inc0=%0d vol0=%0d vol1=%0d run=%0d out=%0d",
+                         t, dut.ch_active[0], dut.ch_active[1], dut.ch_active[2], dut.ch_active[3],
+                         dut.ch_pos[0], dut.ch_inc[0], dut.ch_vol[0], dut.ch_vol[1],
+                         dut.running, $signed(out_sample));
         end
         $fclose(fd);
         $display("tb_mixer: wrote %0d ticks", `TICKS);
