@@ -151,14 +151,23 @@ module aw_mixer (
     reg [23:0] next_pos;
 
     // signed 8-bit multiply-scale with truncation toward zero (C semantics for (b*vol)/64)
-    function automatic signed [8:0] scale_vol(input signed [7:0] b, input [5:0] vol);
-        reg signed [15:0] mag;
+    function automatic signed [8:0] scale_vol(input signed [7:0] b, input [6:0] vol);
+        // Sign-magnitude on purpose. Two width/signedness traps are avoided by doing it this way:
+        //   * `(b * vol) >> 6` sizes the expression by its widest operand, so an 8-bit b truncates the
+        //     product to 8 bits BEFORE shifting - 15*45 = 675 became 163 and >>6 gave 2 instead of 10.
+        //   * mixing a signed b with an unsigned vol makes the whole product unsigned, which turned -128
+        //     into +128 and saturated the output.
+        // Magnitudes are built in 16 bits (256 - byte for negatives, because -(-128) does not fit in 8
+        // bits), multiplied there, then the sign is re-applied - which is exactly C's truncation toward
+        // zero for (b * volume) / 64.
+        reg [15:0] magb;
+        reg [23:0] prod;
+        reg [8:0]  res;
         begin
-            if (b >= 0) scale_vol = (b * vol) >> 6;
-            else begin
-                mag = -b;                                 // magnitude, so >> is a floor on a positive value
-                scale_vol = -((mag * vol) >> 6);          // re-apply the sign: truncation toward zero
-            end
+            magb = b[7] ? (16'd256 - {8'd0, b}) : {8'd0, b};
+            prod = magb * vol;                       // unsigned throughout
+            res  = prod[14:6];                       // /64
+            scale_vol = b[7] ? -res : res;
         end
     endfunction
 
@@ -249,12 +258,12 @@ module aw_mixer (
             S_CALC: begin
                         $display("  CALC ch=%0d act=%b ilc=%0d b1=%0d b2=%0d interp=%0d scaled=%0d run_in=%0d",
                                  cur_ch, ch_active[cur_ch], ilc, $signed(b1), $signed(b2),
-                                 interp, scale_vol(interp, ch_vol[cur_ch]), running);
+                                 interp, scale_vol(interp, {1'b0, ch_vol[cur_ch]}), running);
                         if (ch_active[cur_ch]) begin
                             // SIGN-EXTEND b1/b2. They are int8 samples; zero-extending them turns -128 into
                             // +128, and mixing signed with unsigned operands makes the whole expression
                             // unsigned in Verilog, which is why this accumulated 0 before.
-                            running <= clamp8(running + scale_vol(interp, ch_vol[cur_ch]));
+                            running <= clamp8(running + scale_vol(interp, {1'b0, ch_vol[cur_ch]}));
                         end
                         st <= S_NEXT;
                     end
