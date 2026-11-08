@@ -402,3 +402,26 @@ counter crossing, which is strictly worse: it puts the hazard on the side that h
 Corollary for the edit: `aw_audio_idx` also belongs in clk_core (it is driven by the command path), so its byte
 reads cross through the same handshake. The PSRAM-side logic stays exactly what `aw_rom` already has: latch a
 request, serve when idle, return one byte.
+
+### The last integration finding: the mixer's memory port is fixed-latency (2026-11-08)
+
+`aw_mixer.v` has `rd_addr` out and `rd_data` in, and **no wait/valid**: its sequencer hardcodes the latency in
+states (S_RD1 -> S_W1 -> S_RD2 -> S_W2 -> S_W3), tuned to a one-cycle RAM. Its 64/64 bit-exact bench drives
+exactly that model.
+
+The real path is nothing like one cycle: a byte goes mixer (clk_core) -> handshake -> aw_rom sequencer
+(clk_psram) -> PSRAM access (~12 clk_psram cycles) -> handshake back, i.e. roughly 24+ clk_core cycles, and
+variable because the sequencer serves audio only when the port is idle.
+
+So the integration is NOT plumbing. It needs:
+* `rd_req` / `rd_valid` on the mixer's memory port, with the fixed wait states replaced by "wait for valid";
+* the bench updated to MODEL the new latency (its RAM becomes a delayed responder), because a bench whose
+  memory answers in one cycle would pass a design that cannot work on hardware - the exact "preconditions
+  differ from the field path" trap this project has a rule about;
+* a small CDC shim in core_top doing the 4-phase handshake, with the mixer tolerating a variable number of
+  wait cycles rather than a fixed one.
+
+Worth saying plainly: the earlier CDC note (mixer in clk_core, bytes cross by handshake, 18.6% of a tick)
+still holds - bandwidth and domain choice are settled. What was NOT settled until now is that the mixer's
+interface has to change shape, which is a modification to a verified module rather than wiring around it. That
+should be the first task of the next session, with its bench updated in the same pass.
