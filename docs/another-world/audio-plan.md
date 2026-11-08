@@ -201,3 +201,33 @@ Note `delay=0` with `num=0` is the "stop" form, so the tracker's stop path is ex
 
 The harvest is per-event, not sampled: a 10 ms diagnostic interval can contain two sounds, and a sampled
 monitor would report the second twice. The VM's sequence counter exists for exactly this.
+
+### Harvested requirement table (8 parts, 25-60 frame runs, 2026-11-08)
+
+`scripts/audio_events.py` turns the `SNDEVT`/`MUSEVT` logs from `tb_soc` into the table the mixer and
+tracker are built against. All eight parts harvested; **every event is inside the legal ranges**
+(`resId < 146`, `freq < 40`, `ch <= 3`), which is also the positive control on the decode.
+
+| what the game actually asks for | measured |
+|---|---|
+| distinct sounds (res, freq, vol, ch) | **18 tuples over 11 distinct resources** of the 103 extracted |
+| freq indices used | **1, 3, 5, 7, 10, 20, 22, 30, 34** - all below the mixer's `< 40` |
+| volumes used | 10, 16, 20, 22, 24, 30, 32, 45, 48, 63 |
+| channels used | 0, 1, 2, 3 (all four) |
+| channel stops (`vol == 0`) | **16 events, on all four channels** |
+| music | module **7** only, `delay=15700` -> 134 ms/event; modules 137 and 138 not yet reached |
+
+Two things this settles for the implementation:
+
+**`vol == 0` is a stop, not a silent play.** `vm.cpp` `snd_playSound` does `if (vol == 0)
+mixer->stopChannel(channel); else ...`, and the harvest uses it constantly - `res=106 vol=0` on all four
+channels, `res=48 vol=0` on three. A mixer that treated volume 0 as "play inaudibly" would leave channels
+running forever and every later sound on that channel would be mixed against a stale one. The stop path is
+therefore load-bearing from the first seconds, exactly like the music stop.
+
+**Only 11 of 103 sounds appear in short runs**, so the whole 0.70 MiB is not strictly needed to start -
+but later chapters will reach more, and 0.70 MiB fits the window, so ship all of it rather than build a
+subsetting step that would need re-doing the moment someone plays further.
+
+`res=88 freq=7 vol=16 ch=0` repeating 13 times is the harvest earning its keep: that is a footstep-like
+cue, and a sampled monitor would have reported it once.
