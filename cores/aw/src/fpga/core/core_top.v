@@ -1280,7 +1280,8 @@ wire [23:0] hdr_addr;
 reg  [7:0] hdr_data;
 reg [2:0]  hb_st;
 reg [4:0]  hb_i;
-reg [31:0] hb_fb, hb_pb;
+reg [23:0] hb_fb, hb_pb;   // 24 bits is the whole PSRAM window; the header's top byte of each u32 is
+                            // dead by construction, and keeping it would leave registers with no fanout
 reg [23:0] audio_base_r;
 reg        audio_base_ok;
 
@@ -1292,7 +1293,7 @@ reg        audio_base_ok;
 // is what a hardware round trip cost: the 2-part probe image has its audio at 0x118000, not 0x2F0000.
 always @(posedge clk_core) begin
     if (rst_core) begin
-        hb_st <= 3'd0; hb_i <= 5'd0; hb_fb <= 32'd0; hb_pb <= 32'd0;
+        hb_st <= 3'd0; hb_i <= 5'd0; hb_fb <= 24'd0; hb_pb <= 24'd0;
         audio_base_r <= 24'd0; audio_base_ok <= 1'b0;
     end else begin
         if (aud_rd_valid && (aud_owner == 2'd2)) hdr_data <= aud_rd_data;
@@ -1303,12 +1304,17 @@ always @(posedge clk_core) begin
               end
         3'd1: hb_st <= 3'd2;
         3'd2: if (aud_rd_valid) begin
-                  if (hb_i < 5'd4) hb_fb[{hb_i[1:0], 3'b000} +: 8] <= aud_rd_data;
-                  else             hb_pb[{hb_i[1:0], 3'b000} +: 8] <= aud_rd_data;
+                  // bytes 16..19 are frames_base, 20..23 are pool_bytes, little-endian; byte 3 of each is
+                  // always zero for an image the PSRAM can hold, so it is read and ignored.
+                  if (hb_i < 5'd4) begin
+                      if (hb_i[1:0] != 2'd3) hb_fb[{hb_i[1:0], 3'b000} +: 8] <= aud_rd_data;
+                  end else begin
+                      if (hb_i[1:0] != 2'd3) hb_pb[{hb_i[1:0], 3'b000} +: 8] <= aud_rd_data;
+                  end
                   hb_st <= 3'd3;
               end
         3'd3: if (hb_i == 5'd7) begin
-                  audio_base_r  <= hb_fb[23:0] + hb_pb[23:0];
+                  audio_base_r  <= hb_fb + hb_pb;
                   audio_base_ok <= 1'b1;
                   hb_st         <= 3'd4;
               end else begin

@@ -266,7 +266,14 @@ module aw_rom (
     // window does not cover is silently dropped at wr_en below - silently, because this bridge
     // revision has no flow control and no "you wrote past my window" signal.
     localparam LWIDTH = 22 + 32;                 // byte address, then data
-    localparam LDB    = 9;                       // 512 entries = 64 KB in flight
+    // DEPTH. One entry is ONE 32-bit word (address + data), so 512 entries was 2 KB of payload - not the
+    // 64 KB an earlier comment claimed, which is 32x out. Measured consequence: with the host at its
+    // documented pace (161.7 ns per word, tb_soc PACE=12) the whole 3.64 MiB image arrives; at PACE=10 the
+    // overflow tripwire fires and EVERY later write is dropped, so the image's tail - the audio section,
+    // which sits after the pool - never lands, and the mixer then plays whatever PSRAM held there before.
+    // That is the hardware symptom: picture perfect (the intro's pages are early in the pool) and the sound
+    // garbled from stale bytes. 4096 entries = 16 KB of payload buys 8x the burst absorption for 19 M10K.
+    localparam LDB    = 12;                      // 4096 entries = 16 KB of payload in flight
 
     wire              ld_full;
     wire              ld_empty;

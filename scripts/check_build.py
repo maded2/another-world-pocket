@@ -43,6 +43,14 @@ DEFAULT_ALLOW = [
     # rather than restructured, because moving the shift to the read side would only move the constant to
     # a register and hide the fact that the low byte is zero by construction.
     r'u_samp\|rd_q\[', 
+    # The VM's chapter request is a 16-bit resource id, but only 0x3E80..0x3E89 is a part: pr_* carries the
+    # whole id and the range check IS the contract, so bits 4,5,6,8,14,15 can never be set. Quartus only sees
+    # that now that pr_done has one driver (it had two, which a Verilator warning hid and Quartus refused).
+    r'u_rom\|pr_(s0|s1|stable|done)\[', 
+    # Byte addresses in this design are 22 bits wide (one 4 MiB die, which is also the loader's window), so
+    # the top bits of an address register are zero by construction: hb_fb/hb_pb are header u32s narrowed to
+    # 24 bits and audio_base_r is their sum. Quartus proves bit 23 constant and reports it as lost fanout.
+    r'(hb_fb|hb_pb|audio_base_r)\[2[23]\]', 
     r'aud_mclk',
     r'psram_cre',
     r'wr_addr\[2[01]',   # Quartus compacts bits: [20], [21] or [20,21]
