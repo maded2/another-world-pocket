@@ -153,6 +153,9 @@ worst-path:
 # Simulation: the Silice image carries iverilog and verilator. sim-write is the
 # two-second version of the ROM question; sim_rom is the whole 2 MB pack with every
 # access pattern the VM uses; sim_soc boots the design and captures frames.
+sim-audio:
+	@$(SILICE) scripts/sim_audio.sh
+
 sim-write:
 	@$(SILICE) scripts/sim_write.sh
 
@@ -208,7 +211,7 @@ ref-sim:
 # sim-dbg used to be missing from this list. Its absence is the reason the boot banner printed
 # "AW 1041a up" on builds 1040, 1041 and 1042: the bench that compares that line byte for byte had
 # been red for two releases, and a bench nobody runs is a bench nobody fixes.
-sim: sim-write sim-keys sim-rom sim-iv sim-reset sim-dbg sim-top
+sim: sim-write sim-keys sim-rom sim-iv sim-reset sim-dbg sim-top sim-audio
 
 # ------------------------------------------------------------------- package --
 # The pack .bin files are game content, not build output: they live in
