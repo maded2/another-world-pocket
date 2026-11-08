@@ -11,11 +11,15 @@
 // would stall every stop behind an index walk.
 `timescale 1ns/1ps
 
-module aw_audio_ch #(
-    parameter [23:0] AUDIO_BASE = 24'h2F0000
-) (
+module aw_audio_ch (
     input  wire        clk,
     input  wire        rst,
+    // Byte address of the audio section in the image being run. It is an INPUT, not a parameter: it is
+    // frames_base + pool_bytes from the image's own header, read at boot by core_top. A bitstream that
+    // carries the number baked in is a bitstream that only works with the one image it was built for -
+    // measured: a 2-part probe image built for a test needed its own bitstream because the audio had moved
+    // from 0x2F0000 to 0x118000, and a mismatch is indistinguishable from silence.
+    input  wire [23:0] audio_base,
     // request from the VM (one pulse, arguments held)
     input  wire        play,
     input  wire [15:0] res,
@@ -91,7 +95,7 @@ module aw_audio_ch #(
                         cmd_len  <= {8'd0, idx_plen};
                         cmd_lp   <= {8'd0, idx_ls};
                         cmd_ll   <= {8'd0, idx_ll};
-                        cmd_base <= AUDIO_BASE + idx_blob[23:0] + {16'd0, idx_poff};
+                        cmd_base <= audio_base + idx_blob[23:0] + {16'd0, idx_poff};
                     end else begin
                         cmd_len  <= 24'd0;        // unknown id: issue nothing useful, but do not hang
                         cmd_lp   <= 24'd0;

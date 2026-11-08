@@ -363,8 +363,8 @@ reg design_run = 1'b0;
         .r_pcm_off(idx_poff_w), .r_pcm_len(idx_plen_w),
         .r_loop_start(idx_ls_w), .r_loop_len(idx_ll_w));
 
-    aw_audio_ch #(.AUDIO_BASE(24'h2F0000)) u_audio_ch (
-        .clk(clk_core), .rst(rst_core),
+    aw_audio_ch u_audio_ch (
+        .clk(clk_core), .rst(rst_core), .audio_base(24'h2F0000),
         .play(snd_play_w & idx_load_done_w), .res(snd_res_w), .freq(snd_freq_w[5:0]),
         .vol(snd_vol_w), .ch(snd_ch_w[1:0]),
         .idx_start(idx_start_w), .idx_res(idx_res_w), .idx_busy(idx_busy_w), .idx_found(idx_found_w),

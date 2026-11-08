@@ -602,7 +602,7 @@ aw_reset_gen u_rstgen (
 // when the sequencer is idle. Holding the SoC in reset for a couple of milliseconds of boot is a smaller
 // price than an audio subsystem that may not be ready when the script asks for a sound - and it costs no
 // boot time at all in the common case, because the copy runs while the port is otherwise quiet.
-wire design_reset = ~design_run | rom_vm_restart | ~idx_load_done;
+wire design_reset = ~design_run | rom_vm_restart | ~audio_base_ok;
 
 ////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -1123,17 +1123,6 @@ assign cart_tran_bank0 = {1'b1, uart_line, uart_busy, 1'b1};
 // Everything audio waits for `idx_load_done`: the mixer would otherwise fetch from the same byte port the
 // loader is using, and the boot copy takes ~1.7 ms of a boot that is already seconds long.
 //
-// AUDIO_BASE = frames_base + pool_bytes of the image this bitstream is built for, from its header
-// (scripts/audio_addr_check.py proves the formula by reading the image at those addresses). It is a
-// build-time constant because aw_audio_ch adds it to every sample address, so a bitstream and an image
-// are a PAIR: the field default is the shipping 3.64 MiB image, and the 2-part probe image built for the
-// "does the audio chain work at all on hardware" experiment has its audio section at 0x118000.
-`ifdef AW_AUDIO_BASE
-localparam [23:0] AUDIO_BASE_VAL = `AW_AUDIO_BASE;
-`else
-localparam [23:0] AUDIO_BASE_VAL = 24'h2F0000;
-`endif
-
 wire [7:0]  snd_seq, snd_freq, snd_vol, snd_ch;
 wire [15:0] snd_res;
 wire [7:0]  mus_seq, mus_pos;
@@ -1219,10 +1208,11 @@ aw_audio_idx u_audio_idx (
 // AUDIO_BASE is frames_base + pool_bytes for the shipping image. scripts/audio_addr_check.py proves the
 // formula against build/aw-all-audio.bin (0x2F0000, 0 mismatches, checked on every audio build); it moves
 // whenever the layout does, so it is one constant here and a check there rather than a remembered number.
-aw_audio_ch #(.AUDIO_BASE(AUDIO_BASE_VAL)) u_audio_ch (
+aw_audio_ch u_audio_ch (
     .clk        ( clk_core       ),
     .rst        ( rst_core       ),
-    .play       ( snd_play & idx_load_done ),
+    .audio_base ( audio_base_r   ),   // derived from the image header at boot; see the header reader below
+    .play       ( snd_play & audio_base_ok ),
     .res        ( snd_res        ),
     .freq       ( snd_freq[5:0]  ),
     .vol        ( snd_vol        ),
@@ -1251,7 +1241,7 @@ aw_audio_ch #(.AUDIO_BASE(AUDIO_BASE_VAL)) u_audio_ch (
 aw_mixer u_mixer (
     .clk        ( clk_core       ),
     .rst        ( rst_core       ),
-    .tick       ( audio_tick & idx_load_done ),
+    .tick       ( audio_tick & audio_base_ok ),
     .out_sample ( mix_sample     ),
     .out_valid  ( mix_valid      ),
     .drop_ticks ( mix_drop_ticks ),
@@ -1274,28 +1264,79 @@ aw_mixer u_mixer (
     .rd_data    ( mix_rd_data    )
 );
 
-// ---- the one byte-port client, and the only clock crossing in the data path ----
-// The index loader and the mixer never overlap: the loader runs to completion before the mixer's tick is
-// enabled, so the shim serves one caller at a time by construction rather than by arbitration. The owner is
-// a REGISTER rather than a function of "busy", because the last byte's response arrives one cycle after
-// `busy` drops - and attributing that byte to the mixer would swallow it.
+// ---- ONE byte port, three callers, in a fixed order: index loader -> header read -> mixer ----
+// They never overlap, so this is a sequence rather than an arbiter: the loader runs to completion at boot,
+// then eight header bytes are read, and only then is the mixer's tick enabled. The owner is a REGISTER
+// rather than a function of "busy", because the last byte's response arrives one cycle after `busy` drops -
+// attributing that byte to the next caller would swallow it.
 wire        aud_rd_req;
 wire [23:0] aud_rd_addr;
 wire [7:0]  aud_rd_data;
 wire        aud_rd_valid;
-reg         aud_port_is_idx;
 
+reg [1:0]  aud_owner;                  // 0 = mixer, 1 = index loader, 2 = header reader
+wire       hdr_req;
+wire [23:0] hdr_addr;
+reg  [7:0] hdr_data;
+reg [2:0]  hb_st;
+reg [4:0]  hb_i;
+reg [31:0] hb_fb, hb_pb;
+reg [23:0] audio_base_r;
+reg        audio_base_ok;
+
+// AUDIO_BASE IS READ FROM THE IMAGE, NOT REMEMBERED. The builder appends the audio blob directly after the
+// game pool and records both offsets in the header it already writes: frames_base at bytes 16..19 and
+// pool_bytes at 20..23, little-endian, so audio_base = frames_base + pool_bytes (the formula
+// scripts/audio_addr_check.py proves by reading the image at those addresses). Baking the number into the
+// bitstream makes a bitstream and an image a pair, and a mismatch is indistinguishable from silence - which
+// is what a hardware round trip cost: the 2-part probe image has its audio at 0x118000, not 0x2F0000.
 always @(posedge clk_core) begin
-    if (rst_core)            aud_port_is_idx <= 1'b0;
-    else if (idx_load_start) aud_port_is_idx <= 1'b1;
-    else if (idx_load_done)  aud_port_is_idx <= 1'b0;
+    if (rst_core) begin
+        hb_st <= 3'd0; hb_i <= 5'd0; hb_fb <= 32'd0; hb_pb <= 32'd0;
+        audio_base_r <= 24'd0; audio_base_ok <= 1'b0;
+    end else begin
+        if (aud_rd_valid && (aud_owner == 2'd2)) hdr_data <= aud_rd_data;
+        case (hb_st)
+        3'd0: if (idx_load_done) begin
+                  hb_i  <= 5'd0;
+                  hb_st <= 3'd1;
+              end
+        3'd1: hb_st <= 3'd2;
+        3'd2: if (aud_rd_valid) begin
+                  if (hb_i < 5'd4) hb_fb[{hb_i[1:0], 3'b000} +: 8] <= aud_rd_data;
+                  else             hb_pb[{hb_i[1:0], 3'b000} +: 8] <= aud_rd_data;
+                  hb_st <= 3'd3;
+              end
+        3'd3: if (hb_i == 5'd7) begin
+                  audio_base_r  <= hb_fb[23:0] + hb_pb[23:0];
+                  audio_base_ok <= 1'b1;
+                  hb_st         <= 3'd4;
+              end else begin
+                  hb_i  <= hb_i + 5'd1;
+                  hb_st <= 3'd1;
+              end
+        default: ;
+        endcase
+    end
 end
 
-assign aud_rd_req     = aud_port_is_idx ? idx_ldr_req  : mix_rd_req;
-assign aud_rd_addr    = aud_port_is_idx ? idx_ldr_addr : mix_rd_addr;
-assign idx_ldr_valid  = aud_rd_valid &  aud_port_is_idx;
+assign hdr_addr = 24'd16 + {19'd0, hb_i};
+assign hdr_req  = (hb_st == 3'd1);
+
+always @(posedge clk_core) begin
+    if (rst_core)                                aud_owner <= 2'd2;
+    else if (idx_load_start)                     aud_owner <= 2'd1;
+    else if (idx_load_done && aud_owner == 2'd1) aud_owner <= 2'd2;
+    else if (audio_base_ok)                      aud_owner <= 2'd0;
+end
+
+assign aud_rd_req     = (aud_owner == 2'd1) ? idx_ldr_req  :
+                        (aud_owner == 2'd2) ? hdr_req      : mix_rd_req;
+assign aud_rd_addr    = (aud_owner == 2'd1) ? idx_ldr_addr :
+                        (aud_owner == 2'd2) ? hdr_addr     : mix_rd_addr;
+assign idx_ldr_valid  = aud_rd_valid & (aud_owner == 2'd1);
 assign idx_ldr_data   = aud_rd_data;
-assign mix_rd_valid   = aud_rd_valid & ~aud_port_is_idx;
+assign mix_rd_valid   = aud_rd_valid & (aud_owner == 2'd0);
 assign mix_rd_data    = aud_rd_data;
 
 wire        aud_req;

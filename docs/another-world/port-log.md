@@ -3225,3 +3225,29 @@ but it is exactly the failure shape to look for on hardware.
 
 Not done: the music tracker, the hardware gate, and a harness that keeps running long enough to reach the
 11 looping sounds and modules 137/138.
+
+### Hardware: the audio chain works; the 3.64 MiB dataslot is what does not (2026-11-09)
+
+AW 1047 (the shipping audio build, 3.64 MiB image) on the Pocket: **picture perfect, no sound at all**.
+AW 1048 - a probe identity with a 2-part image (1.79 MiB) carrying the same audio blob - **plays the
+intro's sounds**. So the chain is alive end to end on hardware: index load, lookup, mixer, the byte
+crossing, I2S, and the APF audio pins all work. What fails is the *big* image.
+
+Why that is not obvious from the symptom: the audio blob is appended after the game pool, so it starts at
+0x2F0000, exactly where the pool ends, while the index the core copies out is at 0x1000 - inside the first
+page. A truncated upload therefore leaves the index intact and the graphics fine (the intro's pages are
+early in the pool), and the mixer plays bytes that are not there. PSRAM that was never written reads 0xFF,
+and 0xFF as signed 8-bit through the volume divider is exactly zero:
+
+    b = -1 -> interpolated -1 -> (-1 * 45) >> 6 = 0
+
+so a missing audio section and a dead audio path sound identical. That is why the probe image was built
+before touching the RTL.
+
+The probe also cost one avoidable round trip: its audio sits at 0x118000, so it needed its own bitstream
+because AUDIO_BASE was a build-time constant. It is now derived at boot from the image header
+(frames_base + pool_bytes, bytes 16..23), so one bitstream runs any image and a size sweep needs no rebuild.
+
+Next: AW 1049 (derived base) against both images. Big image silent + small image sounding = the dataslot
+stops somewhere between 1.79 and 3.64 MiB, and the two ways forward are a smaller image (parts + audio under
+the limit) or a second dataslot.

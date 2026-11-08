@@ -54,7 +54,7 @@ module tb_audio_ch;
                        .r_pcm_off(idx_poff), .r_pcm_len(idx_plen),
                        .r_loop_start(idx_ls), .r_loop_len(idx_ll));
 
-    aw_audio_ch #(.AUDIO_BASE(ABASE)) u_ch(.clk(clk), .rst(rst), .play(play), .res(res),
+    aw_audio_ch u_ch(.clk(clk), .rst(rst), .audio_base(ABASE), .play(play), .res(res),
                        .freq(freq), .vol(vol), .ch(ch),
                        .idx_start(idx_start), .idx_res(idx_res), .idx_busy(idx_busy), .idx_found(idx_found),
                        .idx_type(idx_type), .idx_blob(idx_blob), .idx_poff(idx_poff),
