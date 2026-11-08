@@ -311,3 +311,45 @@ the bench; if it fails, it is in `aw_rom`'s new chapter logic.
 Why this matters beyond the bug: #36, #37's integration and the tracker (#39) all build on the paged path, so
 a 50 % loss of bytecode delivery would have been inherited by every audio test as "mysterious starvation".
 The measurement that found it was the plain part-1 run, not any audio bench.
+
+### Resolved: the "regression" was the chapter switch firing - both features confirmed
+
+Bisect, in two runs:
+
+| code under test | bytes to VM | fill shifted | verdict |
+|---|---|---|---|
+| HEAD (`aw_rom` + `tb_soc` new) | 23,021 | 509 | FAIL |
+| `f69583e` both files | 41,956 | 0 | PASS |
+| **new `aw_rom` + old `tb_soc`** | **41,956** | **0** | **PASS** |
+
+So the RTL is innocent and the bench was at fault - and the only *behavioural* difference in the new bench is
+that it connects the VM's part request to `aw_rom` (`vm_part_req`), where the old one left the input
+unconnected and therefore zero. Everything else added there is observation.
+
+That connection is the whole story, because **part 1's own bytecode asks for part 2 during the run**:
+
+```
+op_updateMemList(0x3E82) at 0x9B4   -> part 2
+op_updateMemList(0x3E82) at 0x9C6   -> part 2
+```
+
+and the control-flow walk of part 1 reaches `0x9B8` through a `condJmp` at `0x0087`, so that request is on
+the executed path within the first frames. With the input connected, `aw_rom` did exactly what it was built
+to do: it moved `view_part` to 2 and pulsed the restart.
+
+**What that proves is worth more than the bug report:**
+
+1. The game-driven chapter change works end to end on the real VM - the request is issued by the script, crosses
+   into `aw_rom`, and moves the page table. That is #35 plus the whole `pm_part_req` chain, confirmed by the
+   game itself rather than by an injection.
+2. The #31 blocker is real and now has its clearest symptom: the VM *resumes* rather than re-reading the
+   trailer, so after the switch it keeps executing part 1's bytecode over part 2's bytes. That is exactly the
+   509 shifted fill writes with `gaps=0` and `rewinds=0` - the stream never broke, **the view changed
+   underneath it**, which is a different failure shape from the 1040/1041 resume-policy faults and must not be
+   diagnosed as one.
+3. Any bench that runs a part to the point where the script asks for the next one must either expect the
+   switch or suppress it. This is now recorded so the next person does not re-derive "the paged path lost half
+   its throughput".
+
+So: no regression, no audio fault, and the two half-built features together behave exactly as their separate
+diagnoses predicted.
