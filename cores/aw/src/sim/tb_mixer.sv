@@ -13,9 +13,31 @@ module tb_mixer;
     // ---- the byte RAM the mixer reads (registered read, one cycle of latency) ----
     reg  [7:0] ram [0:255];
     reg  [7:0] rd_data_r;
+    reg        rd_valid_r = 0;
+    reg  [23:0] rd_addr_r;
     wire [23:0] rd_addr;
+    wire        rd_req;
 
-    always @(posedge clk) rd_data_r <= ram[rd_addr[7:0]];
+    // DELAYED responder: the real path is a clock-domain handshake into aw_rom's sequencer and a PSRAM
+    // access, so the byte arrives many cycles after the request and not always in the same number. Modelling
+    // a one-cycle RAM here would pass a design that cannot work - the preconditions must match the field path.
+    localparam integer DELAY = 3;
+    reg [3:0] wait_cnt = 0;
+    reg       pending = 0;
+    always @(posedge clk) begin
+        rd_valid_r <= 1'b0;
+        if (rd_req && !pending && !rd_valid_r) begin
+            rd_addr_r <= rd_addr;
+            pending   <= 1'b1;
+            wait_cnt  <= DELAY;
+        end else if (pending) begin
+            if (wait_cnt == 0) begin
+                rd_data_r  <= ram[rd_addr_r[7:0]];
+                rd_valid_r <= 1'b1;
+                pending    <= 1'b0;
+            end else wait_cnt <= wait_cnt - 1;
+        end
+    end
 
     // ---- command interface ----
     reg        cmd_valid = 0;
@@ -42,7 +64,7 @@ module tb_mixer;
         .cmd_valid(cmd_valid), .cmd_ch(cmd_ch), .cmd_freq(cmd_freq), .cmd_vol(cmd_vol),
         .cmd_len(cmd_len), .cmd_loop_pos(cmd_loop_pos), .cmd_loop_len(cmd_loop_len),
         .cmd_data_base(cmd_data_base),
-        .rd_addr(rd_addr), .rd_data(rd_data_r)
+        .rd_addr(rd_addr), .rd_req(rd_req), .rd_valid(rd_valid_r), .rd_data(rd_data_r)
     );
 
     integer fd, n, t, i;

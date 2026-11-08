@@ -39,8 +39,16 @@ module aw_mixer (
     input  wire [23:0] cmd_loop_len,       // 0 = play once
     input  wire [23:0] cmd_data_base,      // byte address of sample 0 in the caller's memory
 
-    // Sample fetch: addresses are presented one per cycle, data returns the NEXT cycle.
+    // Sample fetch: REQUEST/VALID, not an implied one-cycle RAM.
+    //
+    // The first version hardcoded the latency in its wait states, which was correct for the bench's RAM and
+    // wrong for the real path: a byte goes mixer -> clock-domain handshake -> aw_rom's sequencer -> PSRAM
+    // (~12 clk_psram cycles) -> handshake back, roughly 24+ clk_core cycles, and VARIABLE because audio is
+    // served only when the PSRAM port is idle. A fixed wait cannot express that, and a bench whose memory
+    // answers instantly would have passed a design that cannot work on hardware.
     output reg  [23:0] rd_addr,
+    output reg         rd_req,       // held until rd_valid
+    input  wire        rd_valid,     // rd_data is the byte for the last rd_addr requested
     input  wire [7:0]  rd_data
 );
 
@@ -134,8 +142,8 @@ module aw_mixer (
     // early and read the PREVIOUS channel's bytes: the S_CALC probe showed channel 1 receiving b1=10 (which
     // is ram[1], channel 0's second byte) and b2=-128 (its own first byte). The wait states below are not
     // decoration - each one is exactly the latency of one stage.
-    localparam [3:0] S_IDLE = 4'd0, S_RD1 = 4'd1, S_W1 = 4'd2, S_RD2 = 4'd3,
-                     S_W2 = 4'd4, S_W3 = 4'd5, S_CALC = 4'd6, S_NEXT = 4'd7, S_OUT = 4'd8;
+    localparam [3:0] S_IDLE = 4'd0, S_A1 = 4'd1, S_W1 = 4'd2, S_A2 = 4'd3,
+                     S_W2 = 4'd4, S_CALC = 4'd5, S_NEXT = 4'd6, S_OUT = 4'd7;
 
     reg [3:0]  st;
     reg [1:0]  cur_ch;
@@ -186,6 +194,7 @@ module aw_mixer (
             st         <= S_IDLE;
             out_sample <= 8'sd0;
             rd_addr    <= 24'd0;
+            rd_req     <= 1'b0;
             running    <= 9'sd0;
             cur_ch     <= 2'd0;
             for (i = 0; i < 4; i = i + 1) begin
@@ -219,42 +228,40 @@ module aw_mixer (
             S_IDLE: if (tick) begin
                         running <= 9'sd0;
                         cur_ch  <= 2'd0;
-                        st      <= S_RD1;
+                        st      <= S_A1;
                     end
-            S_RD1: begin
+            S_A1: begin
                         // p1 and ilc are sampled BEFORE the position advances, exactly as the C does.
                         p1   = ch_pos[cur_ch] >> 8;
                         ilc  = ch_pos[cur_ch][7:0];
-                        // p2 is the next sample, or - when this tick sits on the last sample of a loop -
-                        // the loop position, because mixer.cpp assigns loopPos to the position AND uses
-                        // it as p2 in that same iteration. The pair must be fetched before the position
-                        // is advanced, so it is resolved here rather than later.
+                        // p2 is the next sample, or the loop position when this tick sits on the last sample
+                        // of a loop - mixer.cpp assigns loopPos to the position AND uses it as p2 there.
                         if (ch_looplen[cur_ch] != 0) begin
                             if (p1 == (ch_looppos[cur_ch] + ch_looplen[cur_ch] - 1)) p2 = ch_looppos[cur_ch];
                             else                                                       p2 = p1 + 24'd1;
                         end else begin
-                            if (p1 >= ch_len[cur_ch] - 24'd1) p2 = 24'd0;   // never used: the channel stops
+                            if (p1 >= ch_len[cur_ch] - 24'd1) p2 = 24'd0;   // unused: the channel stops
                             else                              p2 = p1 + 24'd1;
                         end
-                        end_now = (ch_looplen[cur_ch] == 0) && (p1 == (ch_len[cur_ch] - 24'd1));
-                        b1   <= 8'd0;
-                        b2   <= 8'd0;
-                        rd_addr <= ch_base[cur_ch] + p1;
-                        st   <= S_W1;
+                        end_now  = (ch_looplen[cur_ch] == 0) && (p1 == (ch_len[cur_ch] - 24'd1));
+                        rd_addr  <= ch_base[cur_ch] + p1;
+                        rd_req   <= 1'b1;
+                        st       <= S_W1;
                     end
-            S_W1: begin
-                        // rd_addr is now visible to the RAM; nothing to capture yet
-                        st <= S_RD2;
-                    end
-            S_RD2: begin
-                        b1 <= rd_data;                       // the byte at p1, two states after it was issued
+            S_W1: if (rd_valid) begin
+                        b1      <= rd_data;
+                        rd_req  <= 1'b0;
                         rd_addr <= ch_base[cur_ch] + p2;
-                        st <= S_W2;
+                        st      <= S_A2;
                     end
-            S_W2: st <= S_W3;
-            S_W3: begin
-                        b2 <= rd_data;                       // the byte at p2
-                        st <= S_CALC;
+            S_A2: begin
+                        rd_req <= 1'b1;
+                        st     <= S_W2;
+                    end
+            S_W2: if (rd_valid) begin
+                        b2     <= rd_data;
+                        rd_req <= 1'b0;
+                        st     <= S_CALC;
                     end
             S_CALC: begin
                         if (ch_active[cur_ch] && !end_now) begin
@@ -284,7 +291,7 @@ module aw_mixer (
                         if (cur_ch == 2'd3) st <= S_OUT;
                         else begin
                             cur_ch <= cur_ch + 2'd1;
-                            st     <= S_RD1;
+                            st     <= S_A1;
                         end
                     end
             S_OUT: begin
