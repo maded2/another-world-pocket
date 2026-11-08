@@ -1,6 +1,7 @@
 # Sound effects and music: what the data is, and how to get it out of the Pocket
 
-Status: **implemented and verified in simulation for sound effects; music tracker and hardware not done.**
+Status: **sound effects implemented, verified in simulation, BUILT and PROVEN ON HARDWARE (AW 1050).**
+The music tracker and the music half of the hardware gate are still open.
 Every number below was measured from `gamedata/memlist.bin`, the pinned upstream sources in
 `ports/another-world/upstream/BUILD/Another-World-Bytecode-Interpreter/src/`, or the benches named next to it.
 

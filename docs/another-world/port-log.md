@@ -3251,3 +3251,26 @@ because AUDIO_BASE was a build-time constant. It is now derived at boot from the
 Next: AW 1049 (derived base) against both images. Big image silent + small image sounding = the dataslot
 stops somewhere between 1.79 and 3.64 MiB, and the two ways forward are a smaller image (parts + audio under
 the limit) or a second dataslot.
+
+### RESOLVED on hardware: the 2 KB upload buffer was the fault (2026-11-09)
+
+AW 1050 (loader FIFO 2 KB -> 16 KB) with the full 3.64 MiB image: **the intro's sound effects play.** So the
+chain was right all along and the dataslot was being truncated - and this also answers the question that has
+been open since the paged work began: **a 3.64 MiB dataslot does arrive on the Pocket.** It arrived here only
+once the loader could absorb a burst.
+
+The trail, because every step looked like something else:
+
+1. AW 1047 (3.64 MiB): picture perfect, **silent**.
+2. AW 1048 (1.79 MiB probe, own bitstream): **sounds clean**. Chain proven; image implicated.
+3. AW 1049 (derived base, same 2 KB buffer, 3.64 MiB): **garbled** - the audio region held stale PSRAM from
+   the previous launch, and the mixer played it. Same fault as step 1, different leftovers: 0xFF reads
+   through the volume divider as exactly zero, other leftovers read as noise.
+4. aw_rom's loader FIFO was `LDB = 9` with one 32-bit word per entry: **2 KB**, not the 64 KB the comment
+   beside it claimed. On overflow `ld_abort` drops every later write for the rest of the power cycle, so the
+   tail - where the audio lives - never landed.
+5. `LDB = 12` (16 KB): tb_soc at PACE=10 stops truncating at byte 2,136,508 and uploads byte-exact; hardware
+   agrees.
+
+The lesson worth keeping: the loader has no flow control from the framework, so the buffer *is* the defence,
+and its size was documented wrongly by a factor of 32 in the one comment anyone would read.
