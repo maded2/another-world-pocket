@@ -171,3 +171,33 @@ control for picture-only behaviour.
 * **Tracker state is small but not free.** 15 instrument descriptors, a 0x80-byte order table, 4 channel
   contexts and the pattern cursor must survive a part change without a sweep-level stall; keep it in
   registers plus one small RAM, and do not let the tracker make a PSRAM read it cannot afford.
+
+### First real audio events, harvested from the intro (2026-11-08)
+
+With the VM patch (#35) and a per-event monitor in `tb_soc` (#42), a 60-frame paged part-1 run issued:
+
+```
+MUSEVT 0 num=0    delay=0     pos=0  frame=7     <- the documented "stop music"
+MUSEVT 1 num=7    delay=15700 pos=0  frame=7     <- module 7, i.e. a real RT_MUSIC entry
+SNDEVT 0 res=8    freq=1  vol=45 ch=3 frame=24
+SNDEVT 1 res=8    freq=5  vol=45 ch=2 frame=24
+SNDEVT 2 res=9    freq=20 vol=30 ch=0 frame=96
+SNDEVT 3 res=9    freq=20 vol=63 ch=1 frame=96
+```
+
+Three things this settles at once:
+
+1. **The opcodes really execute** - the argument reads added in #35 carry real values into the SoC, so
+   #35 is proven end to end rather than only in the netlist.
+2. **The ranges are legal** - `res` 8 and 9 are memlist entries, `freq` 1/5/20 are below the mixer's
+   `< 40` assertion, `ch` 0..3. That is the check the invalid byte scan failed with freq 255 and
+   channel 255, so this is also a positive control on the decode.
+3. **The music requirement is concrete**: the intro starts module **7** with `delay=15700`, `pos=0`.
+   Module 7 is indeed one of the three `RT_MUSIC` entries (memlist 7, 137, 138). The tempo override is
+   therefore load-bearing from the first cue - `15700 * 60 / 7050` = 134 ms per event, so the tracker
+   must honour the opcode's delay argument rather than the module header's, exactly as D2 assumed.
+
+Note `delay=0` with `num=0` is the "stop" form, so the tracker's stop path is exercised immediately too.
+
+The harvest is per-event, not sampled: a 10 ms diagnostic interval can contain two sounds, and a sampled
+monitor would report the second twice. The VM's sequence counter exists for exactly this.

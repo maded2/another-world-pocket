@@ -353,6 +353,38 @@ reg design_run = 1'b0;
     // never generated" look identical, and they are different bugs in different files.
     int       rstr_cnt = 0;
     reg       rstr_d = 1'b0;
+    // ---- audio event harvest (#42) ----
+    // Every event, not a 10 ms sample: two sounds can fire inside one diagnostic interval and a sampled
+    // monitor would silently report the later one twice. The VM publishes a sequence number precisely so
+    // a repeated identical request is visible, so the change of that number is the event.
+    int       snd_evt = 0, mus_evt = 0;
+    reg [7:0] snd_seq_d = 8'd0, mus_seq_d = 8'd0;
+    always @(posedge clk_core) begin
+        snd_seq_d <= snd_seq_w;
+        mus_seq_d <= mus_seq_w;
+        if (snd_seq_w != snd_seq_d) begin
+            $display("SNDEVT %0d res=%0d freq=%0d vol=%0d ch=%0d frame=%0d",
+                     snd_evt, snd_res_w, snd_freq_w, snd_vol_w, snd_ch_w, frames);
+            $fflush;
+            snd_evt = snd_evt + 1;
+            // The ranges that exposed the invalid byte scan: a sound id must be a real memlist entry
+            // (146 of them), the mixer asserts freq < 40, and there are 4 channels.
+            if (snd_res_w >= 146 || snd_freq_w >= 40 || snd_ch_w > 3) begin
+                $display("SNDEVT BAD RANGE - the decode is wrong, not the game");
+                errors = errors + 1;
+            end
+        end
+        if (mus_seq_w != mus_seq_d) begin
+            $display("MUSEVT %0d num=%0d delay=%0d pos=%0d frame=%0d",
+                     mus_evt, mus_num_w, mus_delay_w, mus_pos_w, frames);
+            $fflush;
+            mus_evt = mus_evt + 1;
+            if (mus_num_w >= 146 || mus_pos_w > 63) begin
+                $display("MUSEVT BAD RANGE - the decode is wrong, not the game");
+                errors = errors + 1;
+            end
+        end
+    end
     always @(posedge clk_core) begin
         rstr_d <= vm_restart_w;
         if (vm_restart_w & ~rstr_d) rstr_cnt = rstr_cnt + 1;
