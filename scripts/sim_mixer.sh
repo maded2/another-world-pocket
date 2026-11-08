@@ -27,9 +27,10 @@ build "$WORK"
 # thing it is testing is the same fault as sim_dbg.sh filtering out its own GOT/WANT diff.
 "$ROOT/build/obj-mixer/tb_mixer"
 
-python3 - "$WORK" <<'PY'
+compare() {   # compare <dir> <expect: pass|fail>
+python3 - "$1" "$2" <<'PY'
 import sys
-d = sys.argv[1]
+d, mode = sys.argv[1], sys.argv[2]
 exp = [int(x) for x in open(d + "/expect.hex")]
 act = [int(x) for x in open(d + "/actual.hex")]
 bad = [(i, e, a) for i, (e, a) in enumerate(zip(exp, act)) if e != a]
@@ -40,6 +41,22 @@ if bad:
     print("FAIL - %d samples differ" % len(bad))
     for i, e, a in bad[:8]:
         print("   tick %d: ref %d  rtl %d" % (i, e, a))
-    sys.exit(1)
+    sys.exit(0 if mode == "fail" else 1)
 print("PASS - RTL matches the reference bit-exactly over %d ticks" % len(exp))
+sys.exit(1 if mode == "fail" else 0)
 PY
+}
+
+compare "$WORK" pass || { echo "error: the real scenario did not match" >&2; exit 1; }
+
+# The negative control. The comparison above is only worth something if it can reject a one-sample error,
+# so the same RTL is run against a scenario whose LAST expected sample is off by one. It must be rejected.
+build "$BAD"
+"$ROOT/build/obj-mixer/tb_mixer" > /dev/null
+echo "--- negative control (one expected sample perturbed) ---"
+if compare "$BAD" fail; then
+    echo "OK - the comparison rejects a one-sample error"
+else
+    echo "error: the comparison accepted a perturbed scenario - it is decoration" >&2
+    exit 1
+fi

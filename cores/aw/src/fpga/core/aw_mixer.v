@@ -142,6 +142,12 @@ module aw_mixer (
     reg [23:0] p1, p2;
     reg [7:0]  ilc;
     reg [7:0]  b1, b2;
+    // A non-looping channel whose next sample is the last one contributes NOTHING: mixer.cpp tests
+    // `p1 == chunk.len - 1` and breaks out of the per-sample loop BEFORE interpolating, so the final byte
+    // is never played. Without this the RTL emitted one extra sample per one-shot, which is exactly the
+    // single off-by-one that remained at tick 55 (reference 55, RTL 54 - channel 3 contributing -1 where
+    // the reference stops it first).
+    reg        end_now;
     reg signed [8:0] running;         // the mix accumulator, clamped to int8 on every add
     // The interpolated sample, computed with every operand explicitly signed so the expression cannot be
     // widened to unsigned. (b1*(255-ilc) + b2*ilc) >> 8 then wraps to 8 bits, as the C int8_t store does.
@@ -195,12 +201,6 @@ module aw_mixer (
         end else begin
             // ---- commands, honoured any time ----
             if (cmd_valid) begin
-                // TEMPORARY PROBE (remove before this module is used): what the mixer itself sees and
-                // computes at the write cycle. The bench already shows freq=20 arriving, and no table
-                // entry can produce the 38 that ends up in ch_inc, so this separates "computed 56 but
-                // written somewhere else" from "computed the wrong thing".
-                $display("  MIXCMD ch=%0d freq=%0d inc=%0d vol=%0d len=%0d",
-                         cmd_ch, cmd_freq, rate_inc(cmd_freq), cmd_vol, cmd_len);
                 if (cmd_vol == 8'd0) begin
                     ch_active[cmd_ch] <= 1'b0;            // vol 0 is a STOP, not a silent play
                 end else begin
@@ -236,6 +236,7 @@ module aw_mixer (
                             if (p1 >= ch_len[cur_ch] - 24'd1) p2 = 24'd0;   // never used: the channel stops
                             else                              p2 = p1 + 24'd1;
                         end
+                        end_now = (ch_looplen[cur_ch] == 0) && (p1 == (ch_len[cur_ch] - 24'd1));
                         b1   <= 8'd0;
                         b2   <= 8'd0;
                         rd_addr <= ch_base[cur_ch] + p1;
@@ -256,10 +257,7 @@ module aw_mixer (
                         st <= S_CALC;
                     end
             S_CALC: begin
-                        $display("  CALC ch=%0d act=%b ilc=%0d b1=%0d b2=%0d interp=%0d scaled=%0d run_in=%0d",
-                                 cur_ch, ch_active[cur_ch], ilc, $signed(b1), $signed(b2),
-                                 interp, scale_vol(interp, {1'b0, ch_vol[cur_ch]}), running);
-                        if (ch_active[cur_ch]) begin
+                        if (ch_active[cur_ch] && !end_now) begin
                             // SIGN-EXTEND b1/b2. They are int8 samples; zero-extending them turns -128 into
                             // +128, and mixing signed with unsigned operands makes the whole expression
                             // unsigned in Verilog, which is why this accumulated 0 before.
