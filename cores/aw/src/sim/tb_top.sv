@@ -365,7 +365,11 @@ module tb_top;
         // The window must start AFTER the audio index has been copied out of the image: before that the
         // mixer is deliberately held off (its byte port belongs to the loader), so measuring samples then
         // would report zero for a working chain. Measured the other way first, and it did.
-        if (!in_window && !win_done && pix_cnt > FRAME_CYCLES * 4 && u_core.idx_load_done) begin
+        // ... and after the I2S stage has PRIMED: it holds LRCK low until the sample FIFO has four entries
+        // (83 us), so a window that opens during priming counts three fewer rises and reports a rate error
+        // that is not there. Measured: 477 rises instead of 480.
+        if (!in_window && !win_done && pix_cnt > FRAME_CYCLES * 4 && u_core.idx_load_done
+            && u_core.u_audio_i2s.primed) begin
             in_window  <= 1'b1;
             mclk_edges <= 0;
             lrck_rise  <= 0;

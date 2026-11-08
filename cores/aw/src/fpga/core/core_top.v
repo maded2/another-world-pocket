@@ -1123,6 +1123,17 @@ assign cart_tran_bank0 = {1'b1, uart_line, uart_busy, 1'b1};
 // Everything audio waits for `idx_load_done`: the mixer would otherwise fetch from the same byte port the
 // loader is using, and the boot copy takes ~1.7 ms of a boot that is already seconds long.
 //
+// AUDIO_BASE = frames_base + pool_bytes of the image this bitstream is built for, from its header
+// (scripts/audio_addr_check.py proves the formula by reading the image at those addresses). It is a
+// build-time constant because aw_audio_ch adds it to every sample address, so a bitstream and an image
+// are a PAIR: the field default is the shipping 3.64 MiB image, and the 2-part probe image built for the
+// "does the audio chain work at all on hardware" experiment has its audio section at 0x118000.
+`ifdef AW_AUDIO_BASE
+localparam [23:0] AUDIO_BASE_VAL = `AW_AUDIO_BASE;
+`else
+localparam [23:0] AUDIO_BASE_VAL = 24'h2F0000;
+`endif
+
 wire [7:0]  snd_seq, snd_freq, snd_vol, snd_ch;
 wire [15:0] snd_res;
 wire [7:0]  mus_seq, mus_pos;
@@ -1208,7 +1219,7 @@ aw_audio_idx u_audio_idx (
 // AUDIO_BASE is frames_base + pool_bytes for the shipping image. scripts/audio_addr_check.py proves the
 // formula against build/aw-all-audio.bin (0x2F0000, 0 mismatches, checked on every audio build); it moves
 // whenever the layout does, so it is one constant here and a check there rather than a remembered number.
-aw_audio_ch #(.AUDIO_BASE(24'h2F0000)) u_audio_ch (
+aw_audio_ch #(.AUDIO_BASE(AUDIO_BASE_VAL)) u_audio_ch (
     .clk        ( clk_core       ),
     .rst        ( rst_core       ),
     .play       ( snd_play & idx_load_done ),
