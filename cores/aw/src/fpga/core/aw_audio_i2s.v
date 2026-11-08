@@ -86,6 +86,12 @@ module aw_audio_i2s (
     reg [63:0] nx;          // best available next frame: updated only when a sample arrives, so an underrun
                             // repeats the previous sample instead of going to silence
     reg        got;         // a pop was requested at slot 0 and its value is due
+    // The two 48 kHz timebases are independent, so with the FIFO starting EMPTY any phase jitter empties it
+    // again and the frame repeats the previous sample. Measured in tb_soc: 4,124 repeats in 88,000 frames
+    // (4.7%). Priming to four samples (83 us of latency, inaudible) leaves the level high enough that the
+    // jitter never reaches zero, which is the difference between "buffer" and "no buffer".
+    reg        primed;
+    localparam integer PRIME_LEVEL = 4;
     wire [5:0] slot = c[7:2];
 
     always @(posedge clk_74a) begin
@@ -108,6 +114,14 @@ module aw_audio_i2s (
                     audio_dac  <= 1'b0;
                     audio_sclk <= 1'b0;
                     underruns  <= 16'd0;
+                    primed     <= 1'b0;
+                end else if (!primed) begin
+                    // hold the waveform at zero until there is something to play
+                    audio_sclk <= 1'b0;
+                    audio_dac  <= 1'b0;
+                    audio_lrck <= 1'b0;
+                    c          <= 8'd0;
+                    if (fifo_level >= PRIME_LEVEL) primed <= 1'b1;
                 end else begin
                     c <= c + 8'd1;
                     if (c[1:0] == 2'd0) begin

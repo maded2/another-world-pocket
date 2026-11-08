@@ -87,7 +87,10 @@ def main(paths):
 
     print("\ndistinct music (num, delay, pos): %d" % len(music))
     for (num, delay, pos), n in sorted(music.items()):
-        rate = "%.0f ms/event" % (delay * 60.0 / 7050) if num and delay else "-"
+        # sfxplayer.cpp does `_delay * 60 / 7050` in INTEGER ms, and 15700 gives 133 - not the 134 a rounded
+        # float reports. The plan carried the rounded number for a day and the tracker had to be told
+        # otherwise, so print what the original actually runs at.
+        rate = "%d ms/event" % (delay * 60 // 7050) if num and delay else "-"
         print("   num=%-3d delay=%-6d pos=%-2d  x%d  %s" % (num, delay, pos, n, rate))
     print("  music modules actually started: %s  (RT_MUSIC entries are 7, 137, 138)" % sorted(used_mus))
 

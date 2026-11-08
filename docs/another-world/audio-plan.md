@@ -502,6 +502,15 @@ MCLK/SCLK/LRCK measured over a fixed window.
 * The four audio modules were not in `aw.qsf` at all: no audio build had ever been attempted, so "it
   simulates" was the whole of the evidence until now.
 
+### The I2S FIFO had no depth (measured, fixed)
+
+The first `tb_soc` run with audio reported **4,124 underruns in 88,000 frames** (4.7%): the frame clock asked
+for a sample the FIFO did not have. Both timebases are exactly 48 kHz on average, but they are independent, so
+with the FIFO starting EMPTY every phase wobble walks it back to zero and the frame repeats the previous
+sample. The stage now waits for four samples before it starts shifting (83 us of latency, inaudible) and the
+same run reports **0 underruns**. "Buffer" and "no buffer" are the difference between 4.7% sample repeats and
+none, and the counter in `aw_audio_i2s` is what made it visible instead of an impression.
+
 ### What `tb_top` now proves
 
 The old check was "the DAC is silent for the whole run", which the template's constant-zero shifter passed -

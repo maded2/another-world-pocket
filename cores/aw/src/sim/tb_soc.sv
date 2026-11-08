@@ -377,7 +377,8 @@ reg design_run = 1'b0;
     aw_mixer u_mixer (
         .clk(clk_core), .rst(rst_core), .tick(audio_tick_w & idx_load_done_w),
         .out_sample(mix_sample_w), .out_valid(mix_valid_w), .drop_ticks(mix_drop_ticks_w),
-        .cmd_valid(aud_cmd_valid_w), .cmd_ch(aud_cmd_ch_w), .cmd_freq(aud_cmd_freq_w),
+        .cmd_valid(aud_cmd_valid_w), .cmd_touch(1'b1), .cmd_use_inc(1'b0), .cmd_inc(9'd0),
+        .cmd_ch(aud_cmd_ch_w), .cmd_freq(aud_cmd_freq_w),
         .cmd_vol(aud_cmd_vol_w), .cmd_len(aud_cmd_len_w), .cmd_loop_pos(aud_cmd_lp_w),
         .cmd_loop_len(aud_cmd_ll_w), .cmd_data_base(aud_cmd_base_w),
         .rd_addr(mix_rd_addr_w), .rd_req(mix_rd_req_w), .rd_valid(mix_rd_valid_w), .rd_data(mix_rd_data_w));

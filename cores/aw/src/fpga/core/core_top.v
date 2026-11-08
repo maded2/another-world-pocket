@@ -1245,6 +1245,11 @@ aw_mixer u_mixer (
     .out_valid  ( mix_valid      ),
     .drop_ticks ( mix_drop_ticks ),
     .cmd_valid  ( aud_cmd_valid  ),
+    // The effects path always (re)starts a channel and selects its rate by table index. The music player
+    // (not instantiated yet) is the only user of the other two modes.
+    .cmd_touch  ( 1'b1           ),
+    .cmd_use_inc( 1'b0           ),
+    .cmd_inc    ( 9'd0           ),
     .cmd_ch     ( aud_cmd_ch     ),
     .cmd_freq   ( aud_cmd_freq   ),
     .cmd_vol    ( aud_cmd_vol    ),

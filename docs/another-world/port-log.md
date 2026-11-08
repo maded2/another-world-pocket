@@ -3206,6 +3206,11 @@ stage is now a clock ENABLE on `clk_74a`: one clock, one constraint, the same wa
 Also found by the first Quartus build in a week: `aw_rom`'s `pr_done` had two drivers (Verilator warns,
 Quartus refuses), so the chapter-switch RTL had never actually compiled.
 
+**The I2S FIFO had no depth.** The first `tb_soc` run with audio reported 4,124 underruns in 88,000 frames
+(4.7%): independent 48 kHz timebases, an empty FIFO, and phase wobble repeatedly emptying it. Priming to four
+samples before the shifter starts took it to **0 underruns** - 83 us of latency nobody can hear, against 4.7%
+of frames repeating the previous sample. The counter is what made it measurable.
+
 **Measured state.** `make sim-audio`: six benches green. `tb_top`: index loaded, 480 ticks / 480 mixer samples
 / 479-480 I2S pops per 10 ms, 0 dropped ticks, DAC silent while nothing has played. `tb_soc` (paged part 1,
 the 3.64 MiB audio image, `+HOLDPART=1`): **41,956 bytes to the VM, 0 fill writes shifted** - the golden paged
