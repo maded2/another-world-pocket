@@ -45,32 +45,70 @@ module aw_mixer (
 );
 
     // ------------------------------------------------------------------ rate table
-    // transcribed from staticres.cpp's VirtualMachine::frequenceTable (40 entries, asserted < 40 upstream)
-    function automatic [15:0] freq_val(input [5:0] idx);
-        case (idx)
-            6'd0: freq_val = 16'h0CFF; 6'd1:  freq_val = 16'h0DC3; 6'd2:  freq_val = 16'h0E91;
-            6'd3: freq_val = 16'h0F6F; 6'd4:  freq_val = 16'h1056; 6'd5:  freq_val = 16'h114E;
-            6'd6: freq_val = 16'h1259; 6'd7:  freq_val = 16'h136C; 6'd8:  freq_val = 16'h149F;
-            6'd9: freq_val = 16'h15D9; 6'd10: freq_val = 16'h1726; 6'd11: freq_val = 16'h1888;
-            6'd12: freq_val = 16'h19FD; 6'd13: freq_val = 16'h1B86; 6'd14: freq_val = 16'h1D21;
-            6'd15: freq_val = 16'h1EDE; 6'd16: freq_val = 16'h20AB; 6'd17: freq_val = 16'h229C;
-            6'd18: freq_val = 16'h24B3; 6'd19: freq_val = 16'h26D7; 6'd20: freq_val = 16'h293F;
-            6'd21: freq_val = 16'h2BB2; 6'd22: freq_val = 16'h2E4C; 6'd23: freq_val = 16'h3110;
-            6'd24: freq_val = 16'h33FB; 6'd25: freq_val = 16'h370D; 6'd26: freq_val = 16'h3A43;
-            6'd27: freq_val = 16'h3DDF; 6'd28: freq_val = 16'h4157; 6'd29: freq_val = 16'h4538;
-            6'd30: freq_val = 16'h4998; 6'd31: freq_val = 16'h4DAE; 6'd32: freq_val = 16'h5240;
-            6'd33: freq_val = 16'h5764; 6'd34: freq_val = 16'h5C9A; 6'd35: freq_val = 16'h61C8;
-            6'd36: freq_val = 16'h6793; 6'd37: freq_val = 16'h6E19; 6'd38: freq_val = 16'h7485;
-            default: freq_val = 16'h7BBD;      // 6'd39
-        endcase
-    endfunction
-
-    // chunkInc = (freq << 8) / 48000, exactly as mixer.cpp computes it. freq <= 0x7BBD gives <= 169.
+    // chunkInc = (frequenceTable[idx] << 8) / 48000, PRECOMPUTED rather than divided at runtime.
+    //
+    // Two reasons, and the second is why this was found at all: a divider in a four-channel mixer that has
+    // to produce a sample every ~515 cycles is a waste of the fabric, and the first version computed the
+    // division inside a function and produced an increment of 38 for index 20 where 0x293F gives 56 - a
+    // value NO table entry can produce. Whatever the cause (the function's intermediate width, most
+    // likely), a literal table cannot have it. The values are derived from staticres.cpp's
+    // frequenceTable and are reproducible: (v*256)//48000 for each entry.
     function automatic [8:0] rate_inc(input [5:0] idx);
-        reg [23:0] scaled;
+        reg [8:0] inc;
         begin
-            scaled = {freq_val(idx), 8'd0};          // freq << 8
-            rate_inc = scaled / 24'd48000;
+            case (idx[5:2])
+            4'd0: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd17;  2'd1: inc = 9'd18;  2'd2: inc = 9'd19;  2'd3: inc = 9'd21;
+                endcase
+            end
+            4'd1: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd22;  2'd1: inc = 9'd23;  2'd2: inc = 9'd25;  2'd3: inc = 9'd26;
+                endcase
+            end
+            4'd2: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd28;  2'd1: inc = 9'd29;  2'd2: inc = 9'd31;  2'd3: inc = 9'd33;
+                endcase
+            end
+            4'd3: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd35;  2'd1: inc = 9'd37;  2'd2: inc = 9'd39;  2'd3: inc = 9'd42;
+                endcase
+            end
+            4'd4: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd44;  2'd1: inc = 9'd47;  2'd2: inc = 9'd50;  2'd3: inc = 9'd53;
+                endcase
+            end
+            4'd5: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd56;  2'd1: inc = 9'd59;  2'd2: inc = 9'd63;  2'd3: inc = 9'd66;
+                endcase
+            end
+            4'd6: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd70;  2'd1: inc = 9'd75;  2'd2: inc = 9'd79;  2'd3: inc = 9'd84;
+                endcase
+            end
+            4'd7: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd89;  2'd1: inc = 9'd94;  2'd2: inc = 9'd100; 2'd3: inc = 9'd106;
+                endcase
+            end
+            4'd8: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd112; 2'd1: inc = 9'd119; 2'd2: inc = 9'd126; 2'd3: inc = 9'd133;
+                endcase
+            end
+            default: begin
+                case (idx[1:0])
+                2'd0: inc = 9'd141; 2'd1: inc = 9'd150; 2'd2: inc = 9'd159; 2'd3: inc = 9'd168;
+                endcase
+            end
+            endcase
+            rate_inc = inc;
         end
     endfunction
 

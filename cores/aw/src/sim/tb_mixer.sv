@@ -76,6 +76,8 @@ module tb_mixer;
             for (n = 0; n < ncmd; n = n + 1) begin
                 if (ct[n] == t) begin
                     @(negedge clk);
+                    if (t < 2) $display("   cmd n=%0d tick=%0d ch=%0d freq=%0d vol=%0d len=%0d lp=%0d ll=%0d base=%0d",
+                                        n, t, cch[n], cfq[n], cvo[n], cln[n], clp[n], cll[n], cba[n]);
                     cmd_valid <= 1; cmd_ch <= cch[n][1:0]; cmd_freq <= cfq[n][5:0];
                     cmd_vol <= cvo[n][7:0]; cmd_len <= cln[n][23:0];
                     cmd_loop_pos <= clp[n][23:0]; cmd_loop_len <= cll[n][23:0];
