@@ -257,6 +257,15 @@ reg design_run = 1'b0;
         .in_jstick            (js),
         .in_vm_restart        (vm_restart_w),
         .out_part_req         (vm_part_req_w),
+        .out_snd_seq          (snd_seq_w),
+        .out_snd_res          (snd_res_w),
+        .out_snd_freq         (snd_freq_w),
+        .out_snd_vol          (snd_vol_w),
+        .out_snd_ch           (snd_ch_w),
+        .out_mus_seq          (mus_seq_w),
+        .out_mus_num          (mus_num_w),
+        .out_mus_delay        (mus_delay_w),
+        .out_mus_pos          (mus_pos_w),
         .out_mem_in_ready     (mem_in_ready),
         .out_mem_addr         (mem_addr),
         .out_video_r          (game_r),
@@ -281,6 +290,10 @@ reg design_run = 1'b0;
     int         part_sel  = -1;                      // +PART: which part to select before byte 0
     wire        dir_valid_w, dir_bad_w, dir_busy_w, dir_late_w, pool_ok_w, vm_restart_w;
     wire [15:0] vm_part_req_w;      // the GAME's chapter request, straight out of the SoC
+    // Audio events out of the VM. Nothing consumes them yet (no mixer), so this is the observation
+    // point that proves the opcodes really execute and really carry their arguments.
+    wire [7:0]  snd_seq_w, snd_freq_w, snd_vol_w, snd_ch_w, mus_seq_w, mus_pos_w;
+    wire [15:0] snd_res_w, mus_num_w, mus_delay_w;
     // +VMREQ=<id>: inject a request as if the game had issued it, so the aw_rom side of the chapter
     // change can be exercised without waiting for the script to reach its op_updateMemList. The
     // VM-to-request half is covered separately by the bytecode scan and the netlist port; this
@@ -1520,6 +1533,10 @@ reg design_run = 1'b0;
                     c = 0;
                     $display("  t=%0t frames=%0d bytes_to_vm=%0d addr=%h starving=%0d leds=%b restarts=%0d inr=%b",
                              $time, frames, bytes_to_vm, mem_addr, starving, leds, rstr_cnt, mem_in_ready); $fflush;
+                    if (snd_seq_w != 0 || mus_seq_w != 0)
+                        $display("    audio: snd_seq=%0d (res=%0d freq=%0d vol=%0d ch=%0d)  mus_seq=%0d (num=%0d delay=%0d pos=%0d)",
+                                 snd_seq_w, snd_res_w, snd_freq_w, snd_vol_w, snd_ch_w,
+                                 mus_seq_w, mus_num_w, mus_delay_w, mus_pos_w); $fflush;
                 end
             end
         end

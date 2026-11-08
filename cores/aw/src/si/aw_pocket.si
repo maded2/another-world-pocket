@@ -429,6 +429,17 @@ unit main(
   output uint1  video_hs,      // one-clock pulse, once per line
   output uint1  video_vs,      // one-clock pulse, once per frame
   // status
+  // Audio events, one set per opcode. Sticky fields plus a sequence counter: the core has to notice a
+  // REPEATED identical request (the same gunshot twice), which a value change alone cannot express.
+  output uint8  snd_seq,
+  output uint16 snd_res,
+  output uint8  snd_freq,
+  output uint8  snd_vol,
+  output uint8  snd_ch,
+  output uint8  mus_seq,
+  output uint16 mus_num,
+  output uint16 mus_delay,
+  output uint8  mus_pos,
   output uint16 part_req,      // the chapter the game asked for (0 = none yet). See vm.si's port:
                                // op_updateMemList with a 0x3E8N id is the engine's own "load next part".
   output uint8  leds(0),
@@ -508,7 +519,19 @@ unit main(
                     jstick  <:: jstick_delay,
                     // The engine's own "the next chapter starts here", surfaced to the core so it can
                     // switch the page table. Nothing else in the design knows what a part is.
-                    part_req :> part_req
+                    part_req :> part_req,
+                    // Audio, surfaced the same way. Nothing here mixes or plays yet - these are the
+                    // values the mixer will act on, and they are wired out now so that the opcode path
+                    // can be bench-tested before any audio hardware exists.
+                    snd_seq  :> snd_seq,
+                    snd_res  :> snd_res,
+                    snd_freq :> snd_freq,
+                    snd_vol  :> snd_vol,
+                    snd_ch   :> snd_ch,
+                    mus_seq  :> mus_seq,
+                    mus_num  :> mus_num,
+                    mus_delay:> mus_delay,
+                    mus_pos  :> mus_pos
         );
 
   // ---- video pages
