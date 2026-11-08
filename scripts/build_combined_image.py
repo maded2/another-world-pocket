@@ -232,13 +232,16 @@ def build(packs, out_path, part0_last=False, pad_to=0):
     # moves with the image is a class of bug this project has already paid for once (a header field read from
     # the wrong word because the layout was computed rather than named).
     audio_base = FRAMES_BASE + len(pool_data)
-    audio_rec = struct.Struct("<HBBHIII")
+    # 16 bytes, and it carries the resource's OFFSET IN THE BLOB (u32) because the fetch address is
+    # blob_offset + pcm_off. The first layout omitted it - pcm_off is an offset WITHIN a resource, so without
+    # the blob offset the core would read the wrong resource's bytes and the index would look fine.
+    audio_rec = struct.Struct("<HBBIHHHH")   # res, type, flags, blob_off, pcm_off, pcm_len, loop_start, loop_len
     if audio:
         struct.pack_into("<BBH", blob, AUDIO_INDEX_OFF, 0x41, len(audio_index), 0)   # 'A', count, reserved
         for k, e in enumerate(audio_index):
-            struct.pack_into("<HBBHIII", blob, AUDIO_INDEX_OFF + 4 + k * audio_rec.size,
+            struct.pack_into("<HBBIHHHH", blob, AUDIO_INDEX_OFF + 4 + k * audio_rec.size,
                              e["res"], 0 if e["type"] == "SOUND" else 1, 0,
-                             e.get("pcm_off", 0), e.get("pcm_len", e["len"]),
+                             e["offset"], e.get("pcm_off", 0), e.get("pcm_len", e["len"]),
                              e.get("loop_start", 0), e.get("loop_len", 0))
         off = max(off, AUDIO_INDEX_OFF + 4 + len(audio_index) * audio_rec.size)
     if off > HEADER_BYTES:
