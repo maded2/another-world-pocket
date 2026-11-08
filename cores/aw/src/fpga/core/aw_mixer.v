@@ -129,8 +129,13 @@ module aw_mixer (
     // One tick = 4 channels x (read b1, read b2, accumulate). Two dead cycles between reads absorb the
     // one-cycle memory latency, so the sequence is 4 x 4 = 16 cycles per tick - far below the ~515
     // available, and it keeps the pipeline trivially checkable.
+    // rd_addr is a REGISTER driven non-blocking, so it becomes visible to the RAM one cycle after the state
+    // that assigns it, and rd_data is one cycle after that. The first version captured b1 and b2 one state
+    // early and read the PREVIOUS channel's bytes: the S_CALC probe showed channel 1 receiving b1=10 (which
+    // is ram[1], channel 0's second byte) and b2=-128 (its own first byte). The wait states below are not
+    // decoration - each one is exactly the latency of one stage.
     localparam [3:0] S_IDLE = 4'd0, S_RD1 = 4'd1, S_W1 = 4'd2, S_RD2 = 4'd3,
-                     S_W2 = 4'd4, S_CALC = 4'd5, S_NEXT = 4'd6, S_OUT = 4'd7;
+                     S_W2 = 4'd4, S_W3 = 4'd5, S_CALC = 4'd6, S_NEXT = 4'd7, S_OUT = 4'd8;
 
     reg [3:0]  st;
     reg [1:0]  cur_ch;
@@ -228,21 +233,23 @@ module aw_mixer (
                         st   <= S_W1;
                     end
             S_W1: begin
-                        b1 <= rd_data;
-                        // advance the position now, so the loop test below uses the pre-advance p1
-                        next_pos = ch_pos[cur_ch] + ch_inc[cur_ch];
-                        rd_addr  <= ch_base[cur_ch] + p2;
-                        st       <= S_RD2;
+                        // rd_addr is now visible to the RAM; nothing to capture yet
+                        st <= S_RD2;
                     end
-            // rd_data has ONE cycle of latency: the address presented in S_RD1 is valid in S_W1, and the
-            // address presented in S_W1 is valid HERE. The first version captured b2 in S_W2, one state
-            // too late, so it read the bus while no new address had been issued.
             S_RD2: begin
-                        b2 <= rd_data;
+                        b1 <= rd_data;                       // the byte at p1, two states after it was issued
+                        rd_addr <= ch_base[cur_ch] + p2;
                         st <= S_W2;
                     end
-            S_W2: st <= S_CALC;
+            S_W2: st <= S_W3;
+            S_W3: begin
+                        b2 <= rd_data;                       // the byte at p2
+                        st <= S_CALC;
+                    end
             S_CALC: begin
+                        $display("  CALC ch=%0d act=%b ilc=%0d b1=%0d b2=%0d interp=%0d scaled=%0d run_in=%0d",
+                                 cur_ch, ch_active[cur_ch], ilc, $signed(b1), $signed(b2),
+                                 interp, scale_vol(interp, ch_vol[cur_ch]), running);
                         if (ch_active[cur_ch]) begin
                             // SIGN-EXTEND b1/b2. They are int8 samples; zero-extending them turns -128 into
                             // +128, and mixing signed with unsigned operands makes the whole expression
