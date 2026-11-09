@@ -51,6 +51,11 @@ DEFAULT_ALLOW = [
     # the top bits of an address register are zero by construction: hb_fb/hb_pb are header u32s narrowed to
     # 24 bits and audio_base_r is their sum. Quartus proves bit 23 constant and reports it as lost fanout.
     r'(hb_fb|hb_pb|audio_base_r)\[2[23]\]', 
+    # The music command's held copy of the tracker's fields: sample length and loop offsets come from the
+    # index as u16 fields, so bits 16..23 of len/lp/ll are zero by construction, and the sample address is a
+    # 22-bit PSRAM address (bit 23 zero). Narrow registers inside a 24-bit port would only move the constant.
+    r'u_music|pnd_(len|lp|ll|base)\[', 
+    r'core_top:ic\|pnd_(len|lp|ll|base)\[', 
     r'aud_mclk',
     r'psram_cre',
     r'wr_addr\[2[01]',   # Quartus compacts bits: [20], [21] or [20,21]

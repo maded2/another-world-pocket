@@ -136,7 +136,7 @@ module aw_music #(
 
     always @(posedge clk) begin
         if (rst) begin
-            sc <= SC_IDLE; sc_go <= 1'b0; sc_ack <= 1'b0; sc_done <= 1'b0; sc_found <= 1'b0; sc_fin <= 1'b0;
+            sc <= SC_IDLE; sc_done <= 1'b0; sc_found <= 1'b0; sc_fin <= 1'b0;
             sc_a <= 12'd0; sc_k <= 8'd0; sc_cnt <= 8'd0; sc_i <= 5'd0; sc_p <= 2'd0;
             scan_addr <= 12'd0;
         end else begin
@@ -231,7 +231,7 @@ module aw_music #(
 
     always @(posedge clk) begin
         if (rst) begin
-            bst <= B_IDLE; rd_req <= 1'b0; b_done <= 1'b0; b_busy <= 1'b0; b_ack <= 1'b0;
+            bst <= B_IDLE; rd_req <= 1'b0; b_done <= 1'b0; b_busy <= 1'b0;
             rd_addr <= 24'd0; b_a <= 24'd0; b_n <= 8'd0; b_i <= 8'd0;
         end else begin
             case (bst)
