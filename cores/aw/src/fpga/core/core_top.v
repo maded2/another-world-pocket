@@ -1202,8 +1202,99 @@ aw_audio_idx u_audio_idx (
     .r_pcm_off  ( idx_poff       ),
     .r_pcm_len  ( idx_plen       ),
     .r_loop_start ( idx_ls       ),
-    .r_loop_len   ( idx_ll       )
+    .r_loop_len   ( idx_ll       ),
+    // the tracker resolves its instrument records through this port rather than the single-request resolver
+    .scan_addr  ( idx_scan_addr  ),
+    .scan_q     ( idx_scan_q     )
 );
+
+// ---- music: op_playMusic, and the same "a request is a CHANGE of the sequence counter" rule ----
+reg [7:0] mus_seq_d;
+always @(posedge clk_core) begin
+    if (rst_core) mus_seq_d <= 8'd0;
+    else          mus_seq_d <= mus_seq;
+end
+wire mus_play = (mus_seq != mus_seq_d);
+
+wire        mus_cmd_valid, mus_cmd_stop, mus_cmd_touch, mus_cmd_use_inc;
+wire [8:0]  mus_cmd_inc;
+wire [1:0]  mus_cmd_ch;
+wire [7:0]  mus_cmd_vol;
+wire [23:0] mus_cmd_len, mus_cmd_lp, mus_cmd_ll, mus_cmd_base;
+wire [5:0]  mus_cmd_freq;
+wire        mus_rd_req, mus_rd_valid;
+wire [23:0] mus_rd_addr;
+wire [7:0]  mus_rd_data;
+wire        mus_marker_valid;
+wire [15:0] mus_marker_value;
+wire [1:0]  mus_marker_ch;
+wire        mus_running;
+wire [11:0] idx_scan_addr;
+wire [7:0]  idx_scan_q;
+
+aw_music u_music (
+    .clk          ( clk_core      ),
+    .rst          ( rst_core      ),
+    .audio_base   ( audio_base_r  ),
+    .play         ( mus_play & audio_base_ok ),
+    .num          ( mus_num       ),
+    .delay        ( mus_delay     ),
+    .pos          ( mus_pos       ),
+    .scan_addr    ( idx_scan_addr ),
+    .scan_q       ( idx_scan_q    ),
+    .rd_addr      ( mus_rd_addr   ),
+    .rd_req       ( mus_rd_req    ),
+    .rd_valid     ( mus_rd_valid  ),
+    .rd_data      ( mus_rd_data   ),
+    .cmd_valid    ( mus_cmd_valid ),
+    .cmd_stop     ( mus_cmd_stop  ),
+    .cmd_touch    ( mus_cmd_touch ),
+    .cmd_use_inc  ( mus_cmd_use_inc ),
+    .cmd_inc      ( mus_cmd_inc   ),
+    .cmd_ch       ( mus_cmd_ch    ),
+    .cmd_vol      ( mus_cmd_vol   ),
+    .cmd_len      ( mus_cmd_len   ),
+    .cmd_lp       ( mus_cmd_lp    ),
+    .cmd_ll       ( mus_cmd_ll    ),
+    .cmd_base     ( mus_cmd_base  ),
+    .cmd_freq     ( mus_cmd_freq  ),
+    .marker_valid ( mus_marker_valid ),
+    .marker_value ( mus_marker_value ),
+    .marker_ch    ( mus_marker_ch    ),
+    .running      ( mus_running   )
+);
+
+// ---- the mixer has ONE command input, and two producers ----
+// The effects path wins a collision; the music command is HELD until taken, because the tracker issues one
+// per note and a dropped one is a missing note rather than a delayed one.
+reg        pnd_valid, pnd_stop, pnd_touch, pnd_use_inc;
+reg [8:0]  pnd_inc;
+reg [1:0]  pnd_ch;
+reg [7:0]  pnd_vol;
+reg [23:0] pnd_len, pnd_lp, pnd_ll, pnd_base;
+
+wire take_pnd = pnd_valid && !aud_cmd_valid;
+wire mix_cmd_valid = aud_cmd_valid | take_pnd;
+
+always @(posedge clk_core) begin
+    if (rst_core) pnd_valid <= 1'b0;
+    else begin
+        if (take_pnd) pnd_valid <= 1'b0;
+        if (mus_cmd_valid) begin
+            pnd_valid   <= 1'b1;
+            pnd_stop    <= mus_cmd_stop;
+            pnd_touch   <= mus_cmd_touch;
+            pnd_use_inc <= mus_cmd_use_inc;
+            pnd_inc     <= mus_cmd_inc;
+            pnd_ch      <= mus_cmd_ch;
+            pnd_vol     <= mus_cmd_vol;
+            pnd_len     <= mus_cmd_len;
+            pnd_lp      <= mus_cmd_lp;
+            pnd_ll      <= mus_cmd_ll;
+            pnd_base    <= mus_cmd_base;
+        end
+    end
+end
 
 // ---- play request -> mixer command ----
 // AUDIO_BASE is frames_base + pool_bytes for the shipping image. scripts/audio_addr_check.py proves the
@@ -1247,20 +1338,18 @@ aw_mixer u_mixer (
     .out_sample ( mix_sample     ),
     .out_valid  ( mix_valid      ),
     .drop_ticks ( mix_drop_ticks ),
-    .cmd_valid  ( aud_cmd_valid  ),
-    .cmd_stop   ( aud_cmd_stop   ),
-    // The effects path always (re)starts a channel and selects its rate by table index. The music player
-    // (not instantiated yet) is the only user of the other two modes.
-    .cmd_touch  ( 1'b1           ),
-    .cmd_use_inc( 1'b0           ),
-    .cmd_inc    ( 9'd0           ),
-    .cmd_ch     ( aud_cmd_ch     ),
-    .cmd_freq   ( aud_cmd_freq   ),
-    .cmd_vol    ( aud_cmd_vol    ),
-    .cmd_len    ( aud_cmd_len    ),
-    .cmd_loop_pos ( aud_cmd_lp   ),
-    .cmd_loop_len ( aud_cmd_ll   ),
-    .cmd_data_base( aud_cmd_base ),
+    .cmd_valid  ( mix_cmd_valid  ),
+    .cmd_stop   ( aud_cmd_valid ? aud_cmd_stop : pnd_stop ),
+    .cmd_touch  ( aud_cmd_valid ? 1'b1          : pnd_touch ),
+    .cmd_use_inc( aud_cmd_valid ? 1'b0          : pnd_use_inc ),
+    .cmd_inc    ( aud_cmd_valid ? 9'd0          : pnd_inc ),
+    .cmd_ch     ( aud_cmd_valid ? aud_cmd_ch     : pnd_ch ),
+    .cmd_freq   ( aud_cmd_valid ? aud_cmd_freq   : 6'd0 ),
+    .cmd_vol    ( aud_cmd_valid ? aud_cmd_vol    : pnd_vol ),
+    .cmd_len    ( aud_cmd_valid ? aud_cmd_len    : pnd_len ),
+    .cmd_loop_pos ( aud_cmd_valid ? aud_cmd_lp   : pnd_lp ),
+    .cmd_loop_len ( aud_cmd_valid ? aud_cmd_ll   : pnd_ll ),
+    .cmd_data_base( aud_cmd_valid ? aud_cmd_base : pnd_base ),
     .rd_addr    ( mix_rd_addr    ),
     .rd_req     ( mix_rd_req     ),
     .rd_valid   ( mix_rd_valid   ),
@@ -1277,7 +1366,8 @@ wire [23:0] aud_rd_addr;
 wire [7:0]  aud_rd_data;
 wire        aud_rd_valid;
 
-reg [1:0]  aud_owner;                  // 0 = mixer, 1 = index loader, 2 = header reader
+reg [1:0]  aud_owner;                  // 0 = mixer, 1 = index loader, 2 = header reader, 3 = music
+wire       shim_idle;
 wire       hdr_req;
 wire [23:0] hdr_addr;
 reg  [7:0] hdr_data;
@@ -1332,19 +1422,33 @@ end
 assign hdr_addr = 24'd16 + {19'd0, hb_i};
 assign hdr_req  = (hb_st == 3'd1);
 
+// After boot two producers share the port: the mixer wants 8 bytes per 48 kHz tick and the tracker 16 bytes
+// per music row (one row per 133 ms). The grant alternates at BYTE granularity, so a row fetch can delay
+// the mixer by one byte time rather than by a whole 16-byte burst - ~400 cycles of the 516-cycle tick, which
+// would drop a tick every row. The grant only changes when the shim is between transactions, because its
+// 4-phase handshake needs the previous caller's request to be low first.
 always @(posedge clk_core) begin
     if (rst_core)                                aud_owner <= 2'd2;
     else if (idx_load_start)                     aud_owner <= 2'd1;
     else if (idx_load_done && aud_owner == 2'd1) aud_owner <= 2'd2;
-    else if (audio_base_ok)                      aud_owner <= 2'd0;
+    else if (audio_base_ok && aud_owner == 2'd2) aud_owner <= 2'd0;
+    else if (audio_base_ok && shim_idle) begin
+        if (mus_rd_req && !mix_rd_req)       aud_owner <= 2'd3;
+        else if (mix_rd_req && !mus_rd_req)  aud_owner <= 2'd0;
+        else if (mus_rd_req && mix_rd_req)   aud_owner <= (aud_owner == 2'd3) ? 2'd0 : 2'd3;
+    end
 end
 
 assign aud_rd_req     = (aud_owner == 2'd1) ? idx_ldr_req  :
-                        (aud_owner == 2'd2) ? hdr_req      : mix_rd_req;
+                        (aud_owner == 2'd2) ? hdr_req      :
+                        (aud_owner == 2'd3) ? mus_rd_req   : mix_rd_req;
 assign aud_rd_addr    = (aud_owner == 2'd1) ? idx_ldr_addr :
-                        (aud_owner == 2'd2) ? hdr_addr     : mix_rd_addr;
+                        (aud_owner == 2'd2) ? hdr_addr     :
+                        (aud_owner == 2'd3) ? mus_rd_addr  : mix_rd_addr;
 assign idx_ldr_valid  = aud_rd_valid & (aud_owner == 2'd1);
 assign idx_ldr_data   = aud_rd_data;
+assign mus_rd_valid   = aud_rd_valid & (aud_owner == 2'd3);
+assign mus_rd_data    = aud_rd_data;
 assign mix_rd_valid   = aud_rd_valid & (aud_owner == 2'd0);
 assign mix_rd_data    = aud_rd_data;
 
@@ -1360,6 +1464,7 @@ aw_audio_rd u_audio_rd (
     .addr     ( aud_rd_addr ),
     .data     ( aud_rd_data ),
     .valid    ( aud_rd_valid ),
+    .idle     ( shim_idle    ),
     .clk_p    ( clk_psram ),
     .rst_p    ( rst_psram ),
     .aud_req  ( aud_req   ),

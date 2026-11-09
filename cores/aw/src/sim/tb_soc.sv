@@ -327,6 +327,8 @@ reg design_run = 1'b0;
     wire [7:0]  mix_rd_data_w;
     wire [15:0] aud_underruns_w, aud_overruns_w;
     wire        aud_sclk_unused_w;
+    wire [11:0] idx_scan_addr_w;
+    wire [7:0]  idx_scan_q_w;
     wire        aud_rd_req_w, aud_rd_valid_w;
     wire [23:0] aud_rd_addr_w;
     wire [7:0]  aud_rd_data_w;
@@ -347,11 +349,27 @@ reg design_run = 1'b0;
         else if (idx_load_done_w)  aud_port_is_idx_w <= 1'b0;
     end
     assign idx_load_start_w = rom_ready & ~idx_load_done_w & ~idx_load_busy_w;
-    assign aud_rd_req_w  = aud_port_is_idx_w ? idx_ldr_req_w  : mix_rd_req_w;
-    assign aud_rd_addr_w = aud_port_is_idx_w ? idx_ldr_addr_w : mix_rd_addr_w;
+    // After the index load, music and mixer ALTERNATE at byte granularity, and the owner only changes while
+    // the shim is between transactions: its 4-phase handshake needs the previous caller's request to fall
+    // first, and a level-based mux that always prefers music deadlocks the mixer (measured: 35,388 dropped
+    // ticks - the mixer's request was never served because the shim sat in C_GAP waiting for it).
+    reg  mus_owns_w;
+    wire shim_idle_w;
+    always @(posedge clk_core) begin
+        if (rst_core || aud_port_is_idx_w) mus_owns_w <= 1'b0;
+        else if (shim_idle_w) begin
+            if (mus_rd_req_w && !mix_rd_req_w)      mus_owns_w <= 1'b1;
+            else if (mix_rd_req_w && !mus_rd_req_w) mus_owns_w <= 1'b0;
+            else if (mus_rd_req_w && mix_rd_req_w)  mus_owns_w <= ~mus_owns_w;
+        end
+    end
+    assign aud_rd_req_w  = aud_port_is_idx_w ? idx_ldr_req_w  : mus_owns_w ? mus_rd_req_w  : mix_rd_req_w;
+    assign aud_rd_addr_w = aud_port_is_idx_w ? idx_ldr_addr_w : mus_owns_w ? mus_rd_addr_w : mix_rd_addr_w;
     assign idx_ldr_valid_w = aud_rd_valid_w &  aud_port_is_idx_w;
     assign idx_ldr_data_w  = aud_rd_data_w;
-    assign mix_rd_valid_w  = aud_rd_valid_w & ~aud_port_is_idx_w;
+    assign mus_rd_valid_w  = aud_rd_valid_w & ~aud_port_is_idx_w &  mus_owns_w;
+    assign mus_rd_data_w   = aud_rd_data_w;
+    assign mix_rd_valid_w  = aud_rd_valid_w & ~aud_port_is_idx_w & !mus_owns_w;
     assign mix_rd_data_w   = aud_rd_data_w;
 
     aw_audio_idx u_audio_idx (
@@ -361,7 +379,66 @@ reg design_run = 1'b0;
         .start(idx_start_w), .res_id(idx_res_w),
         .busy(idx_busy_w), .found(idx_found_w), .r_type(idx_type_w), .r_blob_off(idx_blob_w),
         .r_pcm_off(idx_poff_w), .r_pcm_len(idx_plen_w),
-        .r_loop_start(idx_ls_w), .r_loop_len(idx_ll_w));
+        .r_loop_start(idx_ls_w), .r_loop_len(idx_ll_w),
+        .scan_addr(idx_scan_addr_w), .scan_q(idx_scan_q_w));
+
+    // ---- music: the same tracker core_top instantiates, driven by the GAME's own cues ----
+    reg  [7:0] mus_seq_d_w;
+    always @(posedge clk_core) begin
+        if (rst_core) mus_seq_d_w <= 8'd0;
+        else          mus_seq_d_w <= mus_seq_w;
+    end
+    wire mus_play_w = (mus_seq_w != mus_seq_d_w);
+
+    wire        mus_cmd_valid_w, mus_cmd_stop_w, mus_cmd_touch_w, mus_cmd_use_inc_w;
+    wire [8:0]  mus_cmd_inc_w;
+    wire [1:0]  mus_cmd_ch_w;
+    wire [7:0]  mus_cmd_vol_w;
+    wire [23:0] mus_cmd_len_w, mus_cmd_lp_w, mus_cmd_ll_w, mus_cmd_base_w;
+    wire [5:0]  mus_cmd_freq_w;
+    wire        mus_rd_req_w, mus_rd_valid_w;
+    wire [23:0] mus_rd_addr_w;
+    wire [7:0]  mus_rd_data_w;
+    wire        mus_running_w;
+
+    aw_music u_music (
+        .clk(clk_core), .rst(rst_core), .audio_base(24'h2F0000), .play(mus_play_w & idx_load_done_w),
+        .num(mus_num_w), .delay(mus_delay_w), .pos(mus_pos_w),
+        .scan_addr(idx_scan_addr_w), .scan_q(idx_scan_q_w),
+        .rd_addr(mus_rd_addr_w), .rd_req(mus_rd_req_w), .rd_valid(mus_rd_valid_w), .rd_data(mus_rd_data_w),
+        .cmd_valid(mus_cmd_valid_w), .cmd_stop(mus_cmd_stop_w), .cmd_touch(mus_cmd_touch_w),
+        .cmd_use_inc(mus_cmd_use_inc_w), .cmd_inc(mus_cmd_inc_w), .cmd_ch(mus_cmd_ch_w),
+        .cmd_vol(mus_cmd_vol_w), .cmd_len(mus_cmd_len_w), .cmd_lp(mus_cmd_lp_w), .cmd_ll(mus_cmd_ll_w),
+        .cmd_base(mus_cmd_base_w), .cmd_freq(mus_cmd_freq_w),
+        .marker_valid(), .marker_value(), .marker_ch(), .running(mus_running_w));
+
+    // the mixer has ONE command input: effects win a collision, the music command is held until taken
+    reg        pnd_valid_w, pnd_stop_w, pnd_touch_w, pnd_use_inc_w;
+    reg [8:0]  pnd_inc_w;
+    reg [1:0]  pnd_ch_w;
+    reg [7:0]  pnd_vol_w;
+    reg [23:0] pnd_len_w, pnd_lp_w, pnd_ll_w, pnd_base_w;
+    wire take_pnd_w = pnd_valid_w && !aud_cmd_valid_w;
+    wire mix_cmd_valid_w = aud_cmd_valid_w | take_pnd_w;
+    always @(posedge clk_core) begin
+        if (rst_core) pnd_valid_w <= 1'b0;
+        else begin
+            if (take_pnd_w) pnd_valid_w <= 1'b0;
+            if (mus_cmd_valid_w) begin
+                pnd_valid_w   <= 1'b1;
+                pnd_stop_w    <= mus_cmd_stop_w;
+                pnd_touch_w   <= mus_cmd_touch_w;
+                pnd_use_inc_w <= mus_cmd_use_inc_w;
+                pnd_inc_w     <= mus_cmd_inc_w;
+                pnd_ch_w      <= mus_cmd_ch_w;
+                pnd_vol_w     <= mus_cmd_vol_w;
+                pnd_len_w     <= mus_cmd_len_w;
+                pnd_lp_w      <= mus_cmd_lp_w;
+                pnd_ll_w      <= mus_cmd_ll_w;
+                pnd_base_w    <= mus_cmd_base_w;
+            end
+        end
+    end
 
     aw_audio_ch u_audio_ch (
         .clk(clk_core), .rst(rst_core), .audio_base(24'h2F0000),
@@ -377,15 +454,23 @@ reg design_run = 1'b0;
     aw_mixer u_mixer (
         .clk(clk_core), .rst(rst_core), .tick(audio_tick_w & idx_load_done_w),
         .out_sample(mix_sample_w), .out_valid(mix_valid_w), .drop_ticks(mix_drop_ticks_w),
-        .cmd_valid(aud_cmd_valid_w), .cmd_stop(aud_cmd_stop_w), .cmd_touch(1'b1), .cmd_use_inc(1'b0), .cmd_inc(9'd0),
-        .cmd_ch(aud_cmd_ch_w), .cmd_freq(aud_cmd_freq_w),
-        .cmd_vol(aud_cmd_vol_w), .cmd_len(aud_cmd_len_w), .cmd_loop_pos(aud_cmd_lp_w),
-        .cmd_loop_len(aud_cmd_ll_w), .cmd_data_base(aud_cmd_base_w),
+        .cmd_valid(mix_cmd_valid_w),
+        .cmd_stop(aud_cmd_valid_w ? aud_cmd_stop_w : pnd_stop_w),
+        .cmd_touch(aud_cmd_valid_w ? 1'b1 : pnd_touch_w),
+        .cmd_use_inc(aud_cmd_valid_w ? 1'b0 : pnd_use_inc_w),
+        .cmd_inc(aud_cmd_valid_w ? 9'd0 : pnd_inc_w),
+        .cmd_ch(aud_cmd_valid_w ? aud_cmd_ch_w : pnd_ch_w),
+        .cmd_freq(aud_cmd_valid_w ? aud_cmd_freq_w : 6'd0),
+        .cmd_vol(aud_cmd_valid_w ? aud_cmd_vol_w : pnd_vol_w),
+        .cmd_len(aud_cmd_valid_w ? aud_cmd_len_w : pnd_len_w),
+        .cmd_loop_pos(aud_cmd_valid_w ? aud_cmd_lp_w : pnd_lp_w),
+        .cmd_loop_len(aud_cmd_valid_w ? aud_cmd_ll_w : pnd_ll_w),
+        .cmd_data_base(aud_cmd_valid_w ? aud_cmd_base_w : pnd_base_w),
         .rd_addr(mix_rd_addr_w), .rd_req(mix_rd_req_w), .rd_valid(mix_rd_valid_w), .rd_data(mix_rd_data_w));
 
     aw_audio_rd u_audio_rd (
         .clk_c(clk_core), .rst_c(rst_core), .req(aud_rd_req_w), .addr(aud_rd_addr_w),
-        .data(aud_rd_data_w), .valid(aud_rd_valid_w),
+        .data(aud_rd_data_w), .valid(aud_rd_valid_w), .idle(shim_idle_w),
         .clk_p(clk_psram), .rst_p(rst_psram),
         .aud_req(aud_req_w), .aud_addr(aud_addr_w), .aud_data(aud_data_w), .aud_valid(aud_valid_w));
 
@@ -400,6 +485,12 @@ reg design_run = 1'b0;
     // `samples` counts mixed samples, `dac_moved` is sticky on any non-zero DAC bit, and `plays` counts
     // changes of snd_seq (one per op_playSound, including the vol == 0 stops).
     integer aud_plays = 0, aud_samples = 0, aud_dac_moved = 0;
+    integer aud_mus_cues = 0, aud_mus_cmds = 0;
+    reg [7:0] aud_mus_seq_d = 8'd0;
+    always @(posedge clk_core) begin
+        if (mus_seq_w != aud_mus_seq_d) begin aud_mus_seq_d = mus_seq_w; aud_mus_cues = aud_mus_cues + 1; end
+        if (mus_cmd_valid_w) aud_mus_cmds = aud_mus_cmds + 1;
+    end
     reg [7:0] aud_seq_prev = 8'd0;
     always @(posedge clk_core) begin
         if (snd_seq_w != aud_seq_prev) begin
@@ -1952,6 +2043,7 @@ reg design_run = 1'b0;
         // Three claims, and the first two are the ones that were impossible to make before: the index really
         // was copied out of the image at boot, and a play issued by the GAME (not by a bench injection) put
         // non-zero bits on the DAC line while the bytecode stream kept flowing.
+        $display("tb_soc: music - cues %0d, tracker running %0d, commands %0d", aud_mus_cues, mus_running_w, aud_mus_cmds);
         $display("tb_soc: audio - plays %0d, mixed samples %0d, DAC moved %0d, dropped ticks %0d, I2S underruns %0d overruns %0d, index loaded %0d",
                  aud_plays, aud_samples, aud_dac_moved, mix_drop_ticks_w,
                  aud_underruns_w, aud_overruns_w, idx_load_done_w);

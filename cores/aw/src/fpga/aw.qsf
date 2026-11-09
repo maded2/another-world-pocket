@@ -771,6 +771,7 @@ set_global_assignment -name VERILOG_FILE core/aw_audio_ch.v
 set_global_assignment -name VERILOG_FILE core/aw_mixer.v
 set_global_assignment -name VERILOG_FILE core/aw_audio_rd.v
 set_global_assignment -name VERILOG_FILE core/aw_audio_i2s.v
+set_global_assignment -name VERILOG_FILE core/aw_music.v
 set_global_assignment -name VERILOG_FILE core/dbg_uart_tx.v
 set_global_assignment -name VERILOG_FILE core/dbg_console.v
 set_global_assignment -name SYSTEMVERILOG_FILE core/aw_pocket_build.v

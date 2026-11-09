@@ -78,8 +78,8 @@ module tb_music;
     wire [1:0]  marker_ch;
     wire        running;
 
-    aw_music #(.AUDIO_BASE(AUDIO_BASE), .CLK_HZ(CLK_HZ), .MS_CYCLES(MS_CYCLES)) dut (
-        .clk(clk), .rst(rst),
+    aw_music #(.CLK_HZ(CLK_HZ), .MS_CYCLES(MS_CYCLES)) dut (
+        .clk(clk), .rst(rst), .audio_base(AUDIO_BASE),
         .play(play), .num(num), .delay(delay), .pos(pos),
         .scan_addr(scan_addr), .scan_q(scan_q),
         .rd_addr(rd_addr), .rd_req(rd_req), .rd_valid(rd_valid), .rd_data(rd_data),

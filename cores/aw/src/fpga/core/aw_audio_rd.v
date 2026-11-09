@@ -31,6 +31,7 @@ module aw_audio_rd (
     input  wire [23:0] addr,
     output reg  [7:0]  data,
     output reg         valid,          // one clk_c cycle, data is the byte for the last request
+    output wire        idle,           // the caller side is between transactions: safe to change owners
 
     // ---- audio port of aw_rom (clk_psram) ----
     input  wire        clk_p,
@@ -63,6 +64,7 @@ module aw_audio_rd (
     always @(posedge clk_c) begin
         ack_s <= {ack_s[0], ack_t};
     end
+    assign idle = (cs == C_IDLE);
 
     always @(posedge clk_c) begin
         if (rst_c) begin

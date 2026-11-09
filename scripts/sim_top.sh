@@ -36,6 +36,7 @@ if ! verilator --binary -j 4 --timing --top-module tb_top -Wno-fatal -Wno-lint \
     "$CORE/aw_audio_idx.v" \
     "$CORE/aw_audio_ch.v" \
     "$CORE/aw_mixer.v" \
+    "$CORE/aw_music.v" \
     "$CORE/aw_audio_rd.v" \
     "$CORE/aw_audio_i2s.v" \
     "$CORE/core_bridge_cmd.v" \

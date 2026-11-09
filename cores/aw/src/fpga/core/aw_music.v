@@ -34,12 +34,15 @@
 `timescale 1ns/1ps
 
 module aw_music #(
-    parameter [23:0] AUDIO_BASE = 24'h2F0000,
     parameter integer CLK_HZ = 24_750_000,
     parameter integer MS_CYCLES = CLK_HZ / 1000
 ) (
     input  wire        clk,
     input  wire        rst,
+    // Byte address of the audio section, read from the image header at boot by core_top - the same input
+    // aw_audio_ch takes, and for the same reason: a bitstream that carries the number only works with the
+    // image it was built for, and a mismatch is indistinguishable from silence.
+    input  wire [23:0] audio_base,
 
     // op_playMusic: num = resource id, delay = tick override (0 = module header), pos = start order
     input  wire        play,
@@ -394,8 +397,8 @@ module aw_music #(
                     if (!sc_found) begin
                         mst <= M_IDLE;                 // not a music resource: nothing to play, not an error
                     end else begin
-                        mod_base  <= AUDIO_BASE + sc_blob[23:0] + {16'd0, sc_poff};
-                        b_addr    <= AUDIO_BASE + sc_blob[23:0] + {16'd0, sc_poff};
+                        mod_base  <= audio_base + sc_blob[23:0] + {16'd0, sc_poff};
+                        b_addr    <= audio_base + sc_blob[23:0] + {16'd0, sc_poff};
                         b_count   <= 8'd64;
                         b_dst     <= 8'd0;
                         b_start   <= 1'b1;
@@ -448,7 +451,7 @@ module aw_music #(
                     sc_ack <= 1'b1;
                     if (sc_target != 16'd0 && sc_found) begin
                         i_ok[ins_i]   <= 1'b1;
-                        i_base[ins_i] <= AUDIO_BASE + sc_blob[23:0] + {16'd0, sc_poff};
+                        i_base[ins_i] <= audio_base + sc_blob[23:0] + {16'd0, sc_poff};
                         i_len[ins_i]  <= {8'd0, sc_ls};
                         i_ll[ins_i]   <= {8'd0, sc_ll};
                         i_lp[ins_i]   <= (sc_ll != 16'd0) ? {8'd0, sc_ls} : 24'd0;
