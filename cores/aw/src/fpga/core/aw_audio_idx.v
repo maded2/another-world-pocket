@@ -61,7 +61,17 @@ module aw_audio_idx #(
 
     reg [7:0] mem [0:DEPTH-1];
 
-    always @(posedge clk) scan_q <= mem[scan_addr];
+    // A SECOND COPY FOR THE SCAN PORT, on purpose.
+    //
+    // mem has two readers: the resolver (one address per lookup) and the music tracker's scan (sequential).
+    // Written as one array with two synchronous reads, Quartus inferred a SINGLE "Simple Dual Port" RAM - one
+    // read port - and the two readers then share it, which cannot work: the tracker's scan never matched, so
+    // every instrument resolved to nothing and the tracker never left its load. Measured on hardware, with
+    // the M field of the console line: "M0 0000 0000" (not running, 0 rows) while the effects played.
+    // A second array costs 2 M10K and makes the two ports unambiguous, whatever the fitter prefers.
+    reg [7:0] mem_s [0:DEPTH-1];
+
+    always @(posedge clk) scan_q <= mem_s[scan_addr];
 
     // ------------------------------------------------------------------ loader
     // A 4-phase handshake per byte: raise req with a stable address, wait for valid, drop req, advance. The
@@ -105,8 +115,13 @@ module aw_audio_idx #(
                     end
             L_WAIT: if (ldr_valid) begin
                         ldr_req <= 1'b0;
-                        if (in_rec) mem[12'd4 + n] <= ldr_data;
-                        else        mem[n]         <= ldr_data;
+                        if (in_rec) begin
+                            mem[12'd4 + n]   <= ldr_data;
+                            mem_s[12'd4 + n] <= ldr_data;
+                        end else begin
+                            mem[n]   <= ldr_data;
+                            mem_s[n] <= ldr_data;
+                        end
                         if (!in_rec && n == 12'd1) cnt <= ldr_data;
                         lst <= L_NEXT;
                     end

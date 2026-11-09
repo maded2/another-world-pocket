@@ -1049,7 +1049,7 @@ wire       cons_valid, cons_ready;
 // from this parameter. It was left at dbg_console's default, so every build since 1046 announced "AW 1046a
 // up" - the same lie the file's own comment records for 1040-1042, and it cost a hardware round trip: a
 // capture could not be told apart from the one it was meant to test. BUMP THIS WITH EVERY INSTALL.
-localparam [15:0] AW_BUILD_ID = 16'd1054;
+localparam [15:0] AW_BUILD_ID = 16'd1056;
 
 dbg_console #(.BUILD_ID(AW_BUILD_ID)) u_cons (
     .clk        ( clk_core          ),
