@@ -73,6 +73,7 @@ module tb_music;
     wire [7:0]  cmd_vol;
     wire [23:0] cmd_len, cmd_lp, cmd_ll, cmd_base;
     wire [5:0]  cmd_freq;
+    wire        row_valid;
     wire        marker_valid;
     wire [15:0] marker_value;
     wire [1:0]  marker_ch;
@@ -86,7 +87,7 @@ module tb_music;
         .cmd_valid(cmd_valid), .cmd_stop(cmd_stop), .cmd_touch(cmd_touch), .cmd_use_inc(cmd_use_inc), .cmd_inc(cmd_inc),
         .cmd_ch(cmd_ch), .cmd_vol(cmd_vol), .cmd_len(cmd_len), .cmd_lp(cmd_lp), .cmd_ll(cmd_ll),
         .cmd_base(cmd_base), .cmd_freq(cmd_freq),
-        .marker_valid(marker_valid), .marker_value(marker_value), .marker_ch(marker_ch),
+        .row_valid(row_valid), .marker_valid(marker_valid), .marker_value(marker_value), .marker_ch(marker_ch),
         .running(running));
 
     // ---- expectation ----

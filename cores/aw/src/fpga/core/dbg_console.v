@@ -41,6 +41,15 @@ module dbg_console (
     input  wire [3:0]   cen_qmism,           // census block for what each one rules out
     input  wire [2:0]   cen_stat,
     input  wire [7:0]   vid_status,          // {saw_hs,saw_vs,inmenu,design_run,video_sel,suppress,_,rom_ready}
+    // Music, because a silent intro sounds like a broken cue and a garbled one sounds like anything: these
+    // four fields say whether the tracker is running, how far through the row table it is, how many notes it
+    // has issued, and the rate/address of the last one. Appended AFTER the existing fields so nothing that
+    // already parses this line has to change.
+    input  wire         mus_running,
+    input  wire [15:0]  mus_rows,
+    input  wire [15:0]  mus_plays,
+    input  wire [8:0]   mus_last_inc,
+    input  wire [23:0]  mus_last_base,
     // Directory / paging state, so "the VM is running the wrong data" can be told apart from "the
     // upload is corrupt" - which is the whole point, because both look the same on the panel: black
     // screen, or animated garbage. All of these are aw_rom outputs already synchronised into clk_core
@@ -271,7 +280,7 @@ always @(*) begin
         MID_ERR3:    msg_len = 6'd23;
         MID_MENUIN:  msg_len = 6'd8;
         MID_MENUOUT: msg_len = 6'd8;
-        MID_CHK:     msg_len = 8'd156;
+        MID_CHK:     msg_len = 8'd177;
         default:     msg_len = 6'd8;
     endcase
 end

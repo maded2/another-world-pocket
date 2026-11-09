@@ -71,6 +71,7 @@ module aw_music #(
     output reg  [23:0] cmd_len, cmd_lp, cmd_ll, cmd_base,
     output reg  [5:0]  cmd_freq,
 
+    output reg         row_valid,      // one cycle per pattern row fetched: the tracker's own progress
     output reg         marker_valid,
     output reg  [15:0] marker_value,
     output reg  [1:0]  marker_ch,
@@ -378,6 +379,7 @@ module aw_music #(
         end else begin
             cmd_valid    <= 1'b0;
             marker_valid <= 1'b0;
+            row_valid    <= 1'b0;
             dv_go        <= 1'b0;
             if (mst != M_RESTART) sc_abort <= 1'b0;
 
@@ -530,6 +532,7 @@ module aw_music #(
             end
 
             M_TICK: begin
+                row_valid <= 1'b1;
                 b_addr  <= mod_base + 24'hC0 + {6'd0, ord[cur_order], 10'd0} + {16'd0, cur_pos};
                 b_count <= 8'd16;
                 b_dst   <= 8'd2;

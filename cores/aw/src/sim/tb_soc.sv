@@ -410,7 +410,7 @@ reg design_run = 1'b0;
         .cmd_use_inc(mus_cmd_use_inc_w), .cmd_inc(mus_cmd_inc_w), .cmd_ch(mus_cmd_ch_w),
         .cmd_vol(mus_cmd_vol_w), .cmd_len(mus_cmd_len_w), .cmd_lp(mus_cmd_lp_w), .cmd_ll(mus_cmd_ll_w),
         .cmd_base(mus_cmd_base_w), .cmd_freq(mus_cmd_freq_w),
-        .marker_valid(), .marker_value(), .marker_ch(), .running(mus_running_w));
+        .row_valid(), .marker_valid(), .marker_value(), .marker_ch(), .running(mus_running_w));
 
     // the mixer has ONE command input: effects win a collision, the music command is held until taken
     reg        pnd_valid_w, pnd_stop_w, pnd_touch_w, pnd_use_inc_w;

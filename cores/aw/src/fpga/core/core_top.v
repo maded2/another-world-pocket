@@ -1229,6 +1229,25 @@ wire        mus_marker_valid;
 wire [15:0] mus_marker_value;
 wire [1:0]  mus_marker_ch;
 wire        mus_running;
+wire        mus_row_valid;
+// Counters for the console line: what the tracker is actually doing on hardware. The music is the one part
+// of this feature whose failure is not visible in the picture, so it has to report on itself.
+reg  [15:0] mus_rows, mus_plays;
+reg  [8:0]  mus_last_inc;
+reg  [23:0] mus_last_base;
+always @(posedge clk_core) begin
+    if (rst_core) begin
+        mus_rows <= 16'd0; mus_plays <= 16'd0;
+        mus_last_inc <= 9'd0; mus_last_base <= 24'd0;
+    end else begin
+        if (mus_row_valid) mus_rows <= mus_rows + 16'd1;
+        if (mus_cmd_valid && mus_cmd_touch && !mus_cmd_stop) begin
+            mus_plays     <= mus_plays + 16'd1;
+            mus_last_inc  <= mus_cmd_inc;
+            mus_last_base <= mus_cmd_base;
+        end
+    end
+end
 wire [11:0] idx_scan_addr;
 wire [7:0]  idx_scan_q;
 
@@ -1258,6 +1277,7 @@ aw_music u_music (
     .cmd_ll       ( mus_cmd_ll    ),
     .cmd_base     ( mus_cmd_base  ),
     .cmd_freq     ( mus_cmd_freq  ),
+    .row_valid    ( mus_row_valid    ),
     .marker_valid ( mus_marker_valid ),
     .marker_value ( mus_marker_value ),
     .marker_ch    ( mus_marker_ch    ),
