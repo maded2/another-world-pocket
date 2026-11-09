@@ -280,10 +280,14 @@ always @(*) begin
         MID_ERR3:    msg_len = 6'd23;
         MID_MENUIN:  msg_len = 6'd8;
         MID_MENUOUT: msg_len = 6'd8;
-        MID_CHK:     msg_len = 8'd177;
+        MID_CHK:     msg_len = 8'd182;
         default:     msg_len = 6'd8;
     endcase
 end
+
+// zero-extended copy of the music rate for the hex formatter: a bit-select cannot be applied to a
+// concatenation, and {7'd0, mus_last_inc}[...] is exactly that.
+wire [15:0] mus_inc16 = {7'd0, mus_last_inc};
 
 // nibble -> ASCII hex char (for the periodic CHK dump)
 function [7:0] hxn;
@@ -393,6 +397,23 @@ always @(*) begin
             else if (pos == 8'd152) tx_data = 8'h45;                   // 'E'
             else if (pos == 8'd153) tx_data = hxn(dir_err[7:4]);
             else if (pos == 8'd154) tx_data = hxn(dir_err[3:0]);
+            // M: the music. `running`, rows fetched, notes issued, then the last note's rate increment and
+            // sample address. Appended AFTER the existing fields so nothing that already parses this line
+            // has to change - and it has to be here, not in a separate message, because a garbled intro
+            // cannot tell a wrong sample address from a wrong rate from a tracker that stopped on row 3.
+            else if (pos == 8'd155) tx_data = 8'h20;                   // ' '
+            else if (pos == 8'd156) tx_data = 8'h4d;                   // 'M'
+            else if (pos == 8'd157) tx_data = mus_running ? 8'h31 : 8'h30;
+            else if (pos == 8'd158) tx_data = 8'h20;                   // ' '
+            else if (pos <= 8'd162) tx_data = hxn(mus_rows[(8'd162 - pos)*4 +: 4]);
+            else if (pos == 8'd163) tx_data = 8'h20;                   // ' '
+            else if (pos <= 8'd167) tx_data = hxn(mus_plays[(8'd167 - pos)*4 +: 4]);
+            else if (pos == 8'd168) tx_data = 8'h20;                   // ' '
+            else if (pos == 8'd169) tx_data = 8'h49;                   // 'I'
+            else if (pos <= 8'd172) tx_data = hxn(mus_inc16[(8'd172 - pos)*4 +: 4]);
+            else if (pos == 8'd173) tx_data = 8'h20;                   // ' '
+            else if (pos == 8'd174) tx_data = 8'h41;                   // 'A'
+            else if (pos <= 8'd180) tx_data = hxn(mus_last_base[(8'd180 - pos)*4 +: 4]);
             else                    tx_data = 8'h0a;                   // '\n'
         end
         MID_UP:      tx_data = MSG_UP      [(11 - pos)*8 +: 8];

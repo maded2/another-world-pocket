@@ -8,7 +8,7 @@
 #
 # RUN: launch "AW 1054", dataslot aw-all-audio.bin, Game part = Part 2, wait ~12 s.
 # The banner then reads "AW 1054a up" AND the CHK line ends with:
-#     M<running><rows 4hex><plays 4hex>  I<rate increment 3hex> A<last sample address 6hex>
+#     M<running> <rows 4hex> <plays 4hex> I<rate increment 3hex> A<last sample address 6hex>
 #
 # The effects (~0.4 s and ~1.6 s) are known good; the music starts at ~8.5 s and comes out garbled. The M
 # field says which half is wrong:

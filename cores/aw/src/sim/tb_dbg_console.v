@@ -155,6 +155,9 @@ module tb_dbg_console;
         // paging: a table is installed for part 2 and the pool sums match -> flags 0101
         .dir_valid(1'b1), .dir_bad(1'b0), .pool_ok(1'b1), .part_late(1'b0),
         .rom_part(3'd2), .dir_err(8'd0),
+        // music telemetry: running, 64 rows, 3 notes, and the last one's rate/address
+        .mus_running(1'b1), .mus_rows(16'h0040), .mus_plays(16'h0003),
+        .mus_last_inc(9'h02C), .mus_last_base(24'h2F4878),
         .tx_data(c_data), .tx_valid(c_valid), .tx_ready(c_ready)
     );
 
@@ -176,11 +179,11 @@ module tb_dbg_console;
         end
     endtask
 
-    task recv_line_c(input [8*160-1:0] want, input integer want_len);
+    task recv_line_c(input [8*200-1:0] want, input integer want_len);
         begin
             nbyte = 0;
             decode_c(got_byte);
-            while (got_byte !== 8'h0a && nbyte < 158) begin
+            while (got_byte !== 8'h0a && nbyte < 200) begin
                 got_line_c[nbyte*8 +: 8] = got_byte;
                 nbyte = nbyte + 1;
                 decode_c(got_byte);
@@ -216,7 +219,7 @@ module tb_dbg_console;
 
     integer nbyte, k;
     reg [8*32-1:0] got_line;
-    reg [8*160-1:0] got_line_c;  // phase C: the CHK line is 126 chars
+    reg [8*200-1:0] got_line_c;  // phase C: the CHK line is 126 chars
     reg line_ok;
 
     // want is a string literal right-justified in its 32-byte vector, so char c
@@ -353,7 +356,8 @@ module tb_dbg_console;
         c_rst_n = 1'b1;
         recv_line_c("AW 1046a up\n", 12);     // dut_c takes the defaults: BUILD_ID 1046, suffix 'a'
         // C<err>:<32 hex chk> W<match>/<all> S<status> - the loader counters
-        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75 Z.0 1a2b3c4d/1a2b3c4d G25 E00\n", 156);
+        // the M field is appended after E, so every parser written before it still reads the same prefixes
+        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75 Z.0 1a2b3c4d/1a2b3c4d G25 E00 M1 0040 0003 I02c A2f4878\n", 182);
 
         if (errors == 0) $display("tb_dbg_console: -> PASS");
         else             $display("tb_dbg_console: -> FAIL (%0d errors)", errors);
