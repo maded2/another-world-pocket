@@ -314,7 +314,7 @@ reg design_run = 1'b0;
     wire [7:0]  idx_type_w;
     wire [31:0] idx_blob_w;
     wire [15:0] idx_poff_w, idx_plen_w, idx_ls_w, idx_ll_w;
-    wire        aud_cmd_valid_w;
+    wire        aud_cmd_valid_w, aud_cmd_stop_w;
     wire [1:0]  aud_cmd_ch_w;
     wire [5:0]  aud_cmd_freq_w;
     wire [7:0]  aud_cmd_vol_w;
@@ -370,14 +370,14 @@ reg design_run = 1'b0;
         .idx_start(idx_start_w), .idx_res(idx_res_w), .idx_busy(idx_busy_w), .idx_found(idx_found_w),
         .idx_type(idx_type_w), .idx_blob(idx_blob_w), .idx_poff(idx_poff_w), .idx_plen(idx_plen_w),
         .idx_ls(idx_ls_w), .idx_ll(idx_ll_w),
-        .cmd_valid(aud_cmd_valid_w), .cmd_ch(aud_cmd_ch_w), .cmd_freq(aud_cmd_freq_w),
+        .cmd_valid(aud_cmd_valid_w), .cmd_stop(aud_cmd_stop_w), .cmd_ch(aud_cmd_ch_w), .cmd_freq(aud_cmd_freq_w),
         .cmd_vol(aud_cmd_vol_w), .cmd_len(aud_cmd_len_w), .cmd_lp(aud_cmd_lp_w),
         .cmd_ll(aud_cmd_ll_w), .cmd_base(aud_cmd_base_w));
 
     aw_mixer u_mixer (
         .clk(clk_core), .rst(rst_core), .tick(audio_tick_w & idx_load_done_w),
         .out_sample(mix_sample_w), .out_valid(mix_valid_w), .drop_ticks(mix_drop_ticks_w),
-        .cmd_valid(aud_cmd_valid_w), .cmd_touch(1'b1), .cmd_use_inc(1'b0), .cmd_inc(9'd0),
+        .cmd_valid(aud_cmd_valid_w), .cmd_stop(aud_cmd_stop_w), .cmd_touch(1'b1), .cmd_use_inc(1'b0), .cmd_inc(9'd0),
         .cmd_ch(aud_cmd_ch_w), .cmd_freq(aud_cmd_freq_w),
         .cmd_vol(aud_cmd_vol_w), .cmd_len(aud_cmd_len_w), .cmd_loop_pos(aud_cmd_lp_w),
         .cmd_loop_len(aud_cmd_ll_w), .cmd_data_base(aud_cmd_base_w),

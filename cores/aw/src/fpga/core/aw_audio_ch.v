@@ -36,6 +36,7 @@ module aw_audio_ch (
     input  wire [15:0] idx_poff, idx_plen, idx_ls, idx_ll,
     // mixer command
     output reg         cmd_valid,
+    output reg         cmd_stop,       // vol == 0 from the VM is stopChannel, not a silent play (vm.cpp)
     output reg  [1:0]  cmd_ch,
     output reg  [5:0]  cmd_freq,
     output reg  [7:0]  cmd_vol,
@@ -57,7 +58,7 @@ module aw_audio_ch (
 
     always @(posedge clk) begin
         if (rst) begin
-            st <= S_IDLE; idx_start <= 1'b0; cmd_valid <= 1'b0; stop_req <= 1'b0;
+            st <= S_IDLE; idx_start <= 1'b0; cmd_valid <= 1'b0; cmd_stop <= 1'b0; stop_req <= 1'b0;
             cmd_ch <= 2'd0; cmd_freq <= 6'd0; cmd_vol <= 8'd0;
             cmd_len <= 24'd0; cmd_lp <= 24'd0; cmd_ll <= 24'd0; cmd_base <= 24'd0;
         end else begin
@@ -108,6 +109,7 @@ module aw_audio_ch (
             end
             S_ISSUE: begin
                 cmd_valid <= 1'b1;
+                cmd_stop  <= stop_req;      // row's vol field is 0 -> this is a stop, not a play at volume 0
                 st        <= S_IDLE;
             end
             default: st <= S_IDLE;

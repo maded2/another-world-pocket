@@ -40,7 +40,7 @@ module tb_audio_ch;
     wire [31:0] idx_blob;
     wire [15:0] idx_poff, idx_plen, idx_ls, idx_ll;
 
-    wire        cmd_valid;
+    wire        cmd_valid, cmd_stop;
     wire [1:0]  cmd_ch;
     wire [5:0]  cmd_freq;
     wire [7:0]  cmd_vol;
@@ -59,12 +59,13 @@ module tb_audio_ch;
                        .idx_start(idx_start), .idx_res(idx_res), .idx_busy(idx_busy), .idx_found(idx_found),
                        .idx_type(idx_type), .idx_blob(idx_blob), .idx_poff(idx_poff),
                        .idx_plen(idx_plen), .idx_ls(idx_ls), .idx_ll(idx_ll),
-                       .cmd_valid(cmd_valid), .cmd_ch(cmd_ch), .cmd_freq(cmd_freq), .cmd_vol(cmd_vol),
+                       .cmd_valid(cmd_valid), .cmd_stop(cmd_stop), .cmd_ch(cmd_ch), .cmd_freq(cmd_freq), .cmd_vol(cmd_vol),
                        .cmd_len(cmd_len), .cmd_lp(cmd_lp), .cmd_ll(cmd_ll), .cmd_base(cmd_base));
 
     integer i, k, pulses, errors = 0, checked = 0;
     reg probe_run = 1'b0;   // flip to 1 to trace the controller/resolver handshake
     reg [7:0] got_vol; reg [23:0] got_base, got_len, got_lp, got_ll; reg [1:0] got_ch; reg [5:0] got_freq;
+    reg got_stop;
 
     task automatic do_play(input [15:0] r, input [5:0] f, input [7:0] v, input [1:0] c);
         begin
@@ -78,7 +79,7 @@ module tb_audio_ch;
                              k, u_ch.st, idx_start, idx_busy, idx_found, idx_res, u_idx.a);
                 if (cmd_valid) begin
                     pulses = pulses + 1;
-                    got_vol = cmd_vol; got_base = cmd_base; got_len = cmd_len;
+                    got_vol = cmd_vol; got_base = cmd_base; got_len = cmd_len; got_stop = cmd_stop;
                     got_lp = cmd_lp; got_ll = cmd_ll; got_ch = cmd_ch; got_freq = cmd_freq;
                 end
                 if (pulses > 0 && k > 200) k = 3000;   // stop waiting once one has been seen

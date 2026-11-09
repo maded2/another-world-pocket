@@ -1141,6 +1141,7 @@ wire [31:0] idx_blob;
 wire [15:0] idx_poff, idx_plen, idx_ls, idx_ll;
 
 wire        aud_cmd_valid;
+wire        aud_cmd_stop;
 wire [1:0]  aud_cmd_ch;
 wire [5:0]  aud_cmd_freq;
 wire [7:0]  aud_cmd_vol;
@@ -1228,6 +1229,7 @@ aw_audio_ch u_audio_ch (
     .idx_ls     ( idx_ls         ),
     .idx_ll     ( idx_ll         ),
     .cmd_valid  ( aud_cmd_valid  ),
+    .cmd_stop   ( aud_cmd_stop   ),
     .cmd_ch     ( aud_cmd_ch     ),
     .cmd_freq   ( aud_cmd_freq   ),
     .cmd_vol    ( aud_cmd_vol    ),
@@ -1246,6 +1248,7 @@ aw_mixer u_mixer (
     .out_valid  ( mix_valid      ),
     .drop_ticks ( mix_drop_ticks ),
     .cmd_valid  ( aud_cmd_valid  ),
+    .cmd_stop   ( aud_cmd_stop   ),
     // The effects path always (re)starts a channel and selects its rate by table index. The music player
     // (not instantiated yet) is the only user of the other two modes.
     .cmd_touch  ( 1'b1           ),

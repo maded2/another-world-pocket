@@ -68,6 +68,19 @@ else
     "$OBJ/i2s/tb_i2s" | grep -e "tb_audio_i2s" || fail=1
 fi
 
+echo "=== tb_music: the tracker against scripts/ref_tracker.py, event for event ==="
+SCN="$ROOT/build/music-scn"
+mkdir -p "$SCN"
+python3 "$ROOT/scripts/music_scenario.py" "$SCN" --ticks 1100 --delay 15700 > "$OBJ/music-scn.log" 2>&1 || {
+    echo "   scenario generation FAILED"; tail -3 "$OBJ/music-scn.log"; fail=1; }
+if ! verilator --binary -j 4 --timing --top-module tb_music -Wno-fatal -Wno-lint \
+        -DSCN_PATH="\"$SCN\"" --Mdir "$OBJ/music" \
+        "$CORE/aw_music.v" "$SIM/tb_music.sv" -o tb_music > "$OBJ/music.log" 2>&1; then
+    echo "   build FAILED"; grep -E "%Error" "$OBJ/music.log" | head -5; fail=1
+else
+    "$OBJ/music/tb_music" | grep -e "events compared" || fail=1
+fi
+
 echo "=== tb_audio_ch: play / stop / unknown id ==="
 if ! verilator --binary -j 4 --timing --top-module tb_audio_ch -Wno-fatal -Wno-lint \
         --Mdir "$OBJ/ch" "$CORE/aw_audio_idx.v" "$CORE/aw_audio_ch.v" "$SIM/tb_audio_ch.sv" -o tb_ch > "$OBJ/ch.log" 2>&1; then

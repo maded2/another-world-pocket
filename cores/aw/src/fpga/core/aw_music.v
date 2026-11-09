@@ -59,6 +59,7 @@ module aw_music #(
 
     // mixer command
     output reg         cmd_valid,
+    output reg         cmd_stop,
     output reg         cmd_touch,
     output reg         cmd_use_inc,
     output reg  [8:0]  cmd_inc,
@@ -69,6 +70,7 @@ module aw_music #(
 
     output reg         marker_valid,
     output reg  [15:0] marker_value,
+    output reg  [1:0]  marker_ch,
     output wire        running
 );
 
@@ -136,7 +138,9 @@ module aw_music #(
             scan_addr <= 12'd0;
         end else begin
             case (sc)
-            SC_IDLE: if (sc_go) begin
+            SC_IDLE: if (sc_ack) begin
+                         sc_done <= 1'b0;              // the consumer has taken the result
+                     end else if (sc_go) begin
                          sc_done  <= 1'b0;
                          sc_found <= 1'b0;
                          sc_fin   <= 1'b0;
@@ -210,9 +214,13 @@ module aw_music #(
     // player simply hung in M_HDR). The main FSM now starts a burst - address, length, destination - and waits
     // for `b_done`; nothing else touches the port.
     //   b_dst: 0 = hdr[0:63], 1 = ord[0:127], 2 = pat[0:15]
-    localparam [1:0] B_IDLE = 2'd0, B_REQ = 2'd1, B_WAIT = 2'd2, B_FIN = 2'd3;
-    reg [1:0]  bst;
-    reg        b_start, b_busy, b_done;
+    // b_done is a LEVEL until the consumer acknowledges it. Without the acknowledgement the NEXT burst's
+    // consumer sees the PREVIOUS burst's done flag on the cycle it raises its start, concludes its own burst
+    // finished, and decodes stale data - measured: the order table came back all zeros and every row was
+    // decoded from the header's tail.
+    localparam [2:0] B_IDLE = 3'd0, B_REQ = 3'd1, B_WAIT = 3'd2, B_FIN = 3'd3, B_ACK = 3'd4;
+    reg [2:0]  bst;
+    reg        b_start, b_busy, b_done, b_ack;
     reg [23:0] b_addr;
     reg [7:0]  b_count, b_dst;
     reg [23:0] b_a;
@@ -220,7 +228,7 @@ module aw_music #(
 
     always @(posedge clk) begin
         if (rst) begin
-            bst <= B_IDLE; rd_req <= 1'b0; b_done <= 1'b0; b_busy <= 1'b0;
+            bst <= B_IDLE; rd_req <= 1'b0; b_done <= 1'b0; b_busy <= 1'b0; b_ack <= 1'b0;
             rd_addr <= 24'd0; b_a <= 24'd0; b_n <= 8'd0; b_i <= 8'd0;
         end else begin
             case (bst)
@@ -253,6 +261,10 @@ module aw_music #(
             B_FIN: begin
                         b_done <= 1'b1;
                         b_busy <= 1'b0;
+                        bst    <= B_ACK;
+                    end
+            B_ACK: if (b_ack) begin
+                        b_done <= 1'b0;
                         bst    <= B_IDLE;
                     end
             default: bst <= B_IDLE;
@@ -278,7 +290,13 @@ module aw_music #(
         M_NEXTCH  = 5'd12,
         M_ADV     = 5'd13,
         M_WAIT    = 5'd14,
-        M_STOPALL = 5'd15;
+        M_STOPALL = 5'd15,
+        M_INSTR_N = 5'd23,
+        M_INSTR_G = 5'd24,
+        M_HDR_W   = 5'd19,
+        M_HDR_S   = 5'd20,
+        M_TICK_S  = 5'd21,
+        M_PAT_W   = 5'd22;
 
     reg [4:0]  mst;
     reg [15:0] num_r, delay_arg;
@@ -296,7 +314,11 @@ module aw_music #(
     reg [23:0] i_base [0:14], i_len [0:14], i_lp [0:14], i_ll [0:14];
     reg [4:0]  ins_i;
 
-    reg [7:0]  cur_order, cur_pos, num_order;
+    // cur_pos counts BYTES into a 1024-byte order (0, 16, ..., 1008): ten bits. It was eight, so it wrapped
+    // at 256 and `cur_pos == 1008` was really `== 240` in that width - the order advanced after sixteen rows
+    // and every row from then on fetched the wrong pattern. Measured: order 1 row 16 read row 0's bytes.
+    reg [7:0]  cur_order, num_order;
+    reg [9:0]  cur_pos;
     reg [2:0]  ch_idx;
     reg [15:0] note1, note2;
     reg [7:0]  note_vol;
@@ -333,7 +355,7 @@ module aw_music #(
 
     always @(posedge clk) begin
         if (rst) begin
-            mst <= M_IDLE; running_r <= 1'b0; cmd_valid <= 1'b0; cmd_touch <= 1'b0;
+            mst <= M_IDLE; running_r <= 1'b0; cmd_valid <= 1'b0; cmd_touch <= 1'b0; cmd_stop <= 1'b0;
             cmd_use_inc <= 1'b0; cmd_inc <= 9'd0; cmd_vol <= 8'd0;
             marker_valid <= 1'b0;
             num_r <= 16'd0; delay_arg <= 16'd0; pos_r <= 8'd0;
@@ -385,25 +407,43 @@ module aw_music #(
             // 64 header bytes, then the 128-byte order table
             M_HDR: begin
                 b_start <= 1'b0;
+                b_ack   <= 1'b0;
+                // the module scan's acknowledgement must be released here, or SC_IDLE sees sc_ack still high
+                // when M_HDR raises sc_go for the first instrument and drops the go on the floor (measured:
+                // the instrument phase stalled with sc idle, go 0, done 0 for the rest of the run)
+                sc_ack  <= 1'b0;
                 if (b_done) begin
+                    b_ack <= 1'b1;                      // consume this burst
                     if (!hdr_orders) begin
                         hdr_orders <= 1'b1;
                         b_addr  <= mod_base + 24'h40;
                         b_count <= 8'd128;
                         b_dst   <= 8'd1;
-                        b_start <= 1'b1;
+                        mst     <= M_HDR_W;             // wait for the reader to take the ack...
                     end else begin
                         num_order <= hdr[8'd63];
                         ins_i     <= 5'd0;
                         mst       <= M_INSTR;
                         sc_go     <= 1'b1;
-                        sc_target <= {hdr[8'd3], hdr[8'd2]};
+                        sc_target <= {hdr[8'd2], hdr[8'd3]};   // big-endian res: high byte first
                     end
                 end
+            end
+            M_HDR_W: begin                              // ...then for b_done to fall, then start
+                b_ack <= 1'b0;
+                if (!b_done) begin
+                    b_start <= 1'b1;
+                    mst     <= M_HDR_S;
+                end
+            end
+            M_HDR_S: begin
+                b_start <= 1'b0;
+                mst     <= M_HDR;
             end
 
             M_INSTR: begin
                 sc_ack <= 1'b0;
+                sc_go  <= 1'b0;
                 if (sc_done || sc_target == 16'd0) begin
                     sc_ack <= 1'b1;
                     if (sc_target != 16'd0 && sc_found) begin
@@ -412,7 +452,10 @@ module aw_music #(
                         i_len[ins_i]  <= {8'd0, sc_ls};
                         i_ll[ins_i]   <= {8'd0, sc_ll};
                         i_lp[ins_i]   <= (sc_ll != 16'd0) ? {8'd0, sc_ls} : 24'd0;
-                        i_vol[ins_i]  <= hdr[8'd3 + {ins_i, 2'b00}];
+                        // instrument i occupies bytes 2+4i..5+4i: res at 2+4i (big-endian), volume at 4+4i,
+                        // so the volume's LOW byte is 5+4i. Reading 3+4i gave the res's low byte - measured:
+                        // the volume table came out as 1,0,2,0,3,4,0,5,0,6, the resource ids themselves.
+                        i_vol[ins_i]  <= hdr[8'd5 + {ins_i, 2'b00}];
                     end else begin
                         i_ok[ins_i]   <= 1'b0;
                     end
@@ -422,13 +465,22 @@ module aw_music #(
                         dv_go  <= 1'b1;
                         mst    <= M_DELAY;
                     end else begin
-                        ins_i     <= ins_i + 5'd1;
-                        sc_target <= {hdr[8'd3 + {(ins_i + 5'd1), 2'b00}],
-                                      hdr[8'd2 + {(ins_i + 5'd1), 2'b00}]};
-                        sc_go     <= 1'b1;
-                        mst       <= M_INSTR;
+                        ins_i <= ins_i + 5'd1;
+                        mst   <= M_INSTR_N;         // ack first, THEN the next target
                     end
                 end
+            end
+            // the ack has to take effect before the next scan is asked for, or the scanner's done flag (a
+            // level until acknowledged) is read again on the next cycle and every instrument resolves to the
+            // module's own record - measured: i_base[0] = mod_base with len 0.
+            M_INSTR_N: if (!sc_done) begin
+                sc_ack    <= 1'b0;
+                sc_target <= {hdr[8'd2 + {ins_i, 2'b00}], hdr[8'd3 + {ins_i, 2'b00}]};
+                mst       <= M_INSTR_G;
+            end
+            M_INSTR_G: begin
+                sc_go <= (sc_target != 16'd0);
+                mst   <= M_INSTR;
             end
 
             M_DELAY: if (dv_done) begin
@@ -450,12 +502,24 @@ module aw_music #(
                 b_count <= 8'd16;
                 b_dst   <= 8'd2;
                 b_start <= 1'b1;
+                mst     <= M_TICK_S;
+            end
+            M_TICK_S: begin
+                b_start <= 1'b0;
                 mst     <= M_PAT;
             end
 
             M_PAT: begin
                 b_start <= 1'b0;
+                b_ack   <= 1'b0;
                 if (b_done) begin
+                    b_ack <= 1'b1;
+                    mst   <= M_PAT_W;
+                end
+            end
+            M_PAT_W: begin
+                b_ack <= 1'b0;
+                if (!b_done) begin
                     ch_idx <= 3'd0;
                     mst    <= M_CH;
                 end
@@ -466,10 +530,12 @@ module aw_music #(
                 note2 <= cn2;
                 if (cn1 == 16'hFFFD) begin
                     marker_value <= cn2;
+                    marker_ch    <= ch_idx[1:0];
                     marker_valid <= 1'b1;
                     mst          <= M_NEXTCH;
                 end else if (cn1 == 16'hFFFE) begin
                     cmd_valid   <= 1'b1;
+                    cmd_stop    <= 1'b1;                 // 0xFFFE is stopChannel
                     cmd_touch   <= 1'b1;
                     cmd_use_inc <= 1'b0;
                     cmd_ch      <= ch_idx[1:0];
@@ -486,6 +552,7 @@ module aw_music #(
             M_NOTE_SAMPLE: begin
                 if (have_ins) begin
                     cmd_valid   <= 1'b1;
+                    cmd_stop    <= 1'b0;
                     cmd_touch   <= 1'b0;                     // volume only, exactly as setChannelVolume does
                     cmd_use_inc <= 1'b0;
                     cmd_ch      <= ch_idx[1:0];
@@ -511,6 +578,7 @@ module aw_music #(
             M_CMD: if (dv_done) begin
                 if (have_ins) begin
                     cmd_valid   <= 1'b1;
+                    cmd_stop    <= 1'b0;                     // a play at volume 0 is still a play
                     cmd_touch   <= 1'b1;
                     cmd_use_inc <= 1'b1;
                     cmd_inc     <= dv_q[8:0];
@@ -533,17 +601,18 @@ module aw_music #(
             end
 
             M_ADV: begin
-                if (cur_pos == 8'd1008) begin
-                    cur_pos <= 8'd0;
+                if (cur_pos == 10'd1008) begin
+                    cur_pos <= 10'd0;
                     if (cur_order + 8'd1 == num_order) begin
-                        mst <= M_STOPALL;
+                        ch_idx <= 3'd0;          // stop all four channels starting at 0, in order
+                        mst    <= M_STOPALL;
                     end else begin
                         cur_order <= cur_order + 8'd1;
                         tick_cnt  <= 32'd0;
                         mst       <= M_WAIT;
                     end
                 end else begin
-                    cur_pos  <= cur_pos + 8'd16;
+                    cur_pos  <= cur_pos + 10'd16;
                     tick_cnt <= 32'd0;
                     mst      <= M_WAIT;
                 end
@@ -556,6 +625,7 @@ module aw_music #(
 
             M_STOPALL: begin
                 cmd_valid   <= 1'b1;
+                cmd_stop    <= 1'b1;
                 cmd_touch   <= 1'b1;
                 cmd_use_inc <= 1'b0;
                 cmd_ch      <= ch_idx[1:0];
