@@ -98,11 +98,14 @@ module tb_music;
     longint first_play_time = -1;
     integer tick_ms = 133, first_play_tick = -1, ticks = 0;
     integer i, fd, got;
+    reg compare_en = 1'b1;          // off for the stop-music case, which is not part of the oracle's table
 
     task automatic compare_cmd(input integer kind, input integer ch, input integer f1,
                                input integer f2, input integer f3, input integer f4, input integer f5);
         begin
-            if (ncmd >= nexp) begin
+            if (!compare_en) begin
+                // the stop-music check below is not part of the oracle's event table
+            end else if (ncmd >= nexp) begin
                 errors = errors + 1;
                 if (errors < 8) $display("  FAIL extra event #%0d: kind=%0d ch=%0d", ncmd, kind, ch);
             end else if (e_kind[ncmd] != kind || e_ch[ncmd] != ch || e_f1[ncmd] != f1 ||
@@ -193,6 +196,40 @@ module tb_music;
                 errors = errors + 1;
                 $display("  FAIL tempo: first note %0d ps outside [%0d, %0d]", first_play_time,
                          want - 1_000_000, want + slack);
+            end
+        end
+
+        // the VM's op_playMusic with num == 0 is STOP MUSIC, and the intro issues it on the frame before the
+        // real cue. A tracker that treats it as "load module 0" reads resource 0 (an empty SOUND) as a module
+        // header and then ignores the real cue - which is exactly what the first hardware run did: effects
+        // played, no music.
+        begin : stop_music
+            compare_en = 1'b0;
+            @(negedge clk); play <= 1; num <= 16'd0; delay <= 16'd0; pos <= 8'd0;
+            @(negedge clk); play <= 0;
+            i = 0;
+            while (dut.running && i < 1000) begin @(posedge clk); i = i + 1; end
+            if (dut.running) begin
+                errors = errors + 1;
+                $display("  FAIL stop-music: the tracker is still running after a num=0 cue");
+            end else begin
+                $display("  stop-music: num=0 returned the tracker to idle after %0d cycles", i);
+            end
+            // and a cue after a stop must start it again (the intro does stop-then-play on consecutive frames)
+            @(negedge clk); play <= 1; num <= 16'd7; delay <= 16'd15700; pos <= 8'd0;
+            @(negedge clk); play <= 0;
+            i = 0;
+            while (!dut.running && i < 100000) begin
+                @(posedge clk); i = i + 1;
+                if (i == 20 || i == 2000 || i == 20000)
+                    $display("  restart[%0d]: mst=%0d sc=%0d sc_go=%b sc_ack=%b sc_done=%b target=%0d ins=%0d",
+                             i, dut.mst, dut.sc, dut.sc_go, dut.sc_ack, dut.sc_done, dut.sc_target, dut.ins_i);
+            end
+            if (!dut.running) begin
+                errors = errors + 1;
+                $display("  FAIL restart: a cue after a stop did not start the tracker");
+            end else begin
+                $display("  restart: a cue after a stop started the tracker in %0d cycles", i);
             end
         end
 

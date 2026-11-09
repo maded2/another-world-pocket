@@ -127,7 +127,7 @@ module aw_music #(
     reg [11:0] sc_a;
     reg [7:0]  sc_k, sc_cnt, sc_b0;
     reg [15:0] sc_target;
-    reg        sc_go, sc_ack, sc_done, sc_found;
+    reg        sc_go, sc_ack, sc_done, sc_found, sc_abort;
     reg [7:0]  sc_rec [0:15];
     reg [4:0]  sc_i;
     reg [31:0] sc_blob;
@@ -140,7 +140,10 @@ module aw_music #(
             sc_a <= 12'd0; sc_k <= 8'd0; sc_cnt <= 8'd0; sc_i <= 5'd0; sc_p <= 2'd0;
             scan_addr <= 12'd0;
         end else begin
-            case (sc)
+            if (sc_abort) begin
+                sc      <= SC_IDLE;
+                sc_done <= 1'b0;
+            end else case (sc)
             SC_IDLE: if (sc_ack) begin
                          sc_done <= 1'b0;              // the consumer has taken the result
                      end else if (sc_go) begin
@@ -294,6 +297,7 @@ module aw_music #(
         M_ADV     = 5'd13,
         M_WAIT    = 5'd14,
         M_STOPALL = 5'd15,
+        M_RESTART = 5'd25,
         M_INSTR_N = 5'd23,
         M_INSTR_G = 5'd24,
         M_HDR_W   = 5'd19,
@@ -375,19 +379,38 @@ module aw_music #(
             cmd_valid    <= 1'b0;
             marker_valid <= 1'b0;
             dv_go        <= 1'b0;
+            if (mst != M_RESTART) sc_abort <= 1'b0;
 
-            case (mst)
+            // A cue is accepted in ANY state: the intro issues `num = 0` (stop music, vm.cpp) and then
+            // `num = 7` on consecutive frames, and the first version was still loading "module 0" - the
+            // index HAS a record for resource 0 (an empty sound), so it happily read that sound's bytes as a
+            // module header and then ignored the real cue because it was no longer idle. Measured on
+            // hardware: effects played, no music.
+            if (play) begin
+                num_r     <= num;
+                delay_arg <= delay;
+                pos_r     <= pos;
+                sc_go     <= 1'b0;
+                sc_ack    <= 1'b0;              // release any acknowledgement the last load left standing
+                sc_abort  <= 1'b1;              // abandon any scan in flight
+                if (num == 16'd0) begin
+                    ch_idx <= 3'd0;
+                    mst    <= M_STOPALL;        // stop music
+                end else begin
+                    mst    <= M_RESTART;
+                end
+            end else case (mst)
+            M_RESTART: begin
+                sc_abort  <= 1'b0;
+                sc_ack    <= 1'b0;
+                sc_target <= num_r;
+                sc_go     <= 1'b1;
+                mst       <= M_MODSCAN;
+            end
             M_IDLE: begin
                 running_r <= 1'b0;
                 sc_go     <= 1'b0;
-                if (play) begin
-                    num_r     <= num;
-                    delay_arg <= delay;
-                    pos_r     <= pos;
-                    sc_target <= num;
-                    sc_go     <= 1'b1;
-                    mst       <= M_MODSCAN;
-                end
+                sc_abort  <= 1'b0;
             end
 
             M_MODSCAN: begin
@@ -486,17 +509,23 @@ module aw_music #(
                 mst   <= M_INSTR;
             end
 
-            M_DELAY: if (dv_done) begin
-                delay_ms    <= dv_q;
-                tick_cycles <= dv_q * MS_CYCLES;
-                cur_order   <= pos_r;
-                cur_pos     <= 8'd0;
-                tick_cnt    <= 32'd0;
-                if (dv_q == 32'd0) begin
-                    mst <= M_IDLE;                    // a delay that rounds to 0 ms is not a tempo
-                end else begin
-                    running_r <= 1'b1;
-                    mst       <= M_TICK;
+            M_DELAY: begin
+                // the last instrument's acknowledgement is still held here; clear it, or the NEXT cue's scan
+                // start lands on SC_IDLE's ack branch and is dropped (measured: a cue after a stop left the
+                // player in M_MODSCAN with sc_go 0 and sc_ack 1 forever)
+                sc_ack <= 1'b0;
+                if (dv_done) begin
+                    delay_ms    <= dv_q;
+                    tick_cycles <= dv_q * MS_CYCLES;
+                    cur_order   <= pos_r;
+                    cur_pos     <= 10'd0;
+                    tick_cnt    <= 32'd0;
+                    if (dv_q == 32'd0) begin
+                        mst <= M_IDLE;                // a delay that rounds to 0 ms is not a tempo
+                    end else begin
+                        running_r <= 1'b1;
+                        mst       <= M_TICK;
+                    end
                 end
             end
 
