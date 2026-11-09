@@ -1045,7 +1045,13 @@ wire [7:0] vid_status = {1'b0, vid_saw_hs, vid_saw_vs, inmenu_s, design_run,
 wire [7:0] cons_data;
 wire       cons_valid, cons_ready;
 
-dbg_console u_cons (
+// The console banner is how a capture identifies WHICH bitstream is in the FPGA, and it derives the number
+// from this parameter. It was left at dbg_console's default, so every build since 1046 announced "AW 1046a
+// up" - the same lie the file's own comment records for 1040-1042, and it cost a hardware round trip: a
+// capture could not be told apart from the one it was meant to test. BUMP THIS WITH EVERY INSTALL.
+localparam [15:0] AW_BUILD_ID = 16'd1054;
+
+dbg_console #(.BUILD_ID(AW_BUILD_ID)) u_cons (
     .clk        ( clk_core          ),
     .rst_n      ( ~rst_core         ),
     .ev_boot    ( design_run_rise   ),

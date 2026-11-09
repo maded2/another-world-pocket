@@ -2043,7 +2043,9 @@ reg design_run = 1'b0;
         // Three claims, and the first two are the ones that were impossible to make before: the index really
         // was copied out of the image at boot, and a play issued by the GAME (not by a bench injection) put
         // non-zero bits on the DAC line while the bytecode stream kept flowing.
-        $display("tb_soc: music - cues %0d, tracker running %0d, commands %0d", aud_mus_cues, mus_running_w, aud_mus_cmds);
+        $display("tb_soc: music - cues %0d, tracker running %0d, commands %0d | tick_cycles=%0d delay_ms=%0d ord=%0d pos=%0d b_dst=%0d",
+                 aud_mus_cues, mus_running_w, aud_mus_cmds,
+                 u_music.tick_cycles, u_music.delay_ms, u_music.cur_order, u_music.cur_pos, u_music.b_dst);
         $display("tb_soc: audio - plays %0d, mixed samples %0d, DAC moved %0d, dropped ticks %0d, I2S underruns %0d overruns %0d, index loaded %0d",
                  aud_plays, aud_samples, aud_dac_moved, mix_drop_ticks_w,
                  aud_underruns_w, aud_overruns_w, idx_load_done_w);
