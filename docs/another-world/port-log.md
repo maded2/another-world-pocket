@@ -3297,3 +3297,27 @@ music cue, and whatever is heard afterwards is the game's own effects.
 Next experiment, and it is cheap: run a part whose script has no chapter request early enough to interrupt it,
 or add a suppression switch to the core the way the bench has one, and watch `C` on the console line. If `C`
 climbs there, the tracker will follow it.
+
+### The console contradicts the ear: the tracker has never run on hardware (2026-11-10)
+
+Reported after AW 1060 (chapter request tied off): "sound and music running in part 2", plus an operational
+detail worth keeping - the OSD part only takes effect if the core is started a SECOND time, which is the
+framework writing the persisted interact value late.
+
+The console from that same run, live, with the frame counter climbing:
+
+    V=0000f0 ... M0 0000 0000 C00 S00 D00
+    V=0007f8 ... M0 0000 0000 C00 S00 D00
+    V=001158 ... M0 0000 0000 C00 S00 D00
+
+`C` counts every change of `mus_seq`; it is zero, so the VM never executed `op_playMusic` in that run and the
+tracker never left its idle state (`S00`, 0 rows, 0 notes). Therefore the music heard cannot be the tracker.
+It is the game's own effects - the intro's cues are melodic enough to be mistaken for music, and the tracker's
+first note is at 8.5 s, which is the number to listen for when distinguishing the two.
+
+So the open question is no longer the audio path, which now has four independent hardware confirmations: the
+effects play, the mixer keeps its ticks, the byte port serves two clients and the I2S output is clean. The
+question is why the VM never issues the music opcode on hardware when the same netlist, image and part issue
+`num=0` then `num=7` at frame ~7 in simulation. The next measurement is a `snd_seq` counter beside `C`: if
+that also stays zero, the VM is not reaching ANY audio opcode on hardware and the pack view is the suspect; if
+it climbs, the opcode dispatch itself is.
