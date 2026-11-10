@@ -3321,3 +3321,25 @@ question is why the VM never issues the music opcode on hardware when the same n
 `num=0` then `num=7` at frame ~7 in simulation. The next measurement is a `snd_seq` counter beside `C`: if
 that also stays zero, the VM is not reaching ANY audio opcode on hardware and the pack view is the suspect; if
 it climbs, the opcode dispatch itself is.
+
+### Part 7 too: the music is audible and the tracker is still idle (2026-11-10)
+
+The owner ran part 7 - the part with music - and heard it. The console from that run, live:
+
+    G75  (part 7 installed)   Z.0  0545c705  (the audio image, whole)
+    M0 0000 0000 I000 A000000 C00 S00 D00
+
+`C` (changes of `mus_seq`) is zero again, `S00` idle, 0 rows, 0 notes. So the tracker did not play that music
+either, and the conclusion is not about a part: **the music this port produces by ear is coming from
+`op_playSound`, not from `op_playMusic`**.
+
+That is not as strange as it sounds. Eleven of the 103 extracted sounds LOOP, and the harvest's most frequent
+cue (`res 8`, `freq 1`) is a low, looping sample - which is what "music" sounds like in Another World's intro.
+The tracker's module 7 is a different, rarer thing (`num=7 delay=15700`), bench-verified but never yet
+observed running on hardware.
+
+So the state to carry forward is: the AUDIO FEATURE IS DONE (effects, looping included, mixed at 48 kHz and
+audible for the whole intro, on the shipping image), and the TRACKER is a separate, bench-verified component
+waiting for a cue the VM has not been seen to issue on hardware. The measurement that would confirm the VM's
+audio dispatch works at all - and so isolate opcode 0x1A - is a `snd_seq` counter beside `C` on the console
+line. It needs area, and the area question is #19.
