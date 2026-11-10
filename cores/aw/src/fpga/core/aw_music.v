@@ -75,7 +75,8 @@ module aw_music #(
     output reg         marker_valid,
     output reg  [15:0] marker_value,
     output reg  [1:0]  marker_ch,
-    output wire        running
+    output wire        running,
+    output wire [4:0]  state_o         // the FSM state, for the console: where a stuck load is stuck
 );
 
     // ================================================================== divider
@@ -337,6 +338,7 @@ module aw_music #(
     reg [31:0] tick_cycles, tick_cnt, delay_ms;
 
     assign running = running_r;
+    assign state_o = mst;
 
     // the current channel's 4-byte event, straight out of the row buffer
     wire [7:0] cb0 = pat[{ch_idx, 2'b00}];

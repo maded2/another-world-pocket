@@ -50,6 +50,8 @@ module dbg_console (
     input  wire [15:0]  mus_plays,
     input  wire [8:0]   mus_last_inc,
     input  wire [23:0]  mus_last_base,
+    input  wire [7:0]   mus_cues,            // how many times the game asked for music
+    input  wire [4:0]   mus_state,           // aw_music's FSM state: where a stuck load is stuck
     // Directory / paging state, so "the VM is running the wrong data" can be told apart from "the
     // upload is corrupt" - which is the whole point, because both look the same on the panel: black
     // screen, or animated garbage. All of these are aw_rom outputs already synchronised into clk_core
@@ -280,14 +282,15 @@ always @(*) begin
         MID_ERR3:    msg_len = 6'd23;
         MID_MENUIN:  msg_len = 6'd8;
         MID_MENUOUT: msg_len = 6'd8;
-        MID_CHK:     msg_len = 8'd182;
+        MID_CHK:     msg_len = 8'd190;
         default:     msg_len = 6'd8;
     endcase
 end
 
 // zero-extended copy of the music rate for the hex formatter: a bit-select cannot be applied to a
 // concatenation, and {7'd0, mus_last_inc}[...] is exactly that.
-wire [15:0] mus_inc16 = {7'd0, mus_last_inc};
+wire [15:0] mus_inc16   = {7'd0, mus_last_inc};
+wire [7:0]  mus_state8  = {3'd0, mus_state};
 
 // nibble -> ASCII hex char (for the periodic CHK dump)
 function [7:0] hxn;
@@ -414,6 +417,14 @@ always @(*) begin
             else if (pos == 8'd173) tx_data = 8'h20;                   // ' '
             else if (pos == 8'd174) tx_data = 8'h41;                   // 'A'
             else if (pos <= 8'd180) tx_data = hxn(mus_last_base[(8'd180 - pos)*4 +: 4]);
+            // C: how many cues arrived; S: aw_music's state. Together they say "no cue", "stuck in the
+            // module scan", "stuck reading the header", "stuck resolving instruments" without a guess.
+            else if (pos == 8'd181) tx_data = 8'h20;                   // ' '
+            else if (pos == 8'd182) tx_data = 8'h43;                   // 'C'
+            else if (pos <= 8'd184) tx_data = hxn(mus_cues[(8'd184 - pos)*4 +: 4]);
+            else if (pos == 8'd185) tx_data = 8'h20;                   // ' '
+            else if (pos == 8'd186) tx_data = 8'h53;                   // 'S'
+            else if (pos <= 8'd188) tx_data = hxn(mus_state8[(8'd188 - pos)*4 +: 4]);
             else                    tx_data = 8'h0a;                   // '\n'
         end
         MID_UP:      tx_data = MSG_UP      [(11 - pos)*8 +: 8];
