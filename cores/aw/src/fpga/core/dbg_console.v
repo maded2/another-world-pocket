@@ -52,6 +52,7 @@ module dbg_console (
     input  wire [23:0]  mus_last_base,
     input  wire [7:0]   mus_cues,            // how many times the game asked for music
     input  wire [4:0]   mus_state,           // aw_music's FSM state: where a stuck load is stuck
+    input  wire [7:0]   mus_inc1_cnt,        // of those changes, how many were exactly +1
     // Directory / paging state, so "the VM is running the wrong data" can be told apart from "the
     // upload is corrupt" - which is the whole point, because both look the same on the panel: black
     // screen, or animated garbage. All of these are aw_rom outputs already synchronised into clk_core
@@ -282,7 +283,7 @@ always @(*) begin
         MID_ERR3:    msg_len = 6'd23;
         MID_MENUIN:  msg_len = 6'd8;
         MID_MENUOUT: msg_len = 6'd8;
-        MID_CHK:     msg_len = 8'd190;
+        MID_CHK:     msg_len = 8'd194;
         default:     msg_len = 6'd8;
     endcase
 end
@@ -425,6 +426,9 @@ always @(*) begin
             else if (pos == 8'd185) tx_data = 8'h20;                   // ' '
             else if (pos == 8'd186) tx_data = 8'h53;                   // 'S'
             else if (pos <= 8'd188) tx_data = hxn(mus_state8[(8'd188 - pos)*4 +: 4]);
+            else if (pos == 8'd189) tx_data = 8'h20;                   // ' '
+            else if (pos == 8'd190) tx_data = 8'h44;                   // 'D' changes that were +1
+            else if (pos <= 8'd192) tx_data = hxn(mus_inc1_cnt[(8'd192 - pos)*4 +: 4]);
             else                    tx_data = 8'h0a;                   // '\n'
         end
         MID_UP:      tx_data = MSG_UP      [(11 - pos)*8 +: 8];

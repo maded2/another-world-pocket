@@ -158,7 +158,7 @@ module tb_dbg_console;
         // music telemetry: running, 64 rows, 3 notes, and the last one's rate/address
         .mus_running(1'b1), .mus_rows(16'h0040), .mus_plays(16'h0003),
         .mus_last_inc(9'h02C), .mus_last_base(24'h2F4878),
-        .mus_cues(8'h02), .mus_state(5'd3),
+        .mus_cues(8'h02), .mus_state(5'd3), .mus_inc1_cnt(8'h02),
         .tx_data(c_data), .tx_valid(c_valid), .tx_ready(c_ready)
     );
 
@@ -358,7 +358,7 @@ module tb_dbg_console;
         recv_line_c("AW 1046a up\n", 12);     // dut_c takes the defaults: BUILD_ID 1046, suffix 'a'
         // C<err>:<32 hex chk> W<match>/<all> S<status> - the loader counters
         // the M field is appended after E, so every parser written before it still reads the same prefixes
-        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75 Z.0 1a2b3c4d/1a2b3c4d G25 E00 M1 0040 0003 I02c A2f4878 C02 S03\n", 190);
+        recv_line_c("C0:00000000000000000000000000000000 deadbeef/00080000 S4000 Daaaa Bbbbb Ncccc Rdddd P5678 V00012c F0fa00 L01d4c Y001255d3 X75 Z.0 1a2b3c4d/1a2b3c4d G25 E00 M1 0040 0003 I02c A2f4878 C02 S03 D02\n", 194);
 
         if (errors == 0) $display("tb_dbg_console: -> PASS");
         else             $display("tb_dbg_console: -> FAIL (%0d errors)", errors);

@@ -1049,7 +1049,7 @@ wire       cons_valid, cons_ready;
 // from this parameter. It was left at dbg_console's default, so every build since 1046 announced "AW 1046a
 // up" - the same lie the file's own comment records for 1040-1042, and it cost a hardware round trip: a
 // capture could not be told apart from the one it was meant to test. BUMP THIS WITH EVERY INSTALL.
-localparam [15:0] AW_BUILD_ID = 16'd1057;
+localparam [15:0] AW_BUILD_ID = 16'd1059;
 
 dbg_console #(.BUILD_ID(AW_BUILD_ID)) u_cons (
     .clk        ( clk_core          ),
@@ -1220,14 +1220,13 @@ always @(posedge clk_core) begin
     if (rst_core) mus_seq_d <= 8'd0;
     else          mus_seq_d <= mus_seq;
 end
-// A CUE INCREMENTS mus_seq; A SoC RESET DROPS IT TO ZERO.
-//
-// The game asks for the next chapter within the first frames of part 1, and a chapter change resets the SoC -
-// which returns mus_seq to 0. "Any change" therefore turned a reset into a `num = 0` stop cue for the tracker,
-// which it obeyed a few milliseconds after starting to load module 7. The increment test tells the two apart:
-// a reset lands on 0 without having incremented, a cue always adds one (wrapping 255 -> 0 included).
+// A cue is a CHANGE of mus_seq (this is what played on AW 1052). The increment test that was meant to tell a
+// cue from a SoC reset silencing the counter is kept as a MEASUREMENT, not as the trigger: with it as the
+// trigger nothing ever played, and the two counters below say whether the counter is incrementing by one at
+// all. C counts every change, D counts the changes that were exactly +1.
 wire [7:0] mus_delta = mus_seq - mus_seq_d;
-wire mus_play = (mus_delta == 8'd1);
+wire mus_play = (mus_seq != mus_seq_d);
+wire mus_inc1 = (mus_delta == 8'd1);
 
 wire        mus_cmd_valid, mus_cmd_stop, mus_cmd_touch, mus_cmd_use_inc;
 wire [8:0]  mus_cmd_inc;
@@ -1244,10 +1243,15 @@ wire [1:0]  mus_marker_ch;
 wire        mus_running;
 wire        mus_row_valid;
 wire [4:0]  mus_state;
-reg  [7:0]  mus_cues;
+reg  [7:0]  mus_cues, mus_inc1_cnt;
 always @(posedge clk_core) begin
-    if (rst_core)            mus_cues <= 8'd0;
-    else if (mus_play)       mus_cues <= mus_cues + 8'd1;
+    if (rst_core) begin
+        mus_cues     <= 8'd0;
+        mus_inc1_cnt <= 8'd0;
+    end else begin
+        if (mus_play)  mus_cues     <= mus_cues + 8'd1;
+        if (mus_inc1)  mus_inc1_cnt <= mus_inc1_cnt + 8'd1;
+    end
 end
 // Counters for the console line: what the tracker is actually doing on hardware. The music is the one part
 // of this feature whose failure is not visible in the picture, so it has to report on itself.
@@ -1473,9 +1477,14 @@ always @(posedge clk_core) begin
     else if (idx_load_done && aud_owner == 2'd1) aud_owner <= 2'd2;
     else if (audio_base_ok && aud_owner == 2'd2) aud_owner <= 2'd0;
     else if (audio_base_ok && shim_idle) begin
-        if (mus_rd_req && !mix_rd_req)       aud_owner <= 2'd3;
-        else if (mix_rd_req && !mus_rd_req)  aud_owner <= 2'd0;
-        else if (mus_rd_req && mix_rd_req)   aud_owner <= (aud_owner == 2'd3) ? 2'd0 : 2'd3;
+        // THE MIXER WINS, THE TRACKER TAKES THE GAPS.
+        //
+        // Round-robin was wrong: the mixer needs its eight bytes inside a 516-cycle tick, and sharing every
+        // other slot doubled that, so ticks stopped completing and the core went SILENT - effects included.
+        // The tracker needs 16 bytes per 133 ms, i.e. one byte every ~800 us, and the mixer's tick leaves
+        // most of the port idle, so priority costs the music nothing.
+        if (mix_rd_req)      aud_owner <= 2'd0;
+        else if (mus_rd_req) aud_owner <= 2'd3;
     end
 end
 
