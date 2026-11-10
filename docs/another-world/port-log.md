@@ -3274,3 +3274,26 @@ The trail, because every step looked like something else:
 
 The lesson worth keeping: the loader has no flow control from the framework, so the buffer *is* the defence,
 and its size was documented wrongly by a factor of 32 in the one comment anyone would read.
+
+### Hardware, AW 1059: the effects are back; the tracker's cue never arrives (2026-11-10)
+
+With the audio image (`aw-all-audio.bin`, census sum `0545c705` = the image's own declared sum) the intro's
+sound effects play again after the arbiter fix: the mixer owns the PSRAM byte port and the tracker takes the
+gaps, so a 48 kHz tick can no longer be stretched past a tick by the music's reads. That regression was mine:
+introducing a second client on the port in AW 1051 halved the mixer's throughput, which showed up first as
+garbled music (1052) and then as total silence (1058), and it was only caught because the effects were asked
+about directly.
+
+What is NOT happening, and the console says so plainly:
+
+    M0 0000 0000 C00 S00 D00      running 0, 0 rows, 0 notes, 0 cue changes
+
+The tracker never starts, because `mus_seq` never changes on hardware - `C` counts every change of it and it
+stays zero. In simulation the same part, image and netlist issue two cues at frame ~7 (`num=0` stop, then
+`num=7`); the simulation runs with the game's chapter request suppressed (`+HOLDPART=1`), and on hardware that
+request fires within the first frames and resets the SoC - so part 1's script is reset before it reaches its
+music cue, and whatever is heard afterwards is the game's own effects.
+
+Next experiment, and it is cheap: run a part whose script has no chapter request early enough to interrupt it,
+or add a suppression switch to the core the way the bench has one, and watch `C` on the console line. If `C`
+climbs there, the tracker will follow it.
