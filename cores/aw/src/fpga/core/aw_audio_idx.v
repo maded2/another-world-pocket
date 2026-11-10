@@ -41,6 +41,10 @@ module aw_audio_idx #(
     input  wire        ldr_valid,
     input  wire [7:0]  ldr_data,
 
+    // tag byte and record count as COPIED
+    output reg  [7:0]  dbg_tag,
+    output reg  [7:0]  dbg_count,
+
     // ---- local RAM read port for a second client (the music tracker) ----
     // The tracker needs to resolve instrument resource ids too, and sharing the single-request resolver with
     // aw_audio_ch would mean a sound effect and a module load colliding (one of them would be told "not
@@ -122,7 +126,10 @@ module aw_audio_idx #(
                             mem[n]   <= ldr_data;
                             mem_s[n] <= ldr_data;
                         end
-                        if (!in_rec && n == 12'd1) cnt <= ldr_data;
+                        // the tag and count come from the STREAM, not from a second read of the array
+                        if (!in_rec && n == 12'd0) dbg_tag   <= ldr_data;
+                        if (!in_rec && n == 12'd1) dbg_count <= ldr_data;
+                        if (!in_rec && n == 12'd1) cnt       <= ldr_data;
                         lst <= L_NEXT;
                     end
             // Clamp to the RAM: a count that does not fit is a layout error, and copying past the end of an
@@ -160,11 +167,22 @@ module aw_audio_idx #(
     end
 
     // ------------------------------------------------------------------ lookup
+    // THE RESOLVER'S READ IS SYNCHRONISED: address in one state, data captured in the next. That is what lets
+    // Quartus put this array in block RAM - with an asynchronous read it built 16,710 registers instead,
+    // ~2,000 ALMs, and the fitter had no room for anything else (measured: aw_audio_idx 7,897 ALMs at 1059,
+    // 24,383 when a second read of the same array appeared in the loader).
+    reg  [11:0] res_addr;
+    reg  [7:0]  res_q;
+    always @(posedge clk) begin
+        res_q <= mem[res_addr];
+    end
+
     // The scan is one record at a time in local memory: 16 captures plus the compare, ~17 clk per record, so
     // the worst case (the last of 106 records) is ~1800 clk = 73 us - and no PSRAM traffic.
-    localparam [1:0] S_IDLE = 2'd0, S_CAP = 2'd1, S_LATCH = 2'd2;
+    localparam [2:0] S_IDLE = 3'd0, S_CNT = 3'd1, S_CNT2 = 3'd2,
+                     S_WAIT = 3'd3, S_DATA = 3'd4, S_LATCH = 3'd5;
 
-    reg [1:0]  st;
+    reg [2:0]  st;
     reg [7:0]  count;
     reg [7:0]  k;            // record index
     reg [4:0]  bi;           // byte index within the record
@@ -185,38 +203,34 @@ module aw_audio_idx #(
     always @(posedge clk) begin
         if (rst) begin
             st <= S_IDLE; busy <= 1'b0; found <= 1'b0;
-            k <= 8'd0; bi <= 5'd0; count <= 8'd0; a <= 12'd0;
+            k <= 8'd0; bi <= 5'd0; count <= 8'd0; a <= 12'd0; res_addr <= 12'd0;
         end else begin
             case (st)
             S_IDLE: if (start) begin
-                        want  <= res_id;
-                        found <= 1'b0;
-                        if (!load_done) begin
-                            // The index is not resident yet: report not-found rather than scanning garbage.
-                            // core_top does not issue a play before boot completes, so this is a guard - and it
-                            // still raises `busy` for a cycle so the controller's S_SEEN state sees the walk
-                            // start, exactly as a real lookup does. A lookup that answers "not found" with no
-                            // busy at all is the race that made every real play come out as a stop.
-                            busy  <= 1'b1;
-                            count <= 8'd0;
-                            k     <= 8'd0;
-                            st    <= S_LATCH;
-                        end else begin
-                            busy  <= 1'b1;
-                            count <= mem[8'd1];
-                            k     <= 8'd0;
-                            bi    <= 5'd0;
-                            a     <= 12'd4;
-                            st    <= S_CAP;
-                        end
+                        want     <= res_id;
+                        found    <= 1'b0;
+                        busy     <= 1'b1;
+                        k        <= 8'd0;
+                        bi       <= 5'd0;
+                        a        <= 12'd4;
+                        res_addr <= 12'd1;              // the count byte
+                        st       <= S_CNT;
                     end
-            S_CAP: begin
-                        rec[bi] <= mem[a];
-                        if (bi == 5'd15) begin
-                            st <= S_LATCH;
-                        end else begin
+            S_CNT:  st <= S_CNT2;                       // res_q <- mem[1]
+            S_CNT2: begin
+                        count    <= res_q;
+                        res_addr <= a;                  // first record byte
+                        st       <= S_WAIT;
+                    end
+            S_WAIT: st <= S_DATA;
+            S_DATA: begin
+                        rec[bi]  <= res_q;
+                        res_addr <= a + 12'd1;
+                        a        <= a + 12'd1;
+                        if (bi == 5'd15) st <= S_LATCH;
+                        else begin
                             bi <= bi + 5'd1;
-                            a  <= a + 12'd1;
+                            st <= S_WAIT;
                         end
                     end
             S_LATCH: begin
@@ -235,10 +249,10 @@ module aw_audio_idx #(
                             found <= 1'b0;
                             st    <= S_IDLE;
                         end else begin
-                            k     <= k + 8'd1;
-                            bi    <= 5'd0;
-                            a     <= a + 12'd1;             // a is at base+15; next base is +16
-                            st    <= S_CAP;
+                            k        <= k + 8'd1;
+                            bi       <= 5'd0;
+                            res_addr <= a;                  // a already points at the next record
+                            st       <= S_WAIT;
                         end
                     end
             default: st <= S_IDLE;

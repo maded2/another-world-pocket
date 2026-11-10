@@ -764,7 +764,7 @@ set_global_assignment -name OPTIMIZE_HOLD_TIMING "All Paths"
 # The one hold path left after that was a ZERO-LOGIC register-to-register hop (aw_audio_rd.data -> aw_mixer.b2)
 # with 0.514 ns of data delay against 0.523 ns of clock skew: -0.009 ns on the fast corner. A different seed
 # changes the placement of those two registers, which is all this needs.
-set_global_assignment -name SEED 2
+set_global_assignment -name SEED 4
 set_global_assignment -name VERILOG_FILE core/aw_audio_tick.v
 set_global_assignment -name VERILOG_FILE core/aw_audio_idx.v
 set_global_assignment -name VERILOG_FILE core/aw_audio_ch.v

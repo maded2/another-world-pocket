@@ -948,12 +948,7 @@ aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .aud_data             ( aud_data             ),
     .aud_valid            ( aud_valid            ),
     .rom_vm_restart       ( rom_vm_restart       ),
-    // DIAGNOSTIC BUILD AW 1060: the game's chapter request is IGNORED, so part 1 runs uninterrupted and its
-    // music cue can be observed. The bench has done this for weeks (`+HOLDPART=1`); on hardware the request
-    // fires within the first frames and resets the SoC, which is the leading explanation for the tracker
-    // reporting no cue at all (C00). If C climbs and the music plays here, the diagnosis is the switch and not
-    // the tracker. NOT a shipping configuration - the OSD part selection still works.
-    .vm_part_req          ( 16'd0               ),
+    .vm_part_req          ( vm_part_req          ),
 
     .cram0_a              ( cram0_a              ),
     .cram0_dq             ( cram0_dq             ),
@@ -1054,7 +1049,7 @@ wire       cons_valid, cons_ready;
 // from this parameter. It was left at dbg_console's default, so every build since 1046 announced "AW 1046a
 // up" - the same lie the file's own comment records for 1040-1042, and it cost a hardware round trip: a
 // capture could not be told apart from the one it was meant to test. BUMP THIS WITH EVERY INSTALL.
-localparam [15:0] AW_BUILD_ID = 16'd1060;
+localparam [15:0] AW_BUILD_ID = 16'd1062;
 
 dbg_console #(.BUILD_ID(AW_BUILD_ID)) u_cons (
     .clk        ( clk_core          ),
@@ -1088,6 +1083,20 @@ dbg_console #(.BUILD_ID(AW_BUILD_ID)) u_cons (
     .part_late     ( rom_part_late      ),
     .rom_part      ( rom_part_sel       ),
     .dir_err       ( rom_dir_err        ),
+    // The music's own telemetry. These inputs existed on dbg_console from AW 1055 but were never connected
+    // here, and Verilog ties an unconnected input to 0 - so every capture printed M0 0000 0000 C00 S00 D00 and
+    // three hardware sessions were spent chasing a cue that the console was not actually reporting on.
+    .mus_running   ( mus_running        ),
+    .mus_rows      ( mus_rows           ),
+    .mus_plays     ( mus_plays          ),
+    .mus_last_inc  ( mus_last_inc       ),
+    .mus_last_base ( mus_last_base      ),
+    .mus_cues      ( mus_cues           ),
+    .mus_state     ( mus_state          ),
+    .mus_inc1_cnt  ( mus_inc1_cnt       ),
+    .snd_cues      ( snd_cues           ),
+    .idx_tag       ( idx_tag            ),
+    .idx_count     ( idx_count          ),
     .tx_data    ( cons_data         ),
     .tx_valid   ( cons_valid        ),
     .tx_ready   ( cons_ready        )
@@ -1275,6 +1284,14 @@ always @(posedge clk_core) begin
             mus_last_base <= mus_cmd_base;
         end
     end
+end
+wire [7:0]  idx_tag, idx_count;
+// How many op_playSound requests the VM has issued. Beside the music's cue counter this separates "the VM
+// never reaches any audio opcode" from "it reaches sounds but not music", which look identical by ear.
+reg  [7:0]  snd_cues;
+always @(posedge clk_core) begin
+    if (rst_core)      snd_cues <= 8'd0;
+    else if (snd_play) snd_cues <= snd_cues + 8'd1;
 end
 wire [11:0] idx_scan_addr;
 wire [7:0]  idx_scan_q;
