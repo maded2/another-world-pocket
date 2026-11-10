@@ -948,7 +948,12 @@ aw_rom #(.CENSUS_RANGE(CENSUS_RANGE)) u_rom (
     .aud_data             ( aud_data             ),
     .aud_valid            ( aud_valid            ),
     .rom_vm_restart       ( rom_vm_restart       ),
-    .vm_part_req          ( vm_part_req          ),
+    // DIAGNOSTIC BUILD AW 1060: the game's chapter request is IGNORED, so part 1 runs uninterrupted and its
+    // music cue can be observed. The bench has done this for weeks (`+HOLDPART=1`); on hardware the request
+    // fires within the first frames and resets the SoC, which is the leading explanation for the tracker
+    // reporting no cue at all (C00). If C climbs and the music plays here, the diagnosis is the switch and not
+    // the tracker. NOT a shipping configuration - the OSD part selection still works.
+    .vm_part_req          ( 16'd0               ),
 
     .cram0_a              ( cram0_a              ),
     .cram0_dq             ( cram0_dq             ),
@@ -1049,7 +1054,7 @@ wire       cons_valid, cons_ready;
 // from this parameter. It was left at dbg_console's default, so every build since 1046 announced "AW 1046a
 // up" - the same lie the file's own comment records for 1040-1042, and it cost a hardware round trip: a
 // capture could not be told apart from the one it was meant to test. BUMP THIS WITH EVERY INSTALL.
-localparam [15:0] AW_BUILD_ID = 16'd1059;
+localparam [15:0] AW_BUILD_ID = 16'd1060;
 
 dbg_console #(.BUILD_ID(AW_BUILD_ID)) u_cons (
     .clk        ( clk_core          ),
