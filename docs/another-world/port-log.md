@@ -3343,3 +3343,29 @@ audible for the whole intro, on the shipping image), and the TRACKER is a separa
 waiting for a cue the VM has not been seen to issue on hardware. The measurement that would confirm the VM's
 audio dispatch works at all - and so isolate opcode 0x1A - is a `snd_seq` counter beside `C` on the console
 line. It needs area, and the area question is #19.
+
+### SOLVED: the tracker has been working on hardware - the console was lying (2026-11-11)
+
+AW 1062, first build whose music telemetry is actually connected:
+
+    M1 011a 005a  I02c  A2f0008   C02 S0e D02   K0000   E1b
+
+* `M1` running, **282 rows fetched, 90 notes played**
+* `I02c` = rate increment 44, `A2f0008` = the first instrument's sample address, both exactly the oracle's
+  values for module 7's first note
+* `C02` = the two cues the harvest predicts (a stop, then a play), `D02` = both increments
+* `E1b` = 27 `op_playSound` requests, so the VM's audio dispatch is fine
+* `S0e` = the tracker's M_WAIT, i.e. waiting for the next tick - the normal state between rows
+
+So **the music has been working**, and every previous "M0 0000 0000 C00" reading was the console's music
+inputs tied to zero: `dbg_console` had the ports since AW 1055 but `core_top` never connected them after a
+revert. Verilog ties an unconnected input low, the console printed zeros, and those zeros were read as
+measurements for four hardware sessions - the delta test, the chapter-request reset and the index scan were all
+"diagnosed" from them. The owner's ears were the reliable instrument the whole time.
+
+`K0000` is the same fault once more, one level down: `aw_audio_idx`'s new `dbg_tag`/`dbg_count` outputs were
+left unconnected in core_top. Connected in the tree; needs a rebuild to show 416a.
+
+LESSON, twice over: an unconnected module input is silently zero, and every lint in this repo runs -Wno-lint.
+A bench that compares console text cannot see connectivity. Any new status field must be checked by *driving a
+known value through it* (tb_dbg_console does that for the fields it knows) and by confirming the wire exists.
