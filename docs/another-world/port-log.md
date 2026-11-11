@@ -3480,3 +3480,24 @@ built and is superseded before it ever reached a card.
 
 Hardware question that remains for this build: `K416a` on the CHK line, with M/C/E unchanged from
 AW 1062. Nothing above has been on a Pocket.
+
+### The area decision, recorded where the next person will look
+
+The telemetry that solved the tracker only fits because `aw_audio_idx`'s 2048x8 index became block RAM:
+7,897 -> 296 ALMs, and the design from 1,790 LABs (97%) to 1,101 (60%). Three things were tried, in order,
+and only the last worked:
+
+1. **The first idea was the expensive one**: have the tracker resolve its instruments by reading the index
+   region from PSRAM through its existing burst reader and delete the second in-FPGA copy (`mem_s`). It
+   was implemented and the fit came out **worse** (2,224 LABs), so it was reverted. The tracker's scan is a
+   few thousand cycles against a 129 ms tick - the cost was never the scan, it was that the resolver read
+   `mem` asynchronously and the loader read `mem[0]`/`mem[1]` as a *second port*; either one forbids
+   block-RAM inference.
+2. **A registered read alone did not help** (M10K stayed at 175, ALMs went up) while `mem_s` still existed.
+3. **What worked**: one array, one synchronous reader (two states per byte: present, capture), and the
+   console's tag/count taken from the loader's own byte stream instead of a second read of the array. Then
+   `mem` infers as M10K and the module all but disappears.
+
+Two process notes worth more than the numbers: comparing the fit report's **per-entity** ALM/register lines
+before and after a structural change is what caught attempt 2; and the fitter needed seed 4 to clear a
+-0.086 ns hold violation that appeared at the new 60% occupancy (setup 0.392 / hold 0.079 at the time).

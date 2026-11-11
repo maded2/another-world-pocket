@@ -180,9 +180,15 @@ simulation can only half-cover.
 `sleep_supported: false` the OS should fully restart it — verify it comes back to the screen legend,
 not a frozen frame).
 
-**7. Part switching without re-flashing.** Load `part1`, then `part2`, then `part5` from the OSD.
-*Proves:* the one-bitstream decision (part is data, offsets come from the pack trailer) on hardware,
-which is what that decision was made on reasoning alone.
+**7. Part selection from ONE dataslot file.** Load `aw-all-audio.bin` (the combined image) and choose
+`Game part` in the OSD view, not a different file: since the paged build, one upload carries all eight
+parts, a 32 KiB directory page holds their page tables, and the select is a value the framework persists.
+*Proves:* part is data — the one-bitstream decision — on hardware, which that decision was made on
+reasoning alone. The console's `G<part><flags>` is the state; `part_late` (bit 3 of the flags) says a
+select was refused.
+*Known:* the persisted value can arrive after the boot sweep, so the FIRST launch may boot part 0 and
+switch mid-run; starting the core a second time boots the chosen part. That is open (task: first-launch
+select) — record which behaviour the firmware in hand shows.
 *Note:* `part0.bin` is the copy-protection screen and is near-black **by design** — it is not a fault,
 and the reference simulator is equally dark.
 
