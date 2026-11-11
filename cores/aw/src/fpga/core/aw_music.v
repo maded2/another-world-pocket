@@ -69,7 +69,6 @@ module aw_music #(
     output reg  [1:0]  cmd_ch,
     output reg  [7:0]  cmd_vol,
     output reg  [23:0] cmd_len, cmd_lp, cmd_ll, cmd_base,
-    output reg  [5:0]  cmd_freq,
 
     output reg         row_valid,      // one cycle per pattern row fetched: the tracker's own progress
     output reg         marker_valid,

@@ -1049,7 +1049,7 @@ wire       cons_valid, cons_ready;
 // from this parameter. It was left at dbg_console's default, so every build since 1046 announced "AW 1046a
 // up" - the same lie the file's own comment records for 1040-1042, and it cost a hardware round trip: a
 // capture could not be told apart from the one it was meant to test. BUMP THIS WITH EVERY INSTALL.
-localparam [15:0] AW_BUILD_ID = 16'd1062;
+localparam [15:0] AW_BUILD_ID = 16'd1063;
 
 dbg_console #(.BUILD_ID(AW_BUILD_ID)) u_cons (
     .clk        ( clk_core          ),
@@ -1223,6 +1223,11 @@ aw_audio_idx u_audio_idx (
     .r_pcm_len  ( idx_plen       ),
     .r_loop_start ( idx_ls       ),
     .r_loop_len   ( idx_ll       ),
+    // the tag and count as COPIED, for the console's K field. These were declared and printed since AW 1062
+    // but never driven here - the same unconnected-input fault as the music fields, one level down, and just
+    // as invisible: the bench drives dbg_console's idx_tag/idx_count directly, so nothing failed.
+    .dbg_tag    ( idx_tag        ),
+    .dbg_count  ( idx_count      ),
     // the tracker resolves its instrument records through this port rather than the single-request resolver
     .scan_addr  ( idx_scan_addr  ),
     .scan_q     ( idx_scan_q     )
@@ -1247,7 +1252,8 @@ wire [8:0]  mus_cmd_inc;
 wire [1:0]  mus_cmd_ch;
 wire [7:0]  mus_cmd_vol;
 wire [23:0] mus_cmd_len, mus_cmd_lp, mus_cmd_ll, mus_cmd_base;
-wire [5:0]  mus_cmd_freq;
+// no mus_cmd_freq: the tracker plays notes through cmd_inc/cmd_use_inc (arbitrary Hz), and the old
+// cmd_freq output was never assigned - a dead port the lint guard now reports.
 wire        mus_rd_req, mus_rd_valid;
 wire [23:0] mus_rd_addr;
 wire [7:0]  mus_rd_data;
@@ -1321,7 +1327,6 @@ aw_music u_music (
     .cmd_lp       ( mus_cmd_lp    ),
     .cmd_ll       ( mus_cmd_ll    ),
     .cmd_base     ( mus_cmd_base  ),
-    .cmd_freq     ( mus_cmd_freq  ),
     .row_valid    ( mus_row_valid    ),
     .state_o      ( mus_state        ),
     .marker_valid ( mus_marker_valid ),

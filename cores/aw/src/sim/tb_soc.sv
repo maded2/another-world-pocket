@@ -395,7 +395,6 @@ reg design_run = 1'b0;
     wire [1:0]  mus_cmd_ch_w;
     wire [7:0]  mus_cmd_vol_w;
     wire [23:0] mus_cmd_len_w, mus_cmd_lp_w, mus_cmd_ll_w, mus_cmd_base_w;
-    wire [5:0]  mus_cmd_freq_w;
     wire        mus_rd_req_w, mus_rd_valid_w;
     wire [23:0] mus_rd_addr_w;
     wire [7:0]  mus_rd_data_w;
@@ -409,7 +408,7 @@ reg design_run = 1'b0;
         .cmd_valid(mus_cmd_valid_w), .cmd_stop(mus_cmd_stop_w), .cmd_touch(mus_cmd_touch_w),
         .cmd_use_inc(mus_cmd_use_inc_w), .cmd_inc(mus_cmd_inc_w), .cmd_ch(mus_cmd_ch_w),
         .cmd_vol(mus_cmd_vol_w), .cmd_len(mus_cmd_len_w), .cmd_lp(mus_cmd_lp_w), .cmd_ll(mus_cmd_ll_w),
-        .cmd_base(mus_cmd_base_w), .cmd_freq(mus_cmd_freq_w),
+        .cmd_base(mus_cmd_base_w),
         .row_valid(), .marker_valid(), .marker_value(), .marker_ch(), .running(mus_running_w));
 
     // the mixer has ONE command input: effects win a collision, the music command is held until taken
@@ -2053,7 +2052,17 @@ reg design_run = 1'b0;
             $display("tb_soc: audio FAIL - the image's audio index was never loaded at boot");
             errors = errors + 1;
         end
-        if (aud_plays > 0 && !aud_dac_moved) begin
+        // Is the audio section even in this image? The loader copies two bytes from 0x1000 and 0x41
+        // ('A') is the marker the extractor writes there (aw_audio_idx's header). A PLAIN pack has
+        // the game's first page at that address instead (0xb9 in part1.bin), so the plays resolve
+        // against nonsense, PSRAM reads back 0xFF, and 0xFF as a signed sample scaled by volume is
+        // 0 - silence for a reason, which is NOT a dead audio chain. This distinction is the whole
+        // AW 1047/1048 hardware history, and without it `make sim-soc` on a plain pack was red for a
+        // fault in the image it was handed. When the tag IS there, the DAC check below still bites.
+        if (u_audio_idx.dbg_tag != 8'h41) begin
+            $display("tb_soc: audio - no audio section in this image (index tag %02x, want 41): the play/DAC assertions are vacuous for this run",
+                     u_audio_idx.dbg_tag);
+        end else if (aud_plays > 0 && !aud_dac_moved) begin
             $display("tb_soc: audio FAIL - the VM issued %0d play requests but the DAC never moved", aud_plays);
             errors = errors + 1;
         end

@@ -8,6 +8,12 @@
 #   ./docker/run-silice.sh scripts/sim_soc.sh ports/another-world/packs/part6.bin
 #   FRAMES=200 ./docker/run-silice.sh scripts/sim_soc.sh
 #
+# Audio: a PLAIN pack has no audio section (byte 0x1000 is the game's first page, not the
+# index tag 0x41), so the play/DAC assertions stand aside and the run says so. To exercise
+# them, give it the combined audio image and a part:
+#   IMG=build/aw-all-audio.bin PART=1 EXTRA=+HOLDPART=1 ./docker/run-silice.sh scripts/sim_soc.sh
+# A green plain run is therefore NOT evidence that audio works - the summary line says which run it was.
+#
 # Frames land in build/sim/soc-frames/<pack>-<pid>/frameNN.ppm - plain enough to open in
 # anything, and `python3 -c ...` or an image viewer will show what the design drew. The dir is
 # per run: see the FRAMEDIR note below for why that is not cosmetic.

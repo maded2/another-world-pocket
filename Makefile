@@ -50,7 +50,9 @@ CORES    := $(notdir $(wildcard cores/*))
 .DEFAULT_GOAL := help
 .PHONY: help image pull doctor smoke shell build clean-build rev package test \
         new report list size clean distclean prune \
-        silice-image silice-shell silice a5k-translate upstream probe
+        silice-image silice-shell silice a5k-translate upstream probe \
+        lint sim sim-write sim-rom sim-dir sim-keys sim-iv sim-reset sim-soc sim-dbg \
+        sim-top sim-audio check-build worst-path loader
 
 help:
 	@echo "Analogue Pocket openFPGA build env (CORE=$(CORE), image=$(IMAGE))"
@@ -82,6 +84,7 @@ help:
 	@echo "  make packs                 gamedata/ -> partN.bin packs (part1 = the intro)"
 	@echo "  make sim-soc [PACK=f]      boot the design in simulation, capture frames"
 	@echo "  make sim-top               whole core_top: idle screen, load, mux switch, APF video protocol"
+	@echo "  make lint                  fail if a signal the core reads is driven by nothing (undriven-net guard)"
 	@echo "  make ref-sim               the same pack through the golden reference sim"
 	@echo "  make silice-image          build the Silice toolchain image"
 	@echo "  make a5k-translate         .si -> build.v (input for the Quartus flow)"
@@ -156,6 +159,13 @@ worst-path:
 sim-audio:
 	@$(SILICE) scripts/sim_audio.sh
 
+# Undriven-net guard: an unconnected module input reads as 0 on hardware and X in
+# simulation, and neither the benches nor a -Wno-lint build can see it. It has
+# happened twice on this console (the music telemetry, then the K field), so it is
+# a check now. Deliberately outside 'sim': it needs no bench data and takes seconds.
+lint:
+	@$(SILICE) scripts/lint_core.sh
+
 sim-write:
 	@$(SILICE) scripts/sim_write.sh
 
@@ -211,7 +221,8 @@ ref-sim:
 # sim-dbg used to be missing from this list. Its absence is the reason the boot banner printed
 # "AW 1041a up" on builds 1040, 1041 and 1042: the bench that compares that line byte for byte had
 # been red for two releases, and a bench nobody runs is a bench nobody fixes.
-sim: sim-write sim-keys sim-rom sim-iv sim-reset sim-dbg sim-top sim-audio
+# lint is here for the same reason: a guard nobody runs is not a guard.
+sim: lint sim-write sim-keys sim-rom sim-iv sim-reset sim-dbg sim-top sim-audio
 
 # ------------------------------------------------------------------- package --
 # The pack .bin files are game content, not build output: they live in

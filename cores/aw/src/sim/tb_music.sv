@@ -72,7 +72,6 @@ module tb_music;
     wire [1:0]  cmd_ch;
     wire [7:0]  cmd_vol;
     wire [23:0] cmd_len, cmd_lp, cmd_ll, cmd_base;
-    wire [5:0]  cmd_freq;
     wire        row_valid;
     wire        marker_valid;
     wire [15:0] marker_value;
@@ -86,7 +85,7 @@ module tb_music;
         .rd_addr(rd_addr), .rd_req(rd_req), .rd_valid(rd_valid), .rd_data(rd_data),
         .cmd_valid(cmd_valid), .cmd_stop(cmd_stop), .cmd_touch(cmd_touch), .cmd_use_inc(cmd_use_inc), .cmd_inc(cmd_inc),
         .cmd_ch(cmd_ch), .cmd_vol(cmd_vol), .cmd_len(cmd_len), .cmd_lp(cmd_lp), .cmd_ll(cmd_ll),
-        .cmd_base(cmd_base), .cmd_freq(cmd_freq),
+        .cmd_base(cmd_base),
         .row_valid(row_valid), .marker_valid(marker_valid), .marker_value(marker_value), .marker_ch(marker_ch),
         .running(running));
 
