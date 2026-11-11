@@ -177,8 +177,13 @@ switch: latch new part_sel → load table → generation++ → pulse core reset 
   checked at boot and a mismatch reported, never booted through.
 * **OSD variable semantics are unmeasured** (§4.2.7). Do not design the UX around them before one
   hardware run says what happens to the core and the dataslot across an OSD visit.
-* **P2 is still unsolved.** Nothing switches parts automatically, because nothing in the engine
-  asks. Before building anything for it: find out what the reference does at the end of a part
+* **P2 is still unsolved, but the "nothing in the engine asks" claim in this line was WRONG** (corrected
+  2026-11-10): the packs do contain `op_updateMemList` requests in the part range, the port now surfaces them
+  (`part_req`), and `aw_rom` switches the table on one. What is missing is the VM's re-entry — the trailer
+  byte counter kept its power-up value across the algorithm reset, which is fixed in AW 1064; restarting a
+  chapter now re-reads the trailer and renders in simulation for part 1→2, while switching away from the
+  copy-protection part (0→1) is still black and open. The text below is kept for its reasoning about
+  heuristics, not as a statement of fact. Before building anything for it: find out what the reference does at the end of a part
   (`scripts/ref_sim.sh PART=...`, and the upstream extractor for a part-change command). If the
   engine simply idles with no live threads, a core-side "all threads dead for N s → advance" is
   possible but is a heuristic, and heuristics that boot the next chapter deserve their own evidence

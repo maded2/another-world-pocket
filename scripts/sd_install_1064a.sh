@@ -1,29 +1,33 @@
 #!/bin/bash
-# Install AW 1063: the K field's source is connected (it printed 0000 because nothing drove it), plus the
-# static lint that would have caught it, and one dead port removed.
+# Install AW 1064: the K field's source is connected, `make lint` guards the fault class that hid it,
+# and the VM re-arms its trailer counter so a chapter RESTART re-reads the new part's trailer.
 #
-# Nothing about playback changes in this build. It exists to make the console's K field a measurement, and
-# to stop the "unconnected input reads as 0" fault from shipping a THIRD time:
-#   * core_top now connects aw_audio_idx's dbg_tag/dbg_count to dbg_console's K field. AW 1062's capture
-#     showed K0000 although the image declares tag 41 / count 6a: the wires were declared and printed but
-#     never driven, exactly like the music telemetry in AW 1055-1062.
-#   * `make lint` (scripts/lint_core.sh) elaborates core_top with Verilator -Wall and fails on any undriven
-#     signal in the core's own files, with the deliberate APF handshake inputs allowlisted by name. Proven
-#     to bite by re-introducing the K fault. It is part of `make sim` now.
-#   * aw_music's cmd_freq output was never assigned (the tracker plays through cmd_inc/cmd_use_inc); the dead
-#     port is gone, so the lint has nothing to allowlist on our own account.
+# Three changes since AW 1062, none of them in normal playback:
+#   * core_top now connects aw_audio_idx's dbg_tag/dbg_count to dbg_console's K field. AW 1062 printed
+#     K0000 although the image declares tag 41 / count 6a: the wires were declared and printed but never
+#     driven - the same fault as the music telemetry one level down.
+#   * scripts/lint_core.sh (make lint, part of make sim) elaborates core_top with Verilator -Wall and
+#     FAILS on an undriven signal in the core's own files, with the deliberate APF handshake inputs
+#     allowlisted by name and reason. Proven to bite by re-introducing the K fault.
+#   * vm.si: `uint5 n(0)` (the trailer byte counter) is now explicitly re-armed at the read. Its
+#     initializer was a Verilog power-up value, so a vm_restart entered the loop with n=16, skipped the
+#     16 trailer bytes and kept the OLD part's segOffsets - the "the VM resumes after a switch" symptom.
+#     Verified in sim: restarting into the same part re-renders the intro (0 shifted of 41,792 fill
+#     writes), and part 1 -> part 2 renders (87 rich frames, 0 shifted of 51,904). Switching away from
+#     the copy-protection part (0 -> 1) still renders black - known open, not this build's path.
 #
-# RUN: launch "AW 1063", dataslot aw-all-audio.bin, Game part = Part 2, ~15 s. The CHK line ends with
+# RUN: launch "AW 1064", dataslot aw-all-audio.bin, Game part = Part 2, ~15 s. The CHK line ends with
 #     M<running> <rows> <plays> I<inc> A<base> C<cues> S<state> D<+1cues> K<tag><count> E<snd cues>
 #   K416a            the audio index was copied AND its tag/count reached the console (was K0000)
 #   M/C/E             must still read like AW 1062's capture (M1 011a 005a I02c A2f0008 C02 S0e D02 E1b)
 #                    - if they are zero again, a wire was tied off again and the lint is wrong about it
-#   G<part>           the paged install is unchanged from 1062
+#   G<part>           the paged install is unchanged from 1062; a part change is still an OSD choice
+#
 set -u
 
 # Set from the build that this probe is: sha256 of build/aw/bitstream.rbf_r. An installer that
 # installs whatever happens to be in build/ is how 1026a got reported as 1028b.
-EXPECT_SHA="${EXPECT_SHA:-22498143aa85bf31}"
+EXPECT_SHA="${EXPECT_SHA:-f2eef7a60d7b5c7c}"
 
 CARD=""
 for m in /media/*/*; do
@@ -66,6 +70,8 @@ case "$BSHA" in
     5b7ab7d5*) echo "FATAL: that is 1041a (intro freezes at ~10 s)." >&2; exit 1 ;;
     72be08bd*) echo "FATAL: that is the pre-census-default paged build (sweeps 2 MiB, certifies no pool)." >&2; exit 1 ;;
     b7e4190f*) echo "FATAL: that is the all-parts build with the dead ent_bad mask." >&2; exit 1 ;;
+    22498143*) echo "FATAL: that is AW 1063 (K fixed, but built before the chapter re-arm)." >&2; exit 1 ;;
+    f72ab9b3*) echo "FATAL: that IS AW 1062 - installing it under the 1064 label is the banner lie again." >&2; exit 1 ;;
 esac
 
 ISHA=$(sha256sum < "$IMG" | cut -d' ' -f1)
@@ -73,7 +79,7 @@ ISIZE=$(stat -c%s "$IMG")
 echo "image    : $ISHA  ($ISIZE bytes = $(python3 -c "print('%.3f' % ($ISIZE/2.0**20))") MiB)"
 [ "$ISIZE" -eq 3813404 ] || echo "NOTE: image is $ISIZE bytes, not the 3,080,192 this probe was sized for."
 
-DST="$CARD/Cores/Eddie Chan.AW 1063"
+DST="$CARD/Cores/Eddie Chan.AW 1064"
 if [ -e "$DST" ]; then
     echo "FATAL: $DST already exists. Remove it deliberately (it may be the identity something else"
     echo "       was reported against); this script will not overwrite a core folder." >&2
@@ -104,16 +110,17 @@ import json, sys, datetime
 p = sys.argv[1]
 d = json.load(open(p))
 m = d["core"]["metadata"]
-m["shortname"] = "AW 1063"
+m["shortname"] = "AW 1064"
 m["description"] = (
-    "Another World - paged build, audio + music. Same playback as AW 1062; this build makes the "
-    "console's K field real: the audio index's tag and record count (41/6a when the selected file has "
-    "an audio section) were printed from wires nothing drove, so K0000 was not a measurement. The "
-    "unconnected-input class that cost four hardware sessions on the music telemetry is now a build "
-    "check (a Verilator lint that fails on undriven signals in the core's own Verilog, part of make "
-    "sim). One dataslot file carries every part: a 32 KiB directory page holds eight 64-entry page "
-    "tables and the VM's 2 MiB view is assembled from a pool of frames on die 0. UART: G is the part "
-    "and its state, E is why a directory was refused, K is the audio index header. AW 1042 and AW 1062 "
+    "Another World - paged build, audio + music. Playback is unchanged from AW 1062; this build "
+    "makes the console's K field real (the audio index tag/count, 41/6a, was printed from wires "
+    "nothing drove, so K0000 was not a measurement) and makes the unconnected-input class a build "
+    "check. It also fixes a chapter RESTART: the VM's trailer byte counter kept its power-up value "
+    "across an algorithm reset, so a restart skipped the trailer and kept the old part's segment "
+    "offsets. In simulation a restart now re-reads the new part's trailer and renders the intro. "
+    "One dataslot file carries every part: a 32 KiB directory page holds eight 64-entry page tables "
+    "and the VM's 2 MiB view is assembled from a pool of frames on die 0. UART: G is the part and "
+    "its state, E is why a directory was refused, K is the audio index header. AW 1042 and AW 1062 "
     "are controls."
 )
 m["version"] = "1.0.0"
@@ -190,7 +197,7 @@ if not cores or cores[0].get("filename") != "bitstream.rbf_r":
                % (cores[0].get("filename") if cores else None))
 if c.get("framework", {}).get("chip32_vm") != "loader.bin":
     bad.append("chip32_vm is %r but loader.bin is what was copied" % c["framework"].get("chip32_vm"))
-if c.get("metadata", {}).get("shortname") != "AW 1063":
+if c.get("metadata", {}).get("shortname") != "AW 1064":
     bad.append("shortname is %r - the OSD label is how the user picks this build" % c["metadata"].get("shortname"))
 # Everything outside the four fields we rewrite must be byte-identical in meaning to the repo copy.
 def strip(d):
@@ -230,7 +237,7 @@ SET THE PART, OR YOU WILL HEAR NOTHING. This core boots view part 0 = part0.bin,
 protection screen; the sounds in the harvest are in part1.bin. In the OSD set "Game part" to **Part 2**
 (option value 1 - the list is labelled from 1, and part0.bin is what its own header calls GAME_PART1).
 
-RUN 1 - the audio probe.  Launch "AW 1063", pick dataslot file  aw-all-audio.bin  (3.64 MiB), OSD
+RUN 1 - the audio probe.  Launch "AW 1064", pick dataslot file  aw-all-audio.bin  (3.64 MiB), OSD
         Game part = Part 2. Then report, in this order:
   a) the CHK line. G05 = the whole 3.64 MiB arrived and the pool matches what the image declares
      (that also answers the old "does a >2 MiB dataslot arrive" question). G01 = the directory
@@ -251,7 +258,7 @@ RUN 1 - the audio probe.  Launch "AW 1063", pick dataslot file  aw-all-audio.bin
        * sound that starts late, stutters, or matches the picture badly: the PSRAM port, i.e.
          exactly what the dropped-tick counter was there to rule out in simulation (0 in tb_soc).
 
-RUN 2 - same core, same bitstream, plain pack.  Launch "AW 1063" again and pick part0.bin (2 MiB).
+RUN 2 - same core, same bitstream, plain pack.  Launch "AW 1064" again and pick part0.bin (2 MiB).
         Expect G00 E40 (a plain pack has no directory - not an error) and a normal protection screen.
         If run 1 is broken and run 2 is fine, the fault is the big upload; if both are broken, it is
         the core.

@@ -7,16 +7,19 @@
 # Input : cores/aw/src/si/aw_pocket.si        (our SoC top; owns display, ROM port,
 #                                             framebuffers, blitter, rasterizer)
 #         ports/another-world/upstream/hardware/vm.si
-#                                             (the VM/processor, unmodified upstream)
+#                                             (the VM/processor, upstream plus the
+#                                             patches below - each anchored and
+#                                             idempotent, applied to the staged copy)
 # Output: cores/aw/src/fpga/core/aw_pocket_build.v
 #
 # Why a build directory at all: Silice resolves $include() relative to the file,
 # and our top lives elsewhere in the tree, so the sources are staged next to each
-# other and the include is pointed at the staged copy. vm.si itself is not
-# edited - not for pacing, not for anything (see the pacing note in
-# aw_pocket.si for the arithmetic that makes that the right call). Keeping this
-# a pure copy is what lets fetch_upstream.sh stay idempotent and lets a diff
-# against the pinned upstream commit come back empty.
+# other and the include is pointed at the staged copy. The staged vm.si is a copy
+# of the pinned upstream file with a small, enumerated set of divergences (search
+# for "deliberate divergence" below): the part request, the two audio opcodes, and
+# the trailer counter re-arm that makes a chapter restart work. Keeping them here
+# rather than editing upstream is what lets fetch_upstream.sh stay idempotent and
+# lets a diff against the pinned upstream commit come back empty.
 
 # Quartus is fed SystemVerilog: Silice emits sized casts such as 12'(...) which
 # Verilog-2001 mode rejects (19 syntax errors before, 0 after - see
@@ -164,8 +167,37 @@ port_add = """  // Audio, as the engine issues it: op_playSound(h18) and op_play
 if "output uint8  snd_seq(0)" not in s:
     assert port_anchor in s
     s = s.replace(port_anchor, port_anchor + port_add, 1)
+
+# --- chapter re-entry: re-arm the trailer byte counter -------------------------
+# vm_restart returns the generated FSM to ++: (the trailer read), and that is the whole
+# mechanism behind a chapter change. But `uint5 n(0);` compiles to a register whose
+# initializer is a Verilog POWER-UP value, not part of the algorithm reset:
+#
+#     reg [4:0] _q___block_167_n = 0;                 // power-up only
+#     _q___block_167_n <= _d___block_167_n;           // no (reset) ? 0 term
+#
+# A cold boot is fine because power-up is 0. A restart is not: n is already 16 when the
+# FSM returns to ++:, so `while (~n[4,1])` is false immediately, the new part's 16
+# trailer bytes are never consumed, segOffsets keeps the OLD part's four offsets, and
+# the VM runs the old chapter's bytecode over the new page table. In tb_soc that is the
+# chapter switch's 509/770 shifted fill writes with gaps=0 and rewinds=0 - the stream
+# never broke, the view changed underneath it. An explicit `n = 0;` is a real assignment
+# in the algorithm, so it is applied every time control reaches ++:, i.e. on every
+# restart as well as on the first boot.
+#
+# Second deliberate divergence from upstream vm.si (the first is part_req above).
+rearm_anchor = """    uint5 n(0);
+    while (~n[4,1]) {"""
+rearm_new = """    uint5 n(0);
+    n = 0; // RE-ARM: power-up init is not re-applied by the algorithm reset, so a
+           // restart would otherwise enter the loop with n == 16 and skip the trailer.
+    while (~n[4,1]) {"""
+if "RE-ARM:" not in s:
+    assert rearm_anchor in s, "vm.si: trailer counter anchor not found - upstream changed?"
+    s = s.replace(rearm_anchor, rearm_new, 1)
+
 open(p, "w").write(s)
-print("vm.si: audio opcode patch applied (or already present)")
+print("vm.si: audio opcode patch applied (or already present); trailer counter re-armed")
 PY
 
 # our top, with the include pointed at the staged copy of vm.si

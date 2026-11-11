@@ -1,14 +1,18 @@
 # Sound effects and music: what the data is, and how to get it out of the Pocket
 
-Status: **sound effects implemented, verified in simulation, BUILT and PROVEN ON HARDWARE (AW 1050).**
-The music tracker and the music half of the hardware gate are still open.
+Status: **sound effects and the music tracker are implemented, verified in simulation, BUILT and PROVEN
+ON HARDWARE (effects since AW 1050; the tracker since AW 1062, whose capture shows 282 rows, 90 notes and
+the oracle's rate increment).** The phase-G acceptance is half met: event-for-event is done, sample-for-sample
+against the Python render is not. Widening the harvest (loops, modules 137/138) is still open.
 Every number below was measured from `gamedata/memlist.bin`, the pinned upstream sources in
 `ports/another-world/upstream/BUILD/Another-World-Bytecode-Interpreter/src/`, or the benches named next to it.
 
 What is DONE (commits `cee7c9c` and after): A extraction, B packaging, C index + sample fetch in RTL, D VM
-patch, E mixer, F I2S output. Six benches run under `make sim-audio` and `tb_top`/`tb_soc` exercise the chain
-inside the core. What is NOT done: G the music tracker, H the hardware gate, and the docs pass that this file
-is part of.
+patch, E mixer, F I2S output, G the RTL music tracker, H the hardware gate (a sound effect and a music cue on
+the Pocket). Six benches run under `make sim-audio` and `tb_top`/`tb_soc` exercise the chain inside the core.
+What is NOT done: the sample-for-sample half of G, a harvest wide enough to exercise loops and modules
+137/138, and the docs pass that this file is part of (updated 2026-11-11; still stale below where it says
+"no audio").
 
 ## 1. The data
 

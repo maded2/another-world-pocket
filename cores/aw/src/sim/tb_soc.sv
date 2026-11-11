@@ -566,6 +566,11 @@ reg design_run = 1'b0;
     int       post_n = 0;
     reg       switch_done = 1'b0;
     int       switch_at = 0;
+    // +DBGSW=1: print where the VM fetches from in the first cycles after a chapter restart. A proper
+    // re-entry starts the new part's bytecode (view offset 0x0 for a flattened pack, so the address is
+    // near 0x200000 including the bank bit); resuming the old script starts wherever it had reached.
+    // The trailer re-read alone does not prove the script restarted - this is the observable that does.
+    integer   sw_dbg = 0;
     // Restart pulses seen, edge-counted. Without this "the VM did not restart" and "the pulse was
     // never generated" look identical, and they are different bugs in different files.
     int       rstr_cnt = 0;
@@ -759,6 +764,11 @@ reg design_run = 1'b0;
     reg       acc_reserve = 1'b0;
     integer   n_reserve   = 0;      // acceptances that re-served bytes on purpose
     integer   reserve_bytes = 0;    // bytes delivered while the positional oracle stood aside
+    // After a chapter switch the VM is legitimately reading a DIFFERENT part's bytes, and this
+    // oracle's reference is the part named on the command line. Continuing scored a CORRECT
+    // part 1 -> part 2 switch as 106,943 wrong bytes. Count what was skipped and print it: the
+    // switch's own checks (trailer re-read, fill oracle, frames) are what grade that run.
+    integer   sw_skip_bytes = 0;
 
     integer   n_fill_acc  = 0;      // acceptances that wrote the fill buffer: the intolerant ones
     integer   n_fill_bad  = 0;      // of those, ones with a gap that could move a later write
@@ -1439,6 +1449,9 @@ reg design_run = 1'b0;
             // compared against the position the design had just rewound to and matched. The VM
             // has no such reset, so this is the check that says whether a recovery was lossless.
             if (served_k >= 0 && (stream_base + served_k) < PACK_BYTES && !acc_reserve) begin
+                if (switch_done) begin
+                    sw_skip_bytes = sw_skip_bytes + 1;   // the new part's stream, see the declaration
+                end else begin
                 chk_compared = chk_compared + 1;
                 if (mem_data !== ref_mem[stream_base + served_k]) begin
                     errors = errors + 1;
@@ -1447,6 +1460,7 @@ reg design_run = 1'b0;
                                  $time, stream_base + served_k, mem_data,
                                  ref_mem[stream_base + served_k], served_k,
                                  u_rom.c_addr, u_rom.c_waddr, u_rom.n_addr, rewinds);
+                end
                 end
             end
             served_k = served_k + 1;
@@ -1564,6 +1578,7 @@ reg design_run = 1'b0;
         void'($value$plusargs("SWITCH=%d", switch_part));
         void'($value$plusargs("VMREQ=%d", vmreq_force));
         void'($value$plusargs("SWITCHAFTER=%d", switch_after));
+        void'($value$plusargs("DBGSW=%d", sw_dbg));
         void'($value$plusargs("NOINPUT=%d", noinput));
         void'($value$plusargs("PACK_KIND=%s", pack_kind));
         void'($value$plusargs("IMG=%s", img_hex));
@@ -1772,6 +1787,10 @@ reg design_run = 1'b0;
                 // contaminated. What matters is whether the new part's trailer appears shortly after
                 // the restart, so the window is collected here and searched at the end.
                 if (rstr_cnt > 0 && mem_data_available && post_n < 512) begin
+                    if (sw_dbg && post_n < 24)
+                        $display("  post-restart fetch %0d: addr=%h data=%02x fsm=%0d segOffsets=%h",
+                                 post_n, mem_addr, mem_data, u_soc.vm._q__idx_fsm0,
+                                 u_soc.vm._q_segOffsets);
                     post_bytes[post_n] = mem_data;
                     post_n = post_n + 1;
                 end
@@ -1781,6 +1800,14 @@ reg design_run = 1'b0;
                     switch_done = 1'b1;
                     $display("  SWITCH to part %0d at frame %0d (streamed_q=%b dir_part=%0d)",
                              switch_part, frames, u_rom.streamed_q, dir_part_w); $fflush;
+                    // The colour oracle's history is the BOOT part's palette. After a chapter change the
+                    // new part loads a new palette, so judge its colours against a fresh history - not
+                    // against every colour the old scene ever used. Measured: a correct part 1 -> part 2
+                    // switch scored 106,943 "not a decoding of any palette entry" errors, every one of
+                    // them a legitimate part-2 colour. The geometry/text oracles already skip themselves
+                    // after a switch for the same reason; this is the colour oracle doing the same.
+                    nhist     = 0;
+                    ncol_seen = 0;
                     if (vmreq_force != 0) $display("  injected VM part request 0x%04h", vmreq_force);
                     else wr32(32'h00F0_0020, switch_part << 8);
                 end
@@ -2025,6 +2052,9 @@ reg design_run = 1'b0;
         // silence. See acc_reserve above.
         $display("tb_soc: delivery oracle stood aside for %0d acceptances that re-served from their own start (%0d bytes; the fill-shift oracle still checks every byte the VM writes)",
                  n_reserve, reserve_bytes);
+        if (switch_done)
+            $display("tb_soc: stream oracle stood aside after the chapter switch for %0d bytes (they are the new part's, not the command-line pack's)",
+                     sw_skip_bytes);
         // The consumer-side view of the same traffic. A short held acceptance is the bytecode
         // fill, and a gap inside one shifts the fill (vm.si:496); a long one is a string strip,
         // which survives gaps. `pulsed` is readByte, whose bytes always land with in_ready low
@@ -2161,7 +2191,13 @@ reg design_run = 1'b0;
             // "Hello Another World (offsets: 0, 75101, 9871, 110291)" for part2, so reading
             // those four numbers back here is the sentinel - if they agree, the hierarchical
             // path and the word order are both right.
-            $display("SEGOFFSETS %h %h %h %h  (want 0,1255d,268f,1aed3 for part2)",
+            // The reference golden sim prints these four numbers for part 1 and CALLS IT part2 - upstream's
+            // make simulN numbering is one ahead of the extracted packs (part0.bin is the copy-protection
+            // screen, which upstream calls part1). Measured from the files: part1.bin's trailer decodes to
+            // 0,1255d,268f,3aed3 (the last is reported as 1aed3 after the 17-bit mask), part2.bin's to
+            // 0,131f0,514a,139f0. The label used to say "for part2", which is the kind of off-by-one that
+            // makes a correct reading look wrong.
+            $display("SEGOFFSETS %h %h %h %h  (part1.bin's trailer is 0,1255d,268f,[1]aed3; part2.bin's is 0,131f0,514a,139f0)",
                      u_soc.vm._q_segOffsets[31:0], u_soc.vm._q_segOffsets[63:32],
                      u_soc.vm._q_segOffsets[95:64], u_soc.vm._q_segOffsets[127:96]);
             $write("PALETTE32");

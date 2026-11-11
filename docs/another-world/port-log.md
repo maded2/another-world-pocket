@@ -3364,8 +3364,119 @@ measurements for four hardware sessions - the delta test, the chapter-request re
 "diagnosed" from them. The owner's ears were the reliable instrument the whole time.
 
 `K0000` is the same fault once more, one level down: `aw_audio_idx`'s new `dbg_tag`/`dbg_count` outputs were
-left unconnected in core_top. Connected in the tree; needs a rebuild to show 416a.
+left unconnected in core_top. **CORRECTION (added the same evening): "connected in the tree" was written
+without checking and was false — the outputs were still undriven, which is what `make lint` now exists to
+prevent. See the later entry of 2026-11-11.**
 
 LESSON, twice over: an unconnected module input is silently zero, and every lint in this repo runs -Wno-lint.
 A bench that compares console text cannot see connectivity. Any new status field must be checked by *driving a
 known value through it* (tb_dbg_console does that for the fields it knows) and by confirming the wire exists.
+
+## 2026-11-11 (later) — K was not connected either, and the chapter restart now re-reads the trailer
+
+### The sentence above was wrong: `K0000` was never a measurement
+
+"Connected in the tree" was written without checking. At `fcc9060`, `core_top` passed
+`.idx_tag(idx_tag)`/`.idx_count(idx_count)` to `dbg_console` and declared the wires, but the
+`u_audio_idx` instantiation never connected `aw_audio_idx`'s `dbg_tag`/`dbg_count`. Verilog ties
+them to zero, so every K reading was zero — the same fault as the music telemetry, one level
+down, one day later, and invisible for the same reason: `tb_dbg_console` drives those ports
+directly, so the bench compares formatting and never connectivity.
+
+Found by reading the netlist, and then made mechanical. A Verilator run that actually elaborates
+`core_top` — the APF template files plus stand-ins for the two modules only Quartus can build
+(`aw_pll`; `altsyncram` uses the simulation model) — with `-Wall` and **not** `-Wno-lint`, reports
+31 undriven signals in about three seconds. Two of them were ours: `idx_tag`/`idx_count`, and
+`aw_music`'s `cmd_freq`, an output reg that is never assigned anywhere (the tracker plays through
+`cmd_inc`/`cmd_use_inc`); that dead port is gone rather than allowlisted.
+
+`scripts/lint_core.sh` (`make lint`, and part of `make sim`) now fails on any undriven signal in
+the core's own files, and allowlists the inputs this core deliberately leaves open — `savestate_*`,
+`target_dataslot_*`, `target_buffer_*`, `datatable_*` — each with its reason printed. Negative
+control, because a guard that has never failed is a guard nobody can trust: removing the two new
+connections again gives
+
+    FAIL   idx_tag (/work/cores/aw/src/fpga/core/core_top.v) - nothing drives it
+    FAIL   idx_count (...) - nothing drives it
+    lint_core: 2 undriven signal(s) ... exit 1
+
+and the fix takes it back to PASS. It also found `cmd_freq` without being asked.
+
+### The other red thing at HEAD was a bench, and it said so badly
+
+`make sim-soc` on its default pack (`part1.bin`) was failing with "the VM issued 2 play requests
+but the DAC never moved". The design was right and the image was the wrong one: a plain pack has
+the game's first page at `0x1000` (0xb9), not the audio index tag 0x41, so the plays resolve
+against nonsense, PSRAM reads 0xFF, and 0xFF as a signed sample is 0 after the volume divide —
+silence for a reason, exactly the AW 1047/1048 hardware story. The bench now reads
+`aw_audio_idx.dbg_tag`: with 0x41 the DAC assertion still bites, without it the run says the audio
+half is vacuous. Both directions checked — a `part1.bin` whose byte 0x1000 is forced to 0x41 and
+has no audio blob still FAILS the DAC check, and the real audio-image run still passes (plays 5,
+DAC moved 1).
+
+### The chapter restart: the reset was fine, the trailer counter was not
+
+Reading the generated VM settled the question the last entry left open. The FSM is
+
+    _q__idx_fsm0 <= reset ? 0 : ( ~_autorun ? 1 : _d__idx_fsm0 );
+
+so a `vm_restart` **does** return to `_top` and re-enters the trailer read — the earlier
+hypothesis ("Silice's algorithm reset resumes after the trailer read") was wrong. What was wrong
+was one variable: `uint5 n(0);`, the trailer byte counter, compiles to
+
+    reg [4:0] _q___block_167_n = 0;          // a power-up value
+    _q___block_167_n <= _d___block_167_n;    // and nothing else - not part of the reset
+
+A cold boot works because power-up is 0. A restart enters `while (~n[4,1])` with n already 16, the
+loop is false immediately, the new part's sixteen trailer bytes are never consumed, and
+`segOffsets` keeps the **old** part's four offsets — the VM then runs the old chapter's bytecode
+over the new page table. That is the 509/770 shifted fill writes with `gaps=0` and `rewinds=0`
+recorded earlier: the stream never broke, the view changed underneath it.
+
+The fix is one explicit `n = 0;` at `++:` in `scripts/pocket_translate.sh` (anchored, idempotent,
+documented there as the second deliberate divergence from upstream `vm.si`). Measured after it:
+
+| run | result |
+|---|---|
+| restart into the **same** part (1→1, `+SWITCH=1`) | the VM re-read its trailer; intro restarts and renders — 136 frames, 99 non-black, 95 rich, **0 shifted of 41,792** fill writes, PASS |
+| **part 1 → part 2** (`+SWITCH=2`) | trailer re-read is part 2's; 136 frames, 90 non-black, 87 rich (14 colours), 31 swaps, **0 shifted of 51,904**, PASS |
+| **part 0 → part 1** (`+SWITCH=1` from the copy-protection part) | trailer re-read is part 1's and the first fetches are part 1's bytes at offset 0 — but the picture stays black, the palette is never loaded, and the stream runs at part 0's rate (804,249 bytes / 96 frames against 43,000 for the intro) |
+
+The 0→1 case is **open**. The first suspect was the thread table — a restart re-enters the boot on
+RAMs that no longer hold power-up zeros, so threads 1..63 could resume stale positions. That was
+written, generated, measured, and **disproved**: clearing all 64 `threadsData` current/requested pc
+and `vmIsChannelActive` entries changed the run byte for byte, so the patch was reverted rather
+than shipped. The next suspects are the interpreter's local loop state (`scriptStackCalls`, the
+per-opcode block variables) or the SoC-side rasterizer/blitter left mid-operation by the
+copy-protection screen.
+
+Two bench lies were fixed while measuring this, because a green run must not be able to mean
+"checked nothing":
+
+* the streamed-bytes oracle compared every delivered byte against the command-line pack and was
+  **not** gated on the switch, so a *correct* 1→2 switch scored 106,943 wrong bytes. It now stands
+  aside after a switch like the fill oracle already did, and **counts what it skipped** (109,632
+  bytes in the passing run) instead of going quiet.
+* the `SEGOFFSETS` line said `(want 0,1255d,268f,1aed3 for part2)`; measured from the files, those
+  are **part 1's** trailer words (part 2's are 0,131f0,514a,139f0), and the `1aed3` is part 1's
+  3aed3 after the 17-bit mask. Upstream's `make simulN` numbering is one ahead of the extracted
+  packs, which is how the label got there.
+
+Also: the colour oracle's palette history belonged to the boot part, so it now restarts its history
+at the switch — the same reason the text oracle already skips there.
+
+### Gates and identity
+
+`make lint` PASS (25 findings, all allowlisted APF handshakes); `make sim` green (tb_write,
+tb_keys 13, tb_rom 550 + tripwire, tb_iv 24, tb_reset_gen, tb_dbg_console, tb_top, six audio
+benches including tb_music 1192 events); `make sim-dir` 9 runs green; `make sim-soc` green on the
+plain pack, on the audio image, and on the 1→1 and 1→2 switch runs.
+
+**AW 1064** — sha `f2eef7a60d7b5c7c`, 7,485 ALMs / 9,421 registers, worst slack 0.113 ns, scoped
+`make check-build` clean (PLLs 24.75/92.8125/49.5). Installer `scripts/sd_install_1064a.sh`
+expects that sha and refuses 1062 (`f72ab9b3`) and 1063 (`22498143`, K fixed but before the
+re-arm) — installing either under the 1064 label is the banner lie again. A 1063 bitstream was
+built and is superseded before it ever reached a card.
+
+Hardware question that remains for this build: `K416a` on the CHK line, with M/C/E unchanged from
+AW 1062. Nothing above has been on a Pocket.
