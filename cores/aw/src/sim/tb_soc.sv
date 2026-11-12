@@ -1288,8 +1288,15 @@ reg design_run = 1'b0;
     reg [15:0] tr_addr_max = 0;
     integer tr_poly_wen = 0;
     integer tr_acc = 0;
+    // Per-frame count of cycles the a5k display gate held the drawing units off. This is the
+    // quantity that decides whether a draw is DROPPED (`enabled = ~display_conflict | vblank`, and
+    // aw_pocket.si computes the conflict from the last blitter source against the page being
+    // scanned). A chapter switch that leaves the gate high silently discards every pixel while the
+    // engine keeps starting blits and rasterizations - which is exactly the late-switch symptom.
+    integer tr_dc_high = 0;
     reg [23:0] tr_addr_lo = 24'hffffff, tr_addr_hi = 0;
     always @(posedge clk_core) begin
+        if (u_soc._q_display_conflict)   tr_dc_high = tr_dc_high + 1;
         if (u_soc._w_vm_pix_wenable)     tr_w_vm   = tr_w_vm   + 1;
         if (u_soc._w_rast_pix_wenable)   tr_w_rast = tr_w_rast + 1;
         if (u_soc._w_blit_dst_wenable)   tr_w_blit = tr_w_blit + 1;
@@ -1546,15 +1553,17 @@ reg design_run = 1'b0;
                     end
                     for (i = 0; i < 32; i = i + 1)
                         if (u_soc.__mem__palette.buffer[i] !== 16'h0) nzpal = nzpal + 1;
-                    $display("  TRACE f%0d: nz p0=%0d p1=%0d p2=%0d p3=%0d | wen p0=%0d p1=%0d p2=%0d p3=%0d | src vm=%0d rast=%0d blit=%0d memwen1=%0d wdata_or=%h | rpal_or=%h roob=%d amax=%h bdata_or=%h boob=%d | dst=%0d show1=%b pal=%0d | acc=%0d range=%h..%h",
+                    $display("  TRACE f%0d: nz p0=%0d p1=%0d p2=%0d p3=%0d | wen p0=%0d p1=%0d p2=%0d p3=%0d | src vm=%0d rast=%0d blit=%0d memwen1=%0d wdata_or=%h | rpal_or=%h roob=%d amax=%h bdata_or=%h boob=%d | dst=%0d show1=%b pal=%0d | acc=%0d range=%h..%h | dc=%0d bsrc=%0d ps=%b nv=%0d bbw=%0d bbh=%0d",
                              frames, nz0, nz1, nz2, nz3,
                              tr_pagen_w[0], tr_pagen_w[1], tr_pagen_w[2], tr_pagen_w[3],
                              tr_w_vm, tr_w_rast, tr_w_blit, tr_mem_wen1, tr_mem_wdata_or,
                              tr_rast_pal_or, tr_rast_oob, tr_addr_max,
                              tr_blit_data_or, tr_blit_oob,
                              u_soc._w_vm_blitter_dst, u_soc._w_show_page1, nzpal,
-                             tr_acc, tr_addr_lo, tr_addr_hi);
-                    tr_acc = 0; tr_addr_lo = 24'hffffff; tr_addr_hi = 0;
+                             tr_acc, tr_addr_lo, tr_addr_hi,
+                             tr_dc_high, u_soc._w_vm_blitter_src, u_soc._w_vm_page_swap,
+                             u_soc._w_vm_polygon_numv, u_soc._w_vm_polygon_bbw, u_soc._w_vm_polygon_bbh);
+                    tr_acc = 0; tr_addr_lo = 24'hffffff; tr_addr_hi = 0; tr_dc_high = 0;
                     $fflush;
                 end
 `endif
