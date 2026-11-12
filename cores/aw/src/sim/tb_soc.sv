@@ -1299,9 +1299,18 @@ reg design_run = 1'b0;
     // scanned). A chapter switch that leaves the gate high silently discards every pixel while the
     // engine keeps starting blits and rasterizations - which is exactly the late-switch symptom.
     integer tr_dc_high = 0;
+    // The opcode dispatch index, one line per change, for the frames around a chapter switch. The
+    // switch bug is frame-sensitive (182 renders, 185 does not), so the useful question is "which op
+    // first appears between those frames" - and the dispatch index names the op without decoding the
+    // stream by hand. `%h` so it can be diffed between two runs directly.
+    reg [7:0] tr_op_seen = 8'hff;
     reg [23:0] tr_addr_lo = 24'hffffff, tr_addr_hi = 0;
     always @(posedge clk_core) begin
         if (u_soc._q_display_conflict)   tr_dc_high = tr_dc_high + 1;
+        if (u_soc.vm._q_op_decode_addr !== tr_op_seen) begin
+            tr_op_seen = u_soc.vm._q_op_decode_addr;
+            $display("  TRACE f%0d op=%h addr=%h", frames, tr_op_seen, u_soc.vm._q_mem_addr);
+        end
         if (u_soc._w_vm_pix_wenable)     tr_w_vm   = tr_w_vm   + 1;
         if (u_soc._w_rast_pix_wenable)   tr_w_rast = tr_w_rast + 1;
         if (u_soc._w_blit_dst_wenable)   tr_w_blit = tr_w_blit + 1;
