@@ -769,6 +769,11 @@ reg design_run = 1'b0;
     // part 1 -> part 2 switch as 106,943 wrong bytes. Count what was skipped and print it: the
     // switch's own checks (trailer re-read, fill oracle, frames) are what grade that run.
     integer   sw_skip_bytes = 0;
+    // What the ROM actually HANDS the VM after a chapter switch. The empty-polygon finding says the
+    // engine reads zeros for its draw arguments; these two counters separate "the read path is
+    // serving zeros" from "the script asks for the wrong place and finds zeros there".
+    integer   sw_bytes = 0, sw_zero = 0;
+    integer   al_bytes = 0, al_zero = 0;   // whole run, so a cold boot can be compared on the same number
 
     integer   n_fill_acc  = 0;      // acceptances that wrote the fill buffer: the intolerant ones
     integer   n_fill_bad  = 0;      // of those, ones with a gap that could move a later write
@@ -1444,6 +1449,12 @@ reg design_run = 1'b0;
         // trailer reads (TRAILER_ADDR, repeated) and not the VM's stream.
         if (mem_data_available && !u_rom.chk_active) begin
             bytes_to_vm = bytes_to_vm + 1;
+            al_bytes = al_bytes + 1;
+            if (mem_data === 8'h00) al_zero = al_zero + 1;
+            if (switch_done) begin
+                sw_bytes = sw_bytes + 1;
+                if (mem_data === 8'h00) sw_zero = sw_zero + 1;
+            end
             if ((stream_base + served_k) >= PACK_BYTES) chk_unchk = chk_unchk + 1;
             // Every byte handed to the VM, checked against the image. When the game draws
             // nothing this is what tells you whether the ROM lied or the VM asked for
@@ -2062,8 +2073,10 @@ reg design_run = 1'b0;
         $display("tb_soc: delivery oracle stood aside for %0d acceptances that re-served from their own start (%0d bytes; the fill-shift oracle still checks every byte the VM writes)",
                  n_reserve, reserve_bytes);
         if (switch_done)
-            $display("tb_soc: stream oracle stood aside after the chapter switch for %0d bytes (they are the new part's, not the command-line pack's)",
-                     sw_skip_bytes);
+            $display("tb_soc: stream oracle stood aside after the chapter switch for %0d bytes (they are the new part's, not the command-line pack's); of the %0d bytes the ROM delivered after the switch, %0d were ZERO (whole run: %0d of %0d)",
+                     sw_skip_bytes, sw_bytes, sw_zero, al_zero, al_bytes);
+        else
+            $display("tb_soc: ROM delivered %0d bytes, %0d of them ZERO", al_bytes, al_zero);
         // The consumer-side view of the same traffic. A short held acceptance is the bytecode
         // fill, and a gap inside one shifts the fill (vm.si:496); a long one is a string strip,
         // which survives gaps. `pulsed` is readByte, whose bytes always land with in_ready low
