@@ -81,6 +81,26 @@ else
     "$OBJ/music/tb_music" | grep -e "events compared" || fail=1
 fi
 
+# Modules 137 and 138: the other two MUSIC resources in the image. Neither was ever reached by a
+# 25-60 frame harvest run, and both play LOOPING instruments (loop=5728+21392 and 3226+3482), so
+# this is the coverage the harvest could not give: the same bench, the same reference, the two
+# modules the game has not asked for yet.
+for M in 137 138; do
+    echo "=== tb_music: module $M, event for event ==="
+    SCNM="$ROOT/build/music-$M"; mkdir -p "$SCNM"
+    python3 "$ROOT/scripts/music_scenario.py" "$SCNM" --res $M --delay 1000 --ticks 200 \
+        > "$OBJ/music-$M-scn.log" 2>&1 || {
+        echo "   scenario generation FAILED"; tail -3 "$OBJ/music-$M-scn.log"; fail=1; continue; }
+    if ! verilator --binary -j 4 --timing --top-module tb_music -Wno-fatal -Wno-lint \
+            -DSCN_PATH="\"$SCNM\"" -DRES_VAL=$M -DDELAY_VAL=1000 -DTICK_MS=8 \
+            --Mdir "$OBJ/music$M" \
+            "$CORE/aw_music.v" "$SIM/tb_music.sv" -o tb_m$M > "$OBJ/music$M.log" 2>&1; then
+        echo "   build FAILED"; grep -E "%Error" "$OBJ/music$M.log" | head -5; fail=1
+    else
+        "$OBJ/music$M/tb_m$M" | grep -e "events compared" || fail=1
+    fi
+done
+
 echo "=== tb_audio_ch: play / stop / unknown id ==="
 if ! verilator --binary -j 4 --timing --top-module tb_audio_ch -Wno-fatal -Wno-lint \
         --Mdir "$OBJ/ch" "$CORE/aw_audio_idx.v" "$CORE/aw_audio_ch.v" "$SIM/tb_audio_ch.sv" -o tb_ch > "$OBJ/ch.log" 2>&1; then

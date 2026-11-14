@@ -97,6 +97,24 @@ module tb_music;
     // the first version wrapped and reported the first note at 2.1 "seconds"
     longint first_play_time = -1;
     integer tick_ms = 133, first_play_tick = -1, ticks = 0;
+    // The module and the tick-delay override are build-time parameters so the SAME bench grades every
+    // MUSIC resource in the image (7, 137, 138), not just the intro theme. Defaults keep the original
+    // module 7 / 15700 invocation working unchanged.
+`ifdef RES_VAL
+    localparam integer MUS_RES = `RES_VAL;
+`else
+    localparam integer MUS_RES = 7;
+`endif
+`ifdef DELAY_VAL
+    localparam integer MUS_DELAY = `DELAY_VAL;
+`else
+    localparam integer MUS_DELAY = 15700;
+`endif
+`ifdef TICK_MS
+    localparam integer MUS_TICK_MS = `TICK_MS;
+`else
+    localparam integer MUS_TICK_MS = 133;
+`endif
     integer i, fd, got;
     reg compare_en = 1'b1;          // off for the stop-music case, which is not part of the oracle's table
 
@@ -161,7 +179,7 @@ module tb_music;
         fd = $fopen({`SCN_PATH, "/info.txt"}, "r");
         got = $fscanf(fd, "res %d\nticks %d\n%d\n", i, ticks, first_play_tick);
         $fclose(fd);
-        tick_ms = 133;          // --delay 15700: 15700*60/7050 = 133.6, integer division -> 133
+        tick_ms = MUS_TICK_MS;  // --delay D: D*60/7050, integer division (e.g. 15700 -> 133)
 
         $display("tb_music: module 7, %0d expected events, %0d ticks, first PLAY at tick %0d, tick %0d ms",
                  nexp, ticks, first_play_tick, tick_ms);
@@ -169,7 +187,7 @@ module tb_music;
         repeat (10) @(posedge clk);
         rst <= 0;
         repeat (10) @(posedge clk);
-        @(negedge clk); play <= 1; num <= 16'd7; delay <= 16'd15700; pos <= 8'd0;
+        @(negedge clk); play <= 1; num <= MUS_RES; delay <= MUS_DELAY; pos <= 8'd0;
         @(negedge clk); play <= 0;
 
         i = 0;
@@ -216,7 +234,7 @@ module tb_music;
                 $display("  stop-music: num=0 returned the tracker to idle after %0d cycles", i);
             end
             // and a cue after a stop must start it again (the intro does stop-then-play on consecutive frames)
-            @(negedge clk); play <= 1; num <= 16'd7; delay <= 16'd15700; pos <= 8'd0;
+            @(negedge clk); play <= 1; num <= MUS_RES; delay <= MUS_DELAY; pos <= 8'd0;
             @(negedge clk); play <= 0;
             i = 0;
             while (!dut.running && i < 100000) begin

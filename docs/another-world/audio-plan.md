@@ -529,3 +529,23 @@ loader had run, and reported zero mixer samples for a working path.
 
 `tb_soc` is where the real pack runs: it instantiates the same chain against the same `aw_rom`, so a play
 issued by the game's own bytecode measures the shipping path, including the added PSRAM traffic.
+
+### Harvest widening, closed by a different route (2026-11-12)
+
+The original plan was to play the game longer and collect more events. That is expensive in simulation
+(a part's later chapters are hundreds of frames away) and it depended on the game choosing to ask for
+the resources we wanted. The acceptance clause allows the other route, and it turned out to be the
+better one: **grade every MUSIC resource in the image directly against the reference**, with the same
+bench that grades module 7.
+
+`scripts/sim_audio.sh` now runs `tb_music` three times — module 7 (the intro theme, 1192 events) and
+modules **137 (266 events)** and **138 (361 events)** — all event-for-event against `ref_tracker.py`
+with 0 errors. Those two modules were never reached by any harvest run, and their instruments **loop**
+(`loop=5728+21392` and `3226+3482`), so the looping path the mixer must reproduce is now exercised by
+real module data and not only by the mixer's own bit-exact loop case.
+
+What that leaves uncovered is *game-driven* coverage of the 11 looping SOUND resources
+(res 1, 3, 8, 16, 89, 97, 102, 104, 106, 132, 139): their loop wrap is byte-identical to the modules'
+(mixer, `ref_mixer` bit-exact), but no recorded run has heard them from the game. Reaching them means a
+long run into later chapters, which the chapter switch (AW 1065) now makes possible without a relaunch;
+it is a cost/benefit question, not a blocker, and this note is the documented reason.
