@@ -37,6 +37,9 @@ def main():
     ap.add_argument("--pcm", default=None,
                     help="also render the reference PCM to this file (signed samples, one per line) - "
                          "the sample-for-sample half of the tracker's grading")
+    ap.add_argument("--pcm-memset", action="store_true",
+                    help="render the PCM from a module built WITH the upstream memset(data+8,0,4) quirk - "
+                         "the test for whether the RTL reproduces it")
     ap.add_argument("--pcm-samples", type=int, default=4000,
                     help="how many samples to write after the leading silence")
     args = ap.parse_args()
@@ -100,7 +103,12 @@ def main():
         # The sample-for-sample oracle. Leading silence is dropped on BOTH sides (the module's first
         # note is ~8.5 s in at the header delay, and a bench that has to reproduce that silence costs
         # 200M cycles); the comparison then starts at the first non-zero sample, which is the note.
-        pcm = ref_tracker.render(mod, ticks_run, args.pos, args.delay, 0)
+        mod_pcm = mod
+        if args.pcm_memset:
+            mod_pcm = ref_tracker.Module(args.res, blob[index[args.res]["offset"]:
+                                         index[args.res]["offset"] + index[args.res]["len"]],
+                                         index, blob, memset=True)
+        pcm = ref_tracker.render(mod_pcm, ticks_run, args.pos, args.delay, 0)
         first = 0
         while first < len(pcm) and pcm[first] == 0:
             first += 1
