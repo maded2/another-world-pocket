@@ -3501,3 +3501,48 @@ and only the last worked:
 Two process notes worth more than the numbers: comparing the fit report's **per-entity** ALM/register lines
 before and after a structural change is what caught attempt 2; and the fitter needed seed 4 to clear a
 -0.086 ns hold violation that appeared at the new 60% occupancy (setup 0.392 / hold 0.079 at the time).
+
+## 2026-11-12 — the chapter switch, narrowed to the op the restart interrupts
+
+The switch path is the last broken feature and it is now reproduced in simulation, so the Pocket is
+no longer needed to make progress on it. The re-entry fix from AW 1064 stands: a restart really does
+re-read the new part's trailer (the trailer counter `uint5 n(0)` carried a power-up initializer with no
+reset term, so before it a restart entered the read loop with n = 16 and kept the old segment offsets).
+What is still wrong is the picture, and it is wrong the same way on hardware.
+
+Measured (all in simulation, `PART=1 SWITCH=2`, `+HOLDPART`):
+
+| switch at frame | result after the switch |
+|---|---|
+| 10, 40, 80, 120 | renders; 120 passes its checks outright |
+| 160, 180, **182** | renders fully — 145–147 of 147 frames non-black |
+| **185** | 5 non-black frames, black from 197 |
+| 190 / 200 | black from 202 / 228 |
+
+So the trigger lies inside three frames. The opcode dispatch log settles what that means: the op
+sequences for frames 178–189 are **identical** between the 182 and 185 runs (62 ops each, `diff`
+empty, both ending frame 189 with `op=86, 06, 07, 03, 10` at the same addresses). The intro is
+running the same loop either way, and the intros' 14-op cycle at frames 180/182 is
+`0d 0a 0f 06 09 84 e1 06 07 86 06 07 03 10`. A switch at 182 lands after that cycle's multi-cycle
+block (dispatch `09`/`84`/`e1` at `0x2024b7`/`0x2024ae`/`0x2024b2`); at 185 it lands **inside** it.
+That is the first statement of the bug that names a place.
+
+The failing restart, for the record: trailer = the new part's, segOffsets = the new part's, first
+fetches = the new part's first bytes, palette loaded, bytecode fill 0 shifted — and yet every
+post-switch rasterization is `numv=4 bbw=0 bbh=0 zoom=0 color=0 px=0 py=0`, an empty polygon, while
+the last pre-switch one was `bbw=19 bbh=84 zoom=64`. `display_conflict` is 0 for the whole run, so
+a5k's display gate is not dropping anything.
+
+Killed on the way, each by regenerating and measuring rather than by argument: clearing all 64 thread
+entries; clearing all 256 game variables; clearing `scriptStackCalls` and `polygonStack`; forcing
+`page_swap`/`pal_swap` to 0 at boot; forcing `blitter_src`/`blitter_dst`/`rasterizer_dst` to 0 at boot;
+and the idea that the ROM hands back zeros (a switch that renders at frame 80 takes the same 50 % zero
+bytes and the same ~3 MB post-switch stream as one that goes black; a cold part-2 boot is 19.6 % zeros).
+Every one of those patches was reverted, so the tree still builds the shipped AW 1064 netlist.
+
+Next: name the op current at frames 183–184 with a cycle stamp, dump what it keeps in locals
+(`_q_i_readPolygons_*`, `_q___sub_readPolygons_before`, `mem.addr`, aw_rom's fill pointer) across the
+restart, and either re-derive those or make the core wait for the op to retire before it restarts the
+VM — the latter is smaller and matches the plan's "hold the VM, switch the table, re-enter through
+boot". The bench's `TRACE=1` now prints the dispatch index per change, the display gate, and the
+polygon geometry, which is what made the empty-polygon finding visible at all.
