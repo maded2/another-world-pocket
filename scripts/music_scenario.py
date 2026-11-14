@@ -34,6 +34,11 @@ def main():
     ap.add_argument("--ticks", type=int, default=1100)
     ap.add_argument("--audio-base", type=lambda s: int(s, 0), default=0x2F0000)
     ap.add_argument("--image", default="build/aw-all-audio.bin")
+    ap.add_argument("--pcm", default=None,
+                    help="also render the reference PCM to this file (signed samples, one per line) - "
+                         "the sample-for-sample half of the tracker's grading")
+    ap.add_argument("--pcm-samples", type=int, default=4000,
+                    help="how many samples to write after the leading silence")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -90,6 +95,21 @@ def main():
 
     with open(os.path.join(args.out, "expect.txt"), "w") as fh:
         fh.write("\n".join(lines) + "\n")
+
+    if args.pcm:
+        # The sample-for-sample oracle. Leading silence is dropped on BOTH sides (the module's first
+        # note is ~8.5 s in at the header delay, and a bench that has to reproduce that silence costs
+        # 200M cycles); the comparison then starts at the first non-zero sample, which is the note.
+        pcm = ref_tracker.render(mod, ticks_run, args.pos, args.delay, 0)
+        first = 0
+        while first < len(pcm) and pcm[first] == 0:
+            first += 1
+        sel = pcm[first:first + args.pcm_samples]
+        with open(args.pcm, "w") as fh:
+            for v in sel:
+                fh.write("%d\n" % v)
+        print("music scenario: reference PCM %d samples from index %d (first non-zero), hash %08x"
+              % (len(sel), first, abs(hash(tuple(sel))) & 0xFFFFFFFF))
 
     with open(os.path.join(args.out, "info.txt"), "w") as fh:
         fh.write("res %d\nticks %d\n%d\n" % (args.res, ticks_run, first_play if first_play is not None else -1))

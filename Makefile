@@ -52,7 +52,7 @@ CORES    := $(notdir $(wildcard cores/*))
         new report list size clean distclean prune \
         silice-image silice-shell silice a5k-translate upstream probe \
         lint sim sim-write sim-rom sim-dir sim-keys sim-iv sim-reset sim-soc sim-dbg \
-        sim-top sim-audio check-build worst-path loader
+        sim-top sim-audio sim-tracker-pcm check-build worst-path loader
 
 help:
 	@echo "Analogue Pocket openFPGA build env (CORE=$(CORE), image=$(IMAGE))"
@@ -158,6 +158,12 @@ worst-path:
 # access pattern the VM uses; sim_soc boots the design and captures frames.
 sim-audio:
 	@$(SILICE) scripts/sim_audio.sh
+
+# The tracker's samples against the reference rendering. NOT in `sim` yet: it is a known-open
+# measurement (a handful of +-1 samples around volume changes), and a red suite hides every other
+# verdict while a silent tolerance hides the difference. `make sim-tracker-pcm` and read the count.
+sim-tracker-pcm:
+	@$(SILICE) scripts/sim_tracker_pcm.sh
 
 # Undriven-net guard: an unconnected module input reads as 0 on hardware and X in
 # simulation, and neither the benches nor a -Wno-lint build can see it. It has
