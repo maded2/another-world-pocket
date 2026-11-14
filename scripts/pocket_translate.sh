@@ -196,6 +196,62 @@ if "RE-ARM:" not in s:
     assert rearm_anchor in s, "vm.si: trailer counter anchor not found - upstream changed?"
     s = s.replace(rearm_anchor, rearm_new, 1)
 
+# --- CHAPTER RE-ENTRY: give a restart the thread table a cold boot has --------------
+# After a chapter restart the VM re-reads the trailer and starts the new script, but the thread
+# table still holds the OLD chapter: measured `0000 ffff 24c6 22d1` (thread 0 at its start,
+# threads 2 and 3 carrying the previous part's pcs). The first op_pauseThread then schedules
+# 0x24c6, the new script runs part 1's branch inside part 2's view, and the polygon it draws
+# reads offset 0 with zoom 0 - an empty polygon, black screen, while every byte the ROM serves
+# is correct. A cold boot's table is `0000 ffff ffff ...`: thread 0 at pc 0 and every other
+# thread INACTIVE (0xffff), with 0xffff in every requested-pc slot and channel-active clear.
+# This writes exactly that, before the interpreter starts.
+#
+# Two traps, both measured: zeroing the table instead of writing 0xffff leaves all 64 threads
+# runnable at pc 0 and the engine never settles (0 non-black frames, VM starved at 72 kB); and
+# a memory's write enable is defaulted to 0 every cycle by the generated code, so it must be
+# asserted INSIDE each loop iteration - setting it once before the loop writes nothing at all,
+# which is why the first version of this patch looked like it ran and did nothing.
+#
+# Fourth deliberate divergence from upstream vm.si.
+clear_anchor = """    threadsData.addr    = {1b$PC_OFFSET$,6b0};
+    threadsData.wdata   = 0;
+
+    // loop into code execution"""
+clear_new = """    threadsData.addr    = {1b$PC_OFFSET$,6b0};
+    threadsData.wdata   = 0;
+
+    {
+      uint7 tid = 0;
+      threadsData.wenable       = 1;
+      vmIsChannelActive.wenable = 1;
+      while (~tid[6,1]) {
+        // wenable must be asserted in EVERY iteration: the generated code defaults every memory's
+        // write enable to 0 each cycle, so setting it once before the loop writes nothing at all
+        // (measured: the table kept the previous chapter's pcs, which is what made this loop look
+        // like it ran and did nothing).
+        threadsData.wenable = 1;
+        threadsData.addr    = {1b$PC_OFFSET$,tid[0,6]};
+        // The state a cold boot is in at its first pause: thread 0 at pc 0, every other thread
+        // INACTIVE (0xffff), not merely zero. Zeroing them activates all 64 threads at pc 0 and the
+        // engine never settles (measured: 0 non-black frames, the VM starved at 72 kB).
+        threadsData.wdata   = (tid[0,6] == 6b000000) ? 16h0000 : 16hFFFF;
+      ++:
+        threadsData.wenable = 1;
+        threadsData.addr    = {1b$REQUESTED_PC_OFFSET$,tid[0,6]};
+        threadsData.wdata   = 16hFFFF;
+      ++:
+        vmIsChannelActive.wenable = 1;
+        vmIsChannelActive.addr  = {1b$CURR_STATE$,tid[0,6]};
+        vmIsChannelActive.wdata = 0;
+        tid = tid + 1;
+      }
+    }
+
+    // loop into code execution"""
+if "uint7 tid = 0;" not in s:
+    assert clear_anchor in s, "vm.si: boot-state anchor not found - upstream changed?"
+    s = s.replace(clear_anchor, clear_new, 1)
+
 open(p, "w").write(s)
 print("vm.si: audio opcode patch applied (or already present); trailer counter re-armed")
 PY

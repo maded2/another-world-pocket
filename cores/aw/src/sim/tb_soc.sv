@@ -1304,12 +1304,64 @@ reg design_run = 1'b0;
     // first appears between those frames" - and the dispatch index names the op without decoding the
     // stream by hand. `%h` so it can be diffed between two runs directly.
     reg [7:0] tr_op_seen = 8'hff;
+    // On every op_pauseThread (0x06) the scheduler switches threads, so WHICH thread runs next is the
+    // whole question when the restarted script takes a different branch from a cold boot (measured:
+    // at 0x200091 a cold boot continues at 0x200092, a restarted one jumps to 0x24c7). Dump the
+    // thread table on the first few pauses of a run.
+    integer tr_pause_n = 0;
+    // One snapshot of the thread table AT the restart, before any new op runs, to tell "the boot
+    // clear did not reach the RAM" from "the script created those pcs again in the next frames".
+    integer tr_rstr_seen = 0;
+    integer tr_tbl_n = 0;
+    always @(posedge clk_core) begin
+        if (rstr_cnt > 0 && tr_rstr_seen == 0) begin
+            tr_rstr_seen = 1;
+            $write("  RSTRTABLE threads:");
+            for (ti = 0; ti < 16; ti = ti + 1) $write(" %h", u_soc.vm.__mem__threadsData.buffer[ti]);
+            $display;
+        end
+    end
+    integer ti;
+    reg [7:0] tr_opd_d = 8'hff;      // own edge detector: another block also writes tr_op_seen
+    always @(posedge clk_core) begin
+        tr_opd_d <= u_soc.vm._q_op_decode_addr;
+        if (u_soc.vm._q_op_decode_addr == 8'h06 && tr_opd_d != 8'h06 && tr_pause_n < 400) begin
+            tr_pause_n = tr_pause_n + 1;
+            $write("  PAUSE f%0d threads:", frames);
+            for (ti = 0; ti < 32; ti = ti + 1) $write(" %h", u_soc.vm.__mem__threadsData.buffer[ti]);
+            $write(" | active:");
+            for (ti = 0; ti < 32; ti = ti + 1) $write(" %h", u_soc.vm.__mem__vmIsChannelActive.buffer[ti]);
+            $display;
+        end
+    end
+    // Polygon RAM writes, with the address the RAM actually sees. The failed switch leaves the four
+    // vertices at indices 4..7 instead of 0..3, and the VM's own pointer reads 3 in both cases - so
+    // one of those two facts is wrong and this says which.
+    integer tr_pw = 0, tr_pw_sw = 0;
+    always @(posedge clk_core) begin
+        if (u_soc._w_vm_polygon_wenable1) begin
+            if (tr_pw < 10)
+                $display("  PWRITE f%0d addr=%0d data=%h", frames, u_soc._w_vm_polygon_addr1, u_soc._w_vm_polygon_wdata1);
+            tr_pw = tr_pw + 1;
+        end
+        if (switch_done && u_soc._w_vm_polygon_wenable1) begin
+            if (tr_pw_sw < 10)
+                $display("  PWSW   f%0d addr=%0d data=%h", frames, u_soc._w_vm_polygon_addr1, u_soc._w_vm_polygon_wdata1);
+            tr_pw_sw = tr_pw_sw + 1;
+        end
+    end
     reg [23:0] tr_addr_lo = 24'hffffff, tr_addr_hi = 0;
     always @(posedge clk_core) begin
         if (u_soc._q_display_conflict)   tr_dc_high = tr_dc_high + 1;
         if (u_soc.vm._q_op_decode_addr !== tr_op_seen) begin
             tr_op_seen = u_soc.vm._q_op_decode_addr;
             $display("  TRACE f%0d op=%h addr=%h", frames, tr_op_seen, u_soc.vm._q_mem_addr);
+            if (rstr_cnt > 0 && tr_tbl_n < 4) begin
+                tr_tbl_n = tr_tbl_n + 1;
+                $write("  TBLPOST op=%h threads:", tr_op_seen);
+                for (ti = 0; ti < 16; ti = ti + 1) $write(" %h", u_soc.vm.__mem__threadsData.buffer[ti]);
+                $display;
+            end
         end
         if (u_soc._w_vm_pix_wenable)     tr_w_vm   = tr_w_vm   + 1;
         if (u_soc._w_rast_pix_wenable)   tr_w_rast = tr_w_rast + 1;
@@ -1380,11 +1432,15 @@ reg design_run = 1'b0;
                      $time, tr_numv, tr_bbw, tr_bbh,
                      u_soc._w_vm_polygon_zoom, u_soc._w_vm_polygon_color,
                      u_soc._w_vm_polygon_px, u_soc._w_vm_polygon_py, bytes_to_vm, tr_poly_wen);
-            $display("        polygon[0..7] = %h %h %h %h %h %h %h %h",
+            // pa1 = the VM's polygon write pointer and t_pa1 = the address the RAM actually sees.
+            // The failed switch writes its vertices to indices 4..7 instead of 0..3, so which of the
+            // two disagrees with the other is the whole question about vm.si's `polygon.addr1 = -1`.
+            $display("        polygon[0..7] = %h %h %h %h %h %h %h %h  pa1=%0d va=%0d vr=%0d",
                      u_soc.__mem__polygon.buffer[0], u_soc.__mem__polygon.buffer[1],
                      u_soc.__mem__polygon.buffer[2], u_soc.__mem__polygon.buffer[3],
                      u_soc.__mem__polygon.buffer[4], u_soc.__mem__polygon.buffer[5],
-                     u_soc.__mem__polygon.buffer[6], u_soc.__mem__polygon.buffer[7]);
+                     u_soc.__mem__polygon.buffer[6], u_soc.__mem__polygon.buffer[7],
+                     u_soc.vm._q_polygon_addr1, u_soc.vm._q_vmVars_addr, u_soc.vm._w_mem_vmVars_rdata);
         end
         if (tr_blit_start && !tr_p_bstart)
             $display("  TRACE t=%0t BLITTER_START bytes=%0d", $time, bytes_to_vm);
