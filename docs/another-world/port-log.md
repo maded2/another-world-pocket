@@ -3546,3 +3546,48 @@ restart, and either re-derive those or make the core wait for the op to retire b
 VM — the latter is smaller and matches the plan's "hold the VM, switch the table, re-enter through
 boot". The bench's `TRACE=1` now prints the dispatch index per change, the display gate, and the
 polygon geometry, which is what made the empty-polygon finding visible at all.
+
+## 2026-11-12 (later) — the chapter switch: it was the thread table, and the black screen is gone
+
+The entry above ended with "the restart lands inside an op and the new part draws empty polygons".
+That observation was right and its cause was one level away from where it was being looked for.
+
+**What the engine was doing.** After a switch the VM re-read the trailer and ran the new part's script
+from its first byte — verified, repeatedly — while its **thread table still held the previous
+chapter**:
+
+    first op after a restart:   0000 ffff 24c6 22d1 ffff ...
+    a cold boot's table:        0000 ffff ffff ffff ffff ...
+
+Thread 0 is at its start, but threads 2 and 3 carry part 1's pcs. The first `op_pauseThread` (0x06)
+then schedules `0x24c6`; the new script runs part 1's branch inside part 2's view, and the polygon it
+draws reads offset 0 with zoom 0 — an empty polygon (`bbw=0 bbh=0`), nothing rasterized, black screen.
+Every byte the ROM served was correct the whole time, which is why the fill oracle, the stream, the
+palette and the segment offsets were all clean and every "clear the stale memory" experiment looked
+like a dead end.
+
+**The fix.** The boot sequence now writes the table a cold boot has: thread 0 at pc 0, every other
+thread INACTIVE (`0xffff`), every requested-pc slot `0xffff`, channel-active clear. Fourth deliberate
+divergence from upstream `vm.si`, in `scripts/pocket_translate.sh`.
+
+**Two traps, both measured, both worth carrying forward**, because each made a working patch look
+like a falsified hypothesis:
+
+1. **`0xffff` is not zero.** Zeroing the table leaves all 64 threads runnable at pc 0; the engine
+   never settles (0 non-black frames, the VM starved at 72 kB). The sentinel is what makes a thread
+   inactive.
+2. **A memory's write enable is defaulted to 0 every cycle** by the generated code. Asserting it once
+   before a loop writes nothing at all. The first version of this patch did exactly that, and its run
+   was byte-identical to the unpatched one — which read as "the hypothesis failed" rather than "the
+   patch never ran".
+
+**Results** (simulation, combined image, `+HOLDPART`): switch at 182 → 160/165 frames non-black, PASS;
+at 185 → 86/102, PASS (was 5 then black from 197); at 200 → 131/147, PASS (was black from 228);
+same-part restart → 135/176, 131 rich, 0 shifted of 83,648 fill writes. `make sim` (lint + every
+bench), `sim-dir` (9 runs) and `sim-soc` (plain and audio image) all green.
+
+**AW 1065** — sha `8badd5210d28b003`, 7,454 ALMs / 9,431 registers, worst slack 0.058 ns, scoped
+`check-build` clean. Installer `scripts/sd_install_1065a.sh` refuses 1062, 1063 and 1064 (the build
+whose switch still renders black). Hardware has not seen this one yet; the run to ask for is: launch
+part 2, then change part in the OSD while the game is running, and watch whether the picture changes
+instead of going black.
