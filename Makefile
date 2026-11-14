@@ -159,9 +159,9 @@ worst-path:
 sim-audio:
 	@$(SILICE) scripts/sim_audio.sh
 
-# The tracker's samples against the reference rendering. NOT in `sim` yet: it is a known-open
-# measurement (a handful of +-1 samples around volume changes), and a red suite hides every other
-# verdict while a silent tolerance hides the difference. `make sim-tracker-pcm` and read the count.
+# The tracker's samples against the reference rendering, sample for sample. 4000/4000 match at the
+# scenario's row rate; the 4 ms row rate (--delay 500) still differs by +-1 on 56 samples, which is
+# an open question recorded in the port log.
 sim-tracker-pcm:
 	@$(SILICE) scripts/sim_tracker_pcm.sh
 
@@ -228,7 +228,7 @@ ref-sim:
 # "AW 1041a up" on builds 1040, 1041 and 1042: the bench that compares that line byte for byte had
 # been red for two releases, and a bench nobody runs is a bench nobody fixes.
 # lint is here for the same reason: a guard nobody runs is not a guard.
-sim: lint sim-write sim-keys sim-rom sim-iv sim-reset sim-dbg sim-top sim-audio
+sim: lint sim-write sim-keys sim-rom sim-iv sim-reset sim-dbg sim-top sim-audio sim-tracker-pcm
 
 # ------------------------------------------------------------------- package --
 # The pack .bin files are game content, not build output: they live in

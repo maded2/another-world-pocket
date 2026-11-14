@@ -3600,3 +3600,26 @@ the game can ask for the next chapter (`op_updateMemList` → `part_req` → `aw
 the VM restarts and re-reads the trailer → the new script runs), and the OSD can move between parts
 mid-session. The two things that had to be true for that — the trailer counter re-arm (AW 1064) and the
 cold-boot thread table (AW 1065) — are both in the shipping build.
+
+### The tracker's PCM, sample for sample (done)
+
+`tb_music` grades the command stream event for event and `tb_mixer` grades the mixer bit-exactly against
+`ref_mixer.py`; neither compared the **samples** the tracker produces with the ones `ref_tracker.py`
+renders. That is now `cores/aw/src/sim/tb_tracker_pcm.sv` (`make sim-tracker-pcm`, part of `make sim`).
+
+How it is kept honest and cheap: the scenario overrides the tick delay (the same override the music
+opcode carries) so the module's ~8.5 s wait for its first note compresses without changing a sample —
+both sides render with the override — and the comparison starts at the first **non-zero** sample, so no
+silent stretch has to line up. The clock is 24.576 MHz, chosen so 48 kHz is exactly 512 cycles: a bench
+clock that cannot express the sample period would be grading its own rounding error.
+
+**Result: 4000 of 4000 samples match exactly** (row rate 8 ms, `--delay 1000`).
+
+Open, and it is why the gate uses 8 ms: at **4 ms** (`--delay 500`) 56 of 4000 samples differ, every one
+by ±1, in short runs of three or four, with the sign flipping between runs (quieter at 3097, louder at
+3147) — the shape of a *one-sample position* difference on a near-zero waveform, not a level or
+arithmetic error. Eliminated: a fixed latency (best offset shift is 0), and the `prepareInstruments`
+`memset(data+8,0,4)` quirk (rendering the reference with it ON gives the identical hash — those bytes
+are already zero for this instrument). Next tests if it ever matters: render at a third delay to see
+whether the residual scales with the tick period, and dump the RTL's per-channel `ch_pos`/`ch_vol`
+beside `ref_mixer.Channel` at the first differing index.

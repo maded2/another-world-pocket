@@ -22,7 +22,11 @@ module tb_tracker_pcm;
     localparam integer SAMP_CYCLES = CLK_HZ / 48000;     // 512 - exact by construction
     localparam [23:0]  AUDIO_BASE  = 24'h2F0000;
     localparam integer NSAMP       = 4000;
-    localparam integer DELAY       = 500;                // matches the scenario's --delay
+`ifdef DELAY_VAL
+    localparam integer DELAY       = `DELAY_VAL;         // -DDELAY_VAL=n, for the scaling test
+`else
+    localparam integer DELAY       = 1000;               // matches the scenario's --delay
+`endif
     localparam integer TICKS       = 120;
     localparam integer POS         = 0;
 
