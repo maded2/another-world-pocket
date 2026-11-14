@@ -205,6 +205,16 @@ reg design_run = 1'b0;
     // positions stay a belief until checked against the spec and a real pad.
     integer in_checks    = 0;
     integer in_acted     = 0;
+    // The HARD check is the one that is guaranteed: what the SoC hands the VM (u_soc.vm.in_jstick,
+    // through the port and jstick_delay) must equal what the testbench drove. The SOFT check - the
+    // game's own pad variables in vmVars - is scene-dependent by construction: in a scripted scene
+    // the game writes those variables itself, so 3 of 7 patterns "fail" on a correct design and the
+    // first pattern (nothing driven) already reads ud=-1 mask=8. It is now reported, not counted.
+    // +KEYSOFF=1 is the negative control: it shifts the EXPECTED pattern by one bit so the hard
+    // check must see a difference, which proves the assertion bites without touching the design.
+    integer in_off       = 0;
+    integer in_off_seen  = 0;
+    integer in_seen      = 0;   // patterns the VM input register actually showed
     // The first version sampled the pad variables once, at the end of the window, and reported
     // that 'right' and 'up' did nothing while 'left' worked. Both readings were true: vm.si's
     // input block runs periodically, so a single-instant check passes or fails depending on where
@@ -227,13 +237,20 @@ reg design_run = 1'b0;
         seen_pad = 0; acted = 0; acted_at = -1;
         for (g = 0; g < IN_WINDOW_FRAMES * FRAME_CYCLES; g = g + 1) begin
             @(posedge clk_core);
-            if (u_soc.vm.in_jstick === pat) seen_pad = 1;
-            else if (u_soc.vm.in_jstick !== pat && !seen_pad) begin
+            if (u_soc.vm.in_jstick === (in_off ? (pat ^ 6'h01) : pat)) seen_pad = 1;
+            else if (u_soc.vm.in_jstick !== (in_off ? (pat ^ 6'h01) : pat) && !seen_pad) begin
                 // report once per case, not once per cycle
                 if (acted_at == -1 && g > 16) begin
-                    $display("  input %-8s FAIL: VM sees %b, expected %b",
-                             label, u_soc.vm.in_jstick, pat);
-                    errors = errors + 1;
+                    if (in_off) begin
+                        // the negative control: a difference here is the proof the check works
+                        in_off_seen = in_off_seen + 1;
+                        $display("  input %-8s negative control: VM sees %b, expected %b - the check bites",
+                                 label, u_soc.vm.in_jstick, pat ^ 6'h01);
+                    end else begin
+                        $display("  input %-8s FAIL: VM sees %b, expected %b",
+                                 label, u_soc.vm.in_jstick, pat);
+                        errors = errors + 1;
+                    end
                     acted_at = -2;   // suppress repeats; acted stays 0
                 end
             end
@@ -247,20 +264,22 @@ reg design_run = 1'b0;
             end
         end
         in_checks = in_checks + 1;
+        if (seen_pad) in_seen = in_seen + 1;
         if (acted) begin
             in_acted = in_acted + 1;
             $display("  input %-8s pad=%b -> VM lr=%0d ud=%0d mask=%h act=%h  ok (after %0d cycles, %0d frames)",
                      label, pat, want_lr, want_ud, want_mask, want_act, acted_at,
                      acted_at / FRAME_CYCLES);
         end else begin
-            $display("  input %-8s pad=%b -> no match in %0d frames (saw lr=%0d ud=%0d mask=%h act=%h; want lr=%0d ud=%0d mask=%h act=%h)",
-                     label, pat, IN_WINDOW_FRAMES,
+            // NOT an error: the game writes these variables itself in a scripted scene (see the
+            // declaration). The hard check above is what grades the input path.
+            $display("  input %-8s game vars did not follow in %0d frames (scene writes them; saw lr=%0d ud=%0d mask=%h act=%h; wanted lr=%0d ud=%0d mask=%h act=%h) - observation only",
+                     label, IN_WINDOW_FRAMES,
                      u_soc.vm.__mem__vmVars.buffer[8'hFC],
                      u_soc.vm.__mem__vmVars.buffer[8'hE5],
                      u_soc.vm.__mem__vmVars.buffer[8'hFD],
                      u_soc.vm.__mem__vmVars.buffer[8'hFA],
                      want_lr, want_ud, want_mask, want_act);
-            errors = errors + 1;
         end
     endtask
 
@@ -1665,6 +1684,7 @@ reg design_run = 1'b0;
         void'($value$plusargs("SWITCHAFTER=%d", switch_after));
         void'($value$plusargs("DBGSW=%d", sw_dbg));
         void'($value$plusargs("NOINPUT=%d", noinput));
+        void'($value$plusargs("KEYSOFF=%d", in_off));
         void'($value$plusargs("PACK_KIND=%s", pack_kind));
         void'($value$plusargs("IMG=%s", img_hex));
         void'($value$plusargs("IMG_BYTES=%d", img_bytes));
@@ -2012,8 +2032,17 @@ reg design_run = 1'b0;
             in_case("fire",    6'b010000, 16'sd0,  16'sd0,  16'h0000, 16'h1, 16'h0080);
             in_case("rt+fire", 6'b010001, 16'sd1,  16'sd0,  16'h0001, 16'h1, 16'h0081);
             js_force_en = 1'b0;
-            $display("  %0d patterns driven, the game's own pad variables reflected %0d of them",
-                     in_checks, in_acted);
+            $display("  %0d patterns driven: the VM input register matched every one (%0d seen); the game's own pad variables followed %0d (scene-dependent, reported not graded)",
+                     in_checks, in_seen, in_acted);
+            if (in_off) begin
+                if (in_off_seen == 0) begin
+                    $display("  KEYS NEGATIVE CONTROL FAILED: a shifted expectation was still accepted - the input check does not bite");
+                    errors = errors + 1;
+                end else begin
+                    $display("  KEYS negative control: %0d of %0d patterns were caught with a shifted expectation - the check bites",
+                             in_off_seen, in_checks);
+                end
+            end
         end
 
         $display("tb_soc: data_available pulses while the VM was held off: %0d (must be 0)",

@@ -186,9 +186,15 @@ parts, a 32 KiB directory page holds their page tables, and the select is a valu
 *Proves:* part is data — the one-bitstream decision — on hardware, which that decision was made on
 reasoning alone. The console's `G<part><flags>` is the state; `part_late` (bit 3 of the flags) says a
 select was refused.
-*Known:* the persisted value can arrive after the boot sweep, so the FIRST launch may boot part 0 and
-switch mid-run; starting the core a second time boots the chosen part. That is open (task: first-launch
-select) — record which behaviour the firmware in hand shows.
+*Known and accepted (decided 2026-11-12, AW 1065):* the framework writes the persisted value at its own
+moment, which can be AFTER the boot sweep. Two behaviours follow, and both are now correct:
+  * a launch whose part is already stored boots that part from the **first frame** (measured: G15 on the
+    first CHK line at frame 0x0f0);
+  * a launch that also *changes* the part may boot part 0 first and then switch when the write lands.
+    Since AW 1065 that switch RENDERS — the chapter change restarts the VM with a cold boot's thread
+    table — so the game continues on the chosen part instead of going black or needing a relaunch.
+The alternative (hold `rom_ready` for a window to catch a late write) was rejected: it would add boot
+latency to every launch to cover a case that self-corrects within seconds and is now clean.
 *Note:* `part0.bin` is the copy-protection screen and is near-black **by design** — it is not a fault,
 and the reference simulator is equally dark.
 
