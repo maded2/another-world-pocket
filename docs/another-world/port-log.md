@@ -3591,3 +3591,12 @@ bench), `sim-dir` (9 runs) and `sim-soc` (plain and audio image) all green.
 whose switch still renders black). Hardware has not seen this one yet; the run to ask for is: launch
 part 2, then change part in the OSD while the game is running, and watch whether the picture changes
 instead of going black.
+
+### Confirmed on the Pocket
+
+AW 1065, card `/media/eddie/6631-3564`: with the intro running, changing the part in the OSD switches
+to the new chapter and it RENDERS (owner's report). Continuous play is therefore real on hardware:
+the game can ask for the next chapter (`op_updateMemList` → `part_req` → `aw_rom` switches the table →
+the VM restarts and re-reads the trailer → the new script runs), and the OSD can move between parts
+mid-session. The two things that had to be true for that — the trailer counter re-arm (AW 1064) and the
+cold-boot thread table (AW 1065) — are both in the shipping build.
