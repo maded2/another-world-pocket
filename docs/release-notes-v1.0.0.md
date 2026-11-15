@@ -63,7 +63,7 @@ no ROM, no packs, no dataslot image. Another World is a commercial game; you nee
 
 | file | sha256 |
 |---|---|
-| `another-world-pocket-v1.0.0.zip` | `f1300d98a3f6ed31768dc1f810c5cd11515b1894d678c3c1cd846be942261400` |
+| `another-world-pocket-v1.0.0.zip` | `cd3b59bddf89926c97a789a1527b893c96a6745a8b3e267c3d3270cc18d09493` |
 | `Cores/Eddie Chan.Another World/bitstream.rbf_r` | `8badd5210d28b0034a78965ee323ac6cb261e9b8bd552db8236a37d8740f05a3` |
 
 The bitstream announces itself as **AW 1065** on the console line (`AW 1065a up`, 115200 baud on the

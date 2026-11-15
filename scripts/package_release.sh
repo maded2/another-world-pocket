@@ -66,7 +66,13 @@ if [ -d "$REL/stage/Assets" ]; then
     exit 1
 fi
 
-(cd "$REL/stage" && zip -qr "$ZIP" .)
+# Deterministic archive: every entry gets the BITSTREAM's timestamp and a fixed file order, and
+# zip is told to store no extra attributes (zip -X). Without this the archive's sha256 changes on
+# every run - the copy step refreshes mtimes - and a checksum in the release notes would be a lie
+# the first time someone rebuilt it to verify.
+STAMP=$(stat -c %Y "$CORE_DIR/bitstream.rbf_r")
+find "$REL/stage" -exec touch -h -d "@$STAMP" {} +
+(cd "$REL/stage" && find . -type f | LC_ALL=C sort | zip -X -q "$ZIP" -@)
 SHA=$(sha256sum "$ZIP" | cut -d' ' -f1)
 SIZE=$(stat -c%s "$ZIP")
 
