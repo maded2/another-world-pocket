@@ -357,7 +357,7 @@ packs:
 # The whole pipeline in one command: original ROM banks -> per-part packs -> audio -> the single
 # verified dataslot image (build/aw-all-audio.bin). scripts/build_all_in_one.sh documents the steps.
 rom:
-	@scripts/build_all_in_one.sh
+	@scripts/build_all_in_one.sh $(ARGS)
 
 # feasibility probes expect to run inside the Quartus container:
 #   make probe SCRIPT=probe/pll/run.sh

@@ -1,419 +1,232 @@
-# ap-tool — Analogue Pocket openFPGA build environment
+# Another World for the Analogue Pocket
 
-A reproducible Docker build environment for [Analogue openFPGA](https://www.analogue.co/developer)
-cores, built on the pre-built Quartus image [`didiermalenfant/quartus`](https://hub.docker.com/r/didiermalenfant/quartus),
-plus the glue you need to take an existing FPGA core (MiSTer, other openFPGA cores)
-to a `.rbf_r` that boots on an Analogue Pocket.
+An [openFPGA](https://www.analogue.co/developer) core that runs **Another World** (*Out of This
+World*, Delphine Software, 1991) on the Analogue Pocket — the original game engine, not a rewrite:
+[sylefeb's a5k](https://github.com/sylefeb/a5k) Silice virtual machine, ported to the Pocket and
+extended with a paged single-file game image, the game's own 4-channel 8-bit sound, its music
+tracker, and working chapter switching.
 
-Everything below was run and verified in this workspace:
-
-```
-Quartus Prime Lite 22.1std.2 (build 922)   license-free, no licence file needed
-base image  didiermalenfant/quartus:22.1-apple-silicon  (linux/amd64, Debian 9)
-device      Cyclone V 5CEBA4F23C8           <- the FPGA inside the Pocket
-
-make smoke    throwaway design placed/routed for 5CEBA4F23C8 in 26s -> smoke.rbf
-make test     open-fpga/core-template compiled in 57s, positive slack in every
-              STA corner (worst setup +5.26 ns, worst hold +0.135 ns),
-              414/18,480 ALMs, bitstream reversed, packaged + zipped: OK
-make new      scaffolded a fresh core, renamed the Quartus project, built and
-              packaged it as Cores/<author>.<core>/ - end to end
-a5k port    make a5k-translate reproduces upstream build.v (181,419 B / 8152 lines)
-            / 31 modules from the pinned commit, every file owned by your uid
-artifacts     owned by the host user; no sudo, no root-owned files
-```
+> **You must supply the game data yourself.** This repository contains no game files. The data is
+> extracted from the **PC (DOS) release of Another World** — the files `bank01`…`bank0d` and
+> `memlist.bin` — which you need to own and copy into `gamedata/`. Nothing in this repo can
+> substitute for it, and the build stops with a clear message if it is missing.
 
 ---
 
-## 1. Quick start
+## What works
+
+| | |
+|---|---|
+| **All eight game parts in one file** | One dataslot upload carries every part; the eight 2 MiB part views share their identical 32 KiB frames in a pool, so the whole game plus audio fits in 3.64 MiB |
+| **Picture** | The original renderer (blitter, rasterizer, polygon engine) at 320×200, 4:3, 60 Hz |
+| **Sound** | The original 4-channel 8-bit mixer at 48 kHz over I2S, including looping samples |
+| **Music** | The game's Amiga-style music modules played by an RTL tracker — verified sample-for-sample against a transcription of the original player |
+| **Chapters** | The game asks for the next chapter itself, and the OSD can move between parts while it runs — the switch restarts the VM cleanly instead of blanking the screen |
+| **Saves / dock** | Save states are not supported (`sleep` and save states disabled); the Dock is declared, analog output is not |
+
+Known open items are listed in `docs/another-world/port-log.md`; the two that matter are a ±1
+sample residual in the tracker's PCM at one particular row rate (8 ms rate is exact) and the fact
+that only one hardware run has exercised a mid-game chapter change so far.
+
+---
+
+## Requirements
+
+- **Another World, PC (DOS) version** — `bank01`…`bank0d` + `memlist.bin` from that release.
+- **Docker** with ~20 GB free disk (the Quartus image is ~15 GB) and Python 3 on the host.
+- *Nothing else.* Quartus, Verilator, Icarus and Silice all live in the containers.
+
+The build environment itself is documented in
+[`docs/ap-tool-build-environment.md`](docs/ap-tool-build-environment.md).
+
+---
+
+## Build
+
+### 1. One-time setup
 
 ```bash
-make image            # one-off: build the env on top of the Quartus image (~4 min, see FIX_PERMS)
-make doctor           # Quartus + Cyclone V device DB + workspace checks
-make build            # compile cores/core-template -> build/core-template/bitstream.rbf_r
-make package          # -> build/sd/{Cores,Platforms,Assets} + a shippable .zip
-make shell            # a shell inside the container, repo mounted at /work
+make image            # Quartus build image on top of didiermalenfant/quartus (~15 GB)
+make silice-image     # Silice + Verilator + Icarus image, for the netlist and the benches
 ```
 
-Starting your own core:
+### 2. Game data
+
+Copy the PC release's data files into `gamedata/`:
+
+```
+gamedata/
+  bank01 … bank0d      # the DOS release's data banks
+  memlist.bin          # the resource table
+```
+
+### 3. The ROM image (the dataslot file)
 
 ```bash
-make new CORE=mygame AUTHOR=jane PLATFORM=nes TITLE="Nintendo Entertainment System" \
-         YEAR=1983 MANUFACTURER=Nintendo
-make build CORE=mygame
-make package CORE=mygame RELEASE=1
+make rom
 ```
 
-Copy (don't replace) `build/sd/Cores`, `build/sd/Platforms` and `build/sd/Assets`
-to the root of the Pocket's microSD card, or use the generated zip.
+That single command runs the whole pipeline and verifies it:
 
-Requirements: Docker, ~20 GB free disk (base image ~15 GB + build databases), and
-Python 3 on the host for `make package` (any 3.x; the container ships 3.5 so the
-scripts run in both places).
+1. `ports/another-world/packs/part0.bin`…`part7.bin` — eight 2 MiB packs, one per game part;
+2. `build/aw-audio.bin` + `build/aw-audio.json` — every sound effect (103, 11 of them looping) and
+   all three music modules, unpacked from the same banks;
+3. `build/aw-all-audio.bin` — the frame pool, the eight page tables and the audio blob, then a
+   byte-for-byte verification that each part's 2 MiB view is identical to its pack.
 
----
-
-## 2. What is in the box
-
-| Path | Purpose |
-|---|---|
-| `docker/Dockerfile` | derived image: repairs the base image's root-only Quartus install, installs the tooling on `PATH`, sets `/work` as the mount point (and `/build` for compatibility with community openFPGA CI scripts) |
-| `docker/run.sh` | the one place the `docker run` flags live: mounts the repo at `/work`, runs as your uid, `HOME=/work/.home` |
-| `docker/entrypoint.sh` | writable-`HOME` fallback, keeps the base image's `quartus-entrypoint` (GitHub auth, JTAG server), chowns output back when running as root |
-| `scripts/build.sh` | the compile driver: finds the `.qpf`, applies build-time QSF tweaks, runs `quartus_sh --flow compile`, collects the bitstream, parses the fitter/STA summaries, reverses the bits |
-| `scripts/reverse_bits.py` | `.rbf` → `.rbf_r` (per-byte bit reversal — the step Analogue calls "Creating a reversed RBF") |
-| `scripts/package_core.py` | validates the core JSON contract and assembles the SD layout + release zip. Every filename in `core.cores[]` must be backed by its own artifact — it will not reuse one bitstream for several variants |
-| `scripts/new_core.sh` | scaffolds `cores/<name>` from the template and renames the Quartus project |
-| `scripts/doctor.sh` | environment checks, plus `--smoke` which compiles a throwaway design for the Pocket device |
-| `scripts/a5k_translate.sh` | `.si` → Verilog for the a5k port; runs inside the Silice image (see §5) |
-| `docker/Dockerfile.silice` | the **second** image: Silice toolchain, needed only for `ports/another-world` |
-| `docker/run-silice.sh` | same uid-mapping wrapper as `run.sh`, for the Silice image — use it instead of a bare `docker run` |
-| `ports/another-world/` | the a5k (*Another World*) port study: pinned upstream, feasibility probes (§5) |
-| `docs/another-world/` | problem analysis + measured feasibility probes for that port |
-| `cores/core-template/` | git submodule of [`open-fpga/core-template`](https://github.com/open-fpga/core-template) pinned at **v1.3.0** (`da3a021`) — Analogue's official starting point, containing the APF (Analogue Pocket Framework). Clone with `git clone --recurse-submodules`, or `git submodule update --init` afterwards |
-| `build/<core>/` | `compile.log`, `report.txt`, `ap_core.rbf`, `ap_core.sof`, `bitstream.rbf_r` |
-| `Makefile` | the front door; `make help` lists every target |
-
-### How the toolflow works
-
-```
-cores/<core>/src/fpga/<proj>.qpf
-   │  quartus_sh --flow compile <proj>.qpf -c <revision>
-   ├─ Analysis & Synthesis   (quartus_map)
-   ├─ Fitter                 (quartus_fit)   ← NUM_PARALLEL_PROCESSORS applied here
-   ├─ Assembler              (quartus_asm)   → output_files/<proj>.sof + .rbf (GENERATE_RBF_FILE)
-   └─ TimeQuest STA          (quartus_sta)   → <proj>.sta.summary
-   │
-   ├─ reverse_bits.py:  <proj>.rbf  →  build/<core>/bitstream.rbf_r
-   └─ package_core.py:  JSONs + bitstream + platform metadata → SD tree + zip
-```
-
----
-
-## 3. Porting an existing FPGA core to the Pocket
-
-### 3.1 What the Pocket hands you (the APF contract)
-
-The top level is **`apf_top`** (`src/fpga/apf/apf_top.v`, provided by Analogue — do
-not edit it). It owns the physical Pocket I/O: cartridge buses and their level
-shifter directions, the two PSRAM chips, the OSD/scaler, the SPI bridge and the
-I/O pad controller. Your core is instantiated by `apf_top` as **`core_top`**
-(`src/fpga/core/core_top.v`) — that file is yours and is the whole port.
-
-`core_top`'s logical interface (from the template, verbatim):
-
-```systemverilog
-// clocks: 74.25 MHz, two asynchronous copies - treat as async domains
-input  wire        clk_74a, clk_74b,
-
-// video to the scaler: 24-bit RGB888, pixel clock + its 90° twin
-output wire [23:0] video_rgb,
-output wire        video_rgb_clock, video_rgb_clock_90,
-output wire        video_de, video_skip, video_vs, video_hs,
-
-// audio to the codec (I2S-style: master clock, DAC data, LRCK)
-output wire        audio_mclk, audio_dac, audio_lrck,
-input  wire        audio_adc,
-
-// host<->target bridge, synchronous to clk_74a (ROM download, savestates,
-// OSD menu items, status). core_bridge_cmd.v implements the standard commands.
-output wire        bridge_endian_little,
-input  wire [31:0] bridge_addr,
-input  wire        bridge_wr,  input  wire [31:0] bridge_wr_data,
-input  wire        bridge_rd,  output reg  [31:0] bridge_rd_data,
-
-// up to four controllers, key bitmaps + analog + triggers
-input  wire [31:0] cont1_key, cont2_key, cont3_key, cont4_key,
-input  wire [31:0] cont1_joy, cont2_joy, cont3_joy, cont4_joy,
-input  wire [15:0] cont1_trig, cont2_trig, cont3_trig, cont4_trig
-```
-
-Inside `core_top` you will also wire three status signals into
-`core_bridge_cmd` — these are what Analogue OS waits for:
-
-```systemverilog
-status_boot_done   = pll_locked          // FPGA is configured and alive
-status_setup_done  = pll_locked          // rising edge triggers target commands
-status_running     = reset_n             // core out of reset
-```
-
-Official reference: [core boot process](https://www.analogue.co/developer/docs/core-boot-process),
-[bus communication](https://www.analogue.co/developer/docs/bus-communication),
-[host/target commands](https://www.analogue.co/developer/docs/host-target-commands),
-[core definition files](https://www.analogue.co/developer/docs/core-definition-files),
-[SD folder structure](https://www.analogue.co/developer/docs/directories-and-sd-folder-structure),
-[packaging](https://www.analogue.co/developer/docs/packaging-a-core).
-
-### 3.2 Your budget
-
-From the fitter report of a design on this device (`make report`):
-
-| Resource | 5CEBA4F23C8 total |
-|---|---|
-| Logic (ALMs) | 18,480 |
-| Memory bits | 3,153,920 (308 RAM blocks) |
-| DSP blocks | 66 |
-| PLLs | 4 |
-| User pins | 224 |
-
-For comparison the template uses 414 ALMs. A big core (SNES, Amiga) has to be
-sized against this table before you start — a core that fits on a MiSTer
-Arria-10 (110K–480K LE, 4–8 MB of block RAM) will **not** fit here unmodified.
-
-### 3.3 Porting checklist
-
-1. **Bring the RTL in, not the project.** Copy the core's RTL into
-   `cores/<core>/src/fpga/core/` (e.g. `rtl/`, `ip/`) and register every file in
-   `cores/<core>/src/fpga/<proj>.qsf`:
-
-   ```tcl
-   set_global_assignment -name VERILOG_FILE  core/rtl/foo.v
-   set_global_assignment -name VHDR_FILE     core/rtl/pkg.vhd     ;# VHDL_ORDER matters
-   set_global_assignment -name QIP_FILE      core/ip/my_ram.qip
-   set_global_assignment -name SDC_FILE      core/core_constraints.sdc
-   ```
-
-   Top-level entity stays `apf_top`; `core_top` is where your design hangs off
-   the APF signals.
-
-2. **Re-target the device.** MiSTer and other boards use different Cyclone V /
-   Arria 10 parts. Set (the template already has the right values):
-
-   ```tcl
-   set_global_assignment -name FAMILY "Cyclone V"
-   set_global_assignment -name DEVICE 5CEBA4F23C8
-   ```
-
-   Anything Arria-10-only (`altera_a10_*` IPs, HPS, EMIF, `altera_iopll` A10
-   variants, `ALTDDIO` variants not in Cyclone V) has to go.
-
-3. **Rebuild the clocking around 74.25 MHz.** This is where most ports die.
-   The Pocket gives you only `clk_74a`/`clk_74b` at 74.25 MHz; every other
-   frequency must come from a PLL instantiated from the APF's
-   `mf_pllbase` (Altera PLL IP under `src/fpga/core/mf_pllbase*`). Regenerate
-   the PLL for your core's pixel/system clocks and audio master clock, and
-   cross domains with async FIFOs. Do **not** divide the pixel clock up to the
-   scaler: drive `video_rgb_clock` at the real pixel rate and use `video_skip`
-   for modes that need it.
-
-4. **Replace memory primitives.** MiSTer's Arria-10 `altmem`/`10R_*` blocks and
-   huge init files must become Cyclone V M9K blocks (`altsyncram`, or the
-   `dpram`/`sdpram` wrappers cores usually carry). Check the M9K budget; large
-   framebuffers usually go to the PSRAM via the APF instead of block RAM.
-
-5. **ROM loading and save states.** The Pocket has no SD card reader inside the
-   FPGA: Analogue OS streams the ROM into your core over the bridge bus.
-   Declare the slots in `data.json`, and either let `core_bridge_cmd.v` handle
-   the standard FSDB/file commands or implement the handlers for your memory.
-   Savestates work by Analogue OS reading back those same data slots.
-
-6. **Describe the core for Analogue OS** — the JSON files at the core root:
-   `core.json` (id, platform ids, framework capabilities, variant list),
-   `video.json` (one `scaler_mode` per video mode: size, aspect, rotation),
-   `input.json` (which controls/axes your core reads), `audio.json`,
-   `data.json` (ROM slots + extensions), `interact.json` (on-screen menu
-   variables), `variants.json`, `info.txt`.
-   `make package` validates these (`magic: APF_VER_1`, unique variant ids in
-   both `core.cores[]` and `variants.json`, every declared bitstream present,
-   every declared platform has a definition).
-
-   If `core.cores[]` declares **more than one** entry, each needs its own build
-   artifact: `--bitstream` only ever satisfies a single-variant core (or the one
-   entry whose filename it matches). Map the rest explicitly — packaging refuses
-   to copy one image under several names, because that packages a core whose
-   variants all silently boot the same bitstream:
-
-   ```bash
-   python3 scripts/package_core.py --core-dir cores/mygame --out build/sd \
-       --variant default=build/mygame/default.rbf_r \
-       --variant hispeed=build/mygame/hispeed.rbf_r --zip
-   ```
-
-   A variant file already sitting in `cores/<name>/`, `output/`, `dist/` or
-   `src/fpga/output_files/` is picked up without being named.
-
-7. **Build early, build often:**
-
-   ```bash
-   make build CORE=mygame              # first build ~1-2h for a large core
-   make report CORE=mygame             # utilisation + slack in every corner
-   make build CORE=mygame NO_SIGTAP=1  # skip SignalTap when you are done debugging
-   ```
-
-8. **Fix timing before chasing bugs.** Negative slack means the design may work
-   on the bench and fail in your hands. The build fails on negative slack unless
-   `ALLOW_TIMING_FAIL=1`; typical fixes, in order: move logic off the critical
-   path / retime, lower the PLL target, enable
-   `set_global_assignment -name OPTIMIZE_MULTI_CORNER_TIMING ON`, tighten the
-   SDC (false paths and multicycle paths for genuinely async logic — a missing
-   `set_false_path` between async domains wastes hours), and only then consider
-   the "Extra effort" / "Performance" fitter settings.
-
-9. **Test on hardware.** JTAG the Pocket (T6 screwdriver on the back, JTAG header
-   at the bottom edge; the developer edition has a door) with an Intel-approved
-   Blaster. USB access from Docker needs the host devices:
-
-   ```bash
-   AP_RUN_AS=root AP_WITH_USB=1 make shell
-   # inside: quartus_hps / jtagconfig, then program the .rbf (not .sof) you built
-   ```
-   Re-loading the bitstream over JTAG re-initialises the core with the same
-   assets — that is the fast iteration loop. USB-Link mode (Tools ▸ Developer)
-   mounts the microSD over USB-C for JSON tweaks (< 1 MB/s).
-
-10. **Release:** bump `core.json` metadata (`version`, `date_release`, `url`),
-    then `make package CORE=mygame RELEASE=1` and ship the zip (upstream
-    convention is a zip containing `Cores/`, `Platforms/`, `Assets/`).
-
-### 3.4 SignalTap and debug
-
-The template ships a SignalTap `.stp` (`ENABLE_SIGNALTAP ON`). It is invaluable
-when a port boots to a black screen and useless once it works — it inflates
-compile time and area. Toggle it per build with `NO_SIGTAP=1`; `build.sh` edits
-the QSF only for the duration of the build and always restores the original
-(you will see `[build] restored original ...qsf` in the output, and `git status`
-stays clean for that file).
-
----
-
-## 4. Configuration
-
-Copy `config.mk.example` to `config.mk` for per-machine defaults. Anything can
-also be set per command:
+Output: **`build/aw-all-audio.bin`**, 3,813,404 bytes (3.64 MiB), sha256 `9719548c…` for the retail
+data. Useful variants:
 
 ```bash
-make build CORE=mygame JOBS=8 NO_SIGTAP=1
-ALLOW_TIMING_FAIL=1 make build CORE=mygame
-AP_RUN_AS=root make shell              # for JTAG / USB work
-AP_EXTRA_MOUNT=/home/me/cores:/home/me/cores make shell
+make rom ARGS=--skip-packs      # reuse the packs, rebuild only audio + image
+make rom ARGS=--no-audio        # pool-only image (silent)
+scripts/build_all_in_one.sh --out my-image.bin
 ```
 
-| Variable | Meaning |
-|---|---|
-| `CORE` | which `cores/<name>` to work on |
-| `IMAGE` / `BASE_IMAGE` | derived image tag / Quartus base image |
-| `PERMS` | `1` (default) repairs the base image's root-only install so builds run as your uid; `0` for a smaller image + `AP_RUN_AS=root` |
-| `JOBS` | Quartus `NUM_PARALLEL_PROCESSORS` for this build |
-| `NO_SIGTAP` | disable SignalTap for this build |
-| `ALLOW_TIMING_FAIL` | keep going when STA reports negative slack |
-| `QUARTUS_ARGS` | extra args appended to `quartus_sh --flow compile` |
-| `AP_RUN_AS` | `user` (default) or `root` |
-| `AP_WITH_USB` | `1` adds `--privileged` for JTAG/USB |
-| `AP_DEVICE` | device the doctor sanity-checks (default `5CEBA4F23C8`) |
+### 4. The core bitstream
 
-### Continuous integration
+```bash
+make build CORE=aw            # Quartus: analyse, fit, route, assemble -> build/aw/bitstream.rbf_r
+make check-build CORE=aw      # audit the reports: dead logic, clock assignments, timing
+```
 
-The image is just a Quartus container, so community openFPGA CI recipes work
-unchanged (they mount the workspace at `/build`, which is symlinked for
-compatibility):
+`make check-build` is not decoration: a design can close timing while a RAM has become a ROM or a
+register can never change. It looks for exactly that, and for SDC constraints that matched nothing.
 
-```yaml
-- run: docker run --rm -v ${{ github.workspace }}:/build local/ap-pocket:quartus22.1 \
-         quartus_sh --flow compile src/fpga/mygame.qpf -c default
+### 5. Package
+
+```bash
+make package CORE=aw
+```
+
+Produces a ready-to-copy SD layout and a zip:
+
+```
+build/sd/aw/
+  Cores/Eddie Chan.Another World/     core.json, video.json, bitstream.rbf_r, loader.bin …
+  Platforms/anotherworld.json
+  Platforms/_images/anotherworld.bin
+  Assets/anotherworld/common/         aw-all-audio.bin, the per-part packs
+  Eddie Chan.Another World-1.0.0.zip
+```
+
+`core.json` is stamped from the artifact it ships with (version and a release date taken from the
+bitstream's timestamp) so the folder label cannot disagree with the bitstream inside it.
+
+### 6. Tests (optional, no hardware needed)
+
+```bash
+make sim              # static lint + the whole bench suite
+make sim-tracker-pcm  # the tracker's audio against the reference renderer, sample for sample
+make sim-soc          # boot the design in simulation, capture frames as PPMs
+make lint             # fail if a signal the core reads is driven by nothing
 ```
 
 ---
 
-## 5. The second workstream: Another World (a5k / Silice)
+## Install on the Pocket
 
-`ports/another-world/` is a port study for **a5k**, the hardware design behind
-[*Another World*](https://github.com/sylefeb/a5k). It is not a Pocket core yet
-and it does not enter the flow above through `.qpf`: a5k is written in **Silice**
-(`.si`, compiled by a C++/ANTLR frontend), so it must be translated to Verilog
-before `quartus_map` sees it. That is why there is a second image.
+1. Copy **`Cores/`, `Platforms/` and `Assets/`** from `build/sd/aw/` to the **root of the Pocket's
+   microSD card**. Merge — do not replace the folders; other cores live there too.
+2. Put the game image where the platform looks for assets. `package` already places it at
+   `Assets/anotherworld/common/aw-all-audio.bin`; if you are installing by hand, copy
+   `build/aw-all-audio.bin` there.
+3. On the Pocket: **openFPGA → Another World**.
+4. In the core's menu choose the dataslot file **`aw-all-audio.bin`**. This is the one file that
+   carries the whole game; the eight separate `partN.bin` files are only for older test builds.
+5. Launch. The intro starts from the first frame, with sound effects and music.
 
-| Target | What it does |
+### Choosing a chapter
+
+`Game part` in the core's OSD lists **Part 1 … Part 8** (the game's own numbering; Part 1 is the
+copy-protection screen, Part 2 the intro). The choice is persisted, so it applies from the first
+frame on the next launch. You can also change it **while the game is running**: the core switches
+the page table, restarts the VM and renders the new chapter without an upload or a relaunch. Left
+alone, the game requests the next chapter by itself, as the original does.
+
+### Controls
+
+D-pad to move, **A** or **B** to act — Another World has a single action verb, so both face buttons
+are fire. The core declares no custom controller block (it reads the OS default pad mapping) and is
+single-player; START and the analog stick are not used.
+
+---
+
+## Troubleshooting
+
+**Black or silent, with the right file selected.** Check the console line over the Pocket's USB-C
+debug port (115200 baud on `/dev/ttyUSB0` when docked to a PC):
+
+```
+AW 1065a up
+C0:… Z.0 0545c705/0545c705 G15 E00
+M1 0119 005a  I02c A2f0008  C02 S0e D02  K416a  E1a
+```
+
+| field | meaning |
 |---|---|
-| `make upstream` | clone/refresh upstream a5k at the commit pinned in `ports/another-world/UPSTREAM_PIN` |
-| `make silice-image` | build the Silice toolchain from `docker/Dockerfile.silice` |
-| `make a5k-translate` | `.si` → `upstream/hardware/BUILD_probe/build.v`, the Quartus input |
-| `make silice-shell` | shell in the Silice image |
-| `make silice CMD='silice --help'` | any other command in that image |
-| `make probe SCRIPT=probe/pll/run.sh` | run one feasibility probe inside the **Quartus** container (`make probe` alone lists them) |
+| `Z.0` + equal sums | the whole image upload arrived and matches its declared checksums |
+| `G15` | the part currently installed (1) and its flags — bit 3 means a select was refused |
+| `M1 … rows/notes` | the music tracker is running, and how far |
+| `K416a` | the audio index was found in the image (tag `41`, 106 records) |
+| `E…` | how many `op_playSound` requests the game has issued |
 
-The findings live in [`docs/another-world/problem-analysis.md`](docs/another-world/problem-analysis.md)
-(sizing the design against 18,480 ALMs) and
-[`docs/another-world/feasibility-probes.md`](docs/another-world/feasibility-probes.md)
-(the SystemVerilog switch that gets Silice output past `quartus_map`, PLL reachability,
-and the sub-byte write-masked framebuffer that does **not** map to Cyclone V M9K).
+A `K0000` means the selected dataslot file has no audio section — almost always the wrong file.
+Equal `Z` sums with a black screen means the upload was fine and the problem is downstream.
 
-Both images are driven by a wrapper — `docker/run.sh` for Quartus,
-`docker/run-silice.sh` for Silice — and both map your uid/gid. Do not `docker run`
-the Silice image directly: as root it lays `BUILD_*` down as `root:root 755`, and
-a directory you cannot write into is a directory you cannot delete files in,
-sudo or `chown` required. See Troubleshooting.
+**Nothing on screen at all.** The core needs the dataslot file selected; without one it refuses to
+boot rather than drawing a black screen.
 
-Verified here: `make a5k-translate` regenerates `build.v` at the documented
-181,419 B / 8,152 lines / 31 modules, with all 43 generated files owned by the
-host user.
+**Rebuild reproducibility.** `make rom` is deterministic for the same input data: the image's
+sha256 is the check. `make build` needs an existing Silice netlist; if the tree has never been
+translated, run `make pocket-translate` first.
 
 ---
 
-## 6. Troubleshooting (all of these were hit for real while building this env)
+## How it works, briefly
 
-* **`BUILD_*` under `ports/another-world/upstream/` is root-owned and `rm` says
-  Permission denied** — Silice was run through a bare `docker run` instead of
-  `docker/run-silice.sh`. The directory itself is `root:root 755`, so the host
-  user cannot unlink inside it even though its parent is theirs. Repair:
-  `docker run --rm -v $PWD:/work ubuntu:latest chown -R $(id -u):$(id -g) /work/ports`
-  then use `make a5k-translate`.
+The original engine is a bytecode interpreter whose "ROM" is a 2 MiB data pack per game part. This
+port keeps the engine intact and replaces the storage below it:
 
-* **`quartus_sh: error while loading shared libraries: libprotobuf.so.14`** when
-  not root — the base image was built with a restrictive umask, so ~23k files of
-  the Quartus install are root-only. Rebuild the env image with the default
-  `FIX_PERMS=1` (`make image`, one-off ~4 min / ~1.1 GB) or run
-  `AP_RUN_AS=root make build`, which chowns artifacts back to your uid. `make
-  doctor` reports exactly this.
-* **`Error (125048): Error reading ... .qsf` on the last line** — Quartus writes
-  QSF files CRLF and sometimes without a trailing newline; appending an
-  assignment to such a file fuses it onto the last line. `build.sh` inserts the
-  missing newline; keep it in mind if you script QSF edits of your own.
-* **`quartus_sh --flow compile x.qpf -s rev` fails with "Expected arguments are
-  --flow <flow_name> <project_name> [-c <revision>]"** — the flow takes `-c`,
-  not `-s`.
-* **`Warning (292013): LogicLock is only available with a valid subscription
-  license`** — Quartus Lite. Harmless unless your port relies on LogicLock
-  partitions.
-* **`Warning (12914): db/stp1_auto_stripped.stp is not embedded into sof`** —
-  benign SignalTap bookkeeping.
-* **`Warning (332060): ... was determined to be a clock but was found without an
-  associated clock assignment`** — very common in ported cores; add
-  `create_clock`/`derive_pll_clocks` coverage in `core_constraints.sdc`, or
-  `set_false_path`/`set_clock_groups -asynchronous` if the domain really is
-  asynchronous.
-* **Bitstream size differs from another build of the same core** — normal: the
-  same design is 787,952 bytes with Quartus 18.1 and ~787,900 with 22.1.
-  `reverse_bits.py` only warns on gross deviations.
-* **A core built by someone else misbehaves** — Quartus version matters for
-  placement, not correctness, but PLL/IP generation is version-sensitive: if a
-  published core is broken for you, try the Quartus version its author used
-  (`BASE_IMAGE=` accepts any Quartus image, e.g. `raetro/quartus:21.1`).
-* **Files in `cores/core-template` show as modified after a build** — that repo
-  commits Quartus outputs (`ap_core.rbf`, `ap_core.jdi`, `apf/build_id.mif`).
-  Your own core should gitignore them, as `.gitignore` here does.
-* **`apt-get` inside the container fails** — Debian 9 is off the main mirrors;
-  the env deliberately installs nothing. If you truly need a package, use
-  `archive.debian.org` with `-o Acquire::Check-Valid-Until=false`.
+- **Paging.** The eight packs are 79 % identical at the same offsets, so the core stores a pool of
+  distinct 32 KiB frames plus a 64-entry page table per part. The VM still sees a flat 2 MiB view,
+  byte-identical to the pack it would have read; it never learns there is a pool.
+- **Streaming.** A byte-stream loader with a 16 KB FIFO feeds the VM over the bridge, which is what
+  makes a 3.64 MiB upload arrive intact.
+- **Audio.** The index of every sound and music resource is copied out of the image at boot; the
+  mixer fetches sample bytes through the same PSRAM port as everything else, with the music tracker
+  and effects sharing it by priority.
+- **Chapters.** The game's own `op_updateMemList` request is surfaced to the core, which points the
+  page table at the new part and restarts the VM — with the trailer re-read and the thread table
+  reset to what a cold boot has, which is what makes the new chapter actually run.
+
+Details, measurements and the failures that got here are in
+[`docs/another-world/port-log.md`](docs/another-world/port-log.md).
 
 ---
 
-## 7. Notes on the base image
+## Repository layout
 
-`didiermalenfant/quartus:22.1-apple-silicon` is the only tag on that repository
-(≈5.9 GB compressed). It contains Quartus Prime **Lite** 22.1std.2 build 922
-(no licence file needed, Cyclone V supported — `make doctor` confirms the
-device DB), the Nios II/Unix toolchains, `git`, `make`, `tclsh` and Python
-**3.5.3**. Its entrypoint optionally runs `gh auth setup-git` (with
-`GITHUB_TOKEN`) and `jtagconfig --addserver` (with `JTAG_SERVER`/`JTAG_PASSWD`);
-the derived image preserves that behaviour.
+| Path | What |
+|---|---|
+| `cores/aw/` | the core: APF metadata, `core_top.v`, the APF bridge, the audio and ROM RTL, the Silice SoC source |
+| `ports/another-world/` | the a5k port work: extractor, packs, upstream sources |
+| `scripts/` | build, extract, package, install and simulation entry points |
+| `docs/another-world/` | port log, audio plan, single-image plan, problem analysis, hardware bring-up notes |
+| `docs/ap-tool-build-environment.md` | the Docker/Quartus environment this all runs in |
+| `gamedata/` | **you supply this** — the PC release's data banks |
 
-Because that Python is 3.5, everything in `scripts/` is written to run on
-Python 3.5 and on modern Python alike — no f-strings, no `dirs_exist_ok`, no
-PEP-604 annotations. Keep it that way if you add tooling.
+---
 
-## 8. Licensing
+## Credits and licensing
 
-The APF sources under `src/fpga/apf/` are Analogue's, licensed under their
-[Pocket EULA](https://www.analogue.link/pocket-eula) — use them only to build
-cores for Analogue hardware. Quartus and the device data are Intel-licensed.
-The scripts in this repo are yours to do with as you please.
+- **Another World** / *Out of This World* is © Delphine Software International, designed by Éric
+  Chahi. All game data, graphics, sound and music remain the property of their owners. This project
+  ships no game data, and the extraction tools only operate on files you provide from a copy you
+  own.
+- The engine implementation is **[sylefeb/a5k](https://github.com/sylefeb/a5k)** (MIT), a Silice
+  port of the original bytecode interpreter and renderer, used here as the SoC's core. The
+  divergences from upstream (the part request, the audio opcodes, the trailer counter re-arm and the
+  cold-boot thread table) are enumerated in `scripts/pocket_translate.sh`.
+- Analogue, Pocket and openFPGA are trademarks of Analogue. This is an unofficial, non-commercial
+  port and is not affiliated with or endorsed by Analogue, Delphine Software or Éric Chahi.
