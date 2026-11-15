@@ -3623,3 +3623,24 @@ arithmetic error. Eliminated: a fixed latency (best offset shift is 0), and the 
 are already zero for this instrument). Next tests if it ever matters: render at a third delay to see
 whether the residual scales with the tick period, and dump the RTL's per-channel `ch_pos`/`ch_vol`
 beside `ref_mixer.Channel` at the first differing index.
+
+### Shipping: `make rom` and `make package` (2026-11-12)
+
+The build had grown into a sequence of commands that each documented itself and none of which was the
+entry point a person would look for. Two now are:
+
+* **`make rom`** — `scripts/build_all_in_one.sh`. From `gamedata/` (the licensed DOS release, not in this
+  repo) to the single dataslot image, in the three documented steps: `extract_packs.sh` (eight 2 MiB
+  packs) → `extract_audio.py` (103 sounds, 11 of them looping, plus the 3 music modules) →
+  `build_combined_image.py` (frame pool + page tables + audio blob, then `--verify`). Measured on this
+  tree: 3,813,404 bytes, sha256 `9719548c…` — the same image that is on the card, so the pipeline
+  reproduces it byte for byte. `--skip-packs` reuses the packs, `--no-audio` builds the pool-only image,
+  `--out` chooses the path.
+* **`make package`** — now also ships that image (and the pool-only one when present) in
+  `Assets/anotherworld/common/`, and **stamps `core.json` with the build**: version 1.0.0 and a
+  `date_release` taken from the bitstream's mtime, not from the day someone typed the JSON. The metadata
+  said `0.1.0 / 2026-10-08` while the bitstream in the same folder was AW 1065 — the same class of lie as
+  the banner that announced "AW 1041a up" for three releases.
+
+Output: `build/sd/aw/` (Cores/Platforms/Assets, 22 files) and `Eddie Chan.Another World-1.0.0.zip`.
+Copy `Cores/`, `Platforms/` and `Assets/` to the card root and merge.

@@ -51,7 +51,7 @@ CORES    := $(notdir $(wildcard cores/*))
 .PHONY: help image pull doctor smoke shell build clean-build rev package test \
         new report list size clean distclean prune \
         silice-image silice-shell silice a5k-translate upstream probe \
-        lint sim sim-write sim-rom sim-dir sim-keys sim-iv sim-reset sim-soc sim-dbg \
+        lint sim sim-write sim-rom sim-dir sim-keys sim-iv sim-reset sim-soc sim-dbg rom \
         sim-top sim-audio sim-tracker-pcm check-build worst-path loader
 
 help:
@@ -82,6 +82,7 @@ help:
 	@echo "Another World (a5k / Silice) port - see docs/another-world/"
 	@echo "  make upstream              fetch/refresh pinned upstream a5k sources"
 	@echo "  make packs                 gamedata/ -> partN.bin packs (part1 = the intro)"
+	@echo "  make rom                   gamedata/ -> the single dataslot image (packs + audio, verified)"
 	@echo "  make sim-soc [PACK=f]      boot the design in simulation, capture frames"
 	@echo "  make sim-top               whole core_top: idle screen, load, mux switch, APF video protocol"
 	@echo "  make lint                  fail if a signal the core reads is driven by nothing (undriven-net guard)"
@@ -250,6 +251,17 @@ package: loader
 	 mkdir -p $(CORE_DIR)/dist/assets/anotherworld/common && \
 	 cp -f ports/another-world/packs/part*.bin $(CORE_DIR)/dist/assets/anotherworld/common/; \
 	fi
+	@# The single-file dataslot image: one upload carries all eight parts and the audio, and the
+	@# OSD's Game part list selects the chapter. It is a build product of scripts/build_all_in_one.sh
+	@# (`make rom`), so ship it when it exists rather than making every package run rebuild 3.6 MiB.
+	@for img in build/aw-all-audio.bin build/aw-all.bin; do \
+	 if [ -f "$$img" ]; then cp -f "$$img" $(CORE_DIR)/dist/assets/anotherworld/common/; \
+	  echo "package: included $$img"; fi; \
+	done
+	@# Stamp the release with the build it actually contains (core.json used to claim 0.1.0 while the
+	@# bitstream was a different build - the same class of lie as the banner that said "AW 1041a up"
+	@# for three releases).
+	@$(PY) scripts/stamp_release.py $(CORE_DIR)/core.json $(BUILD)/bitstream.rbf_r $(if $(RELEASE_VERSION),--version $(RELEASE_VERSION),)
 	@bit=$(BUILD)/bitstream.rbf_r; \
 	 test -f "$$bit" || { echo "$$bit missing - run make build first"; exit 1; }; \
 	 $(PY) scripts/package_core.py --core-dir $(CORE_DIR) --bitstream "$$bit" \
@@ -341,6 +353,11 @@ upstream:
 # "make: *** No rule to make target 'packs'".
 packs:
 	@./docker/run-extract.sh scripts/extract_packs.sh
+
+# The whole pipeline in one command: original ROM banks -> per-part packs -> audio -> the single
+# verified dataslot image (build/aw-all-audio.bin). scripts/build_all_in_one.sh documents the steps.
+rom:
+	@scripts/build_all_in_one.sh
 
 # feasibility probes expect to run inside the Quartus container:
 #   make probe SCRIPT=probe/pll/run.sh
