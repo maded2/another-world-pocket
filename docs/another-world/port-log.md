@@ -3644,3 +3644,22 @@ entry point a person would look for. Two now are:
 
 Output: `build/sd/aw/` (Cores/Platforms/Assets, 22 files) and `Eddie Chan.Another World-1.0.0.zip`.
 Copy `Cores/`, `Platforms/` and `Assets/` to the card root and merge.
+
+### The platform category was the reason the core did not appear
+
+A fresh install on a card full of working cores showed nothing under openFPGA. Every file on the
+card matched the build byte for byte, the JSONs all parsed, the platform image was the right size
+and the bitstream was the one that had already booted on another card. The difference was one word:
+
+    Platforms/anotherworld.json    "category": "Other"     -> not listed
+
+Every other platform on that card uses `"Others"` (plural) — Arcade 198, Computer 40, Console 32,
+Arcade Multi 27, Handheld 24, **Others 5**, Tools 2 … and our singular `Other` was the only one.
+The firmware ignores a category it does not know, and with the platform ignored its cores never
+appear in the menu. Fixed in `cores/aw/dist/platforms/anotherworld.json`; the core then shows under
+**Others → Another World**.
+
+Worth keeping: the metadata files are the one part of this project that a *validator* reads rather
+than a person, and a mistake there is silent — nothing crashes, the core is simply absent. The
+check that would have caught it is comparing against the platforms that already work on the same
+card, which is cheap and should be part of packaging.
