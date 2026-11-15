@@ -9,8 +9,8 @@
             "description": "Another World (Out of This World, Delphine Software 1991). Runs the original engine: a Silice virtual machine over game data loaded through the dataslot, with the original 4-channel 8-bit mixer and I2S output.",
             "author": "Eddie Chan",
             "url": "https://github.com/sylefeb/a5k",
-            "version": "1.0.0",
-            "date_release": "2026-11-14"
+            "version": "1.0.1",
+            "date_release": "2026-11-15"
         },
         "framework": {
             "target_product": "Analogue Pocket",
