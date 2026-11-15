@@ -118,3 +118,23 @@ cores/*/loader.bin
 # port-log.md. The current installer stays tracked.
 scripts/sd_install_102*.sh
 scripts/sd_install_103[0-4]*.sh
+
+# ---------------------------------------------------------------------------
+# NEVER PUBLISH GAME DATA.
+#
+# Another World's data banks, the packs extracted from them, the combined
+# dataslot image and anything the packager copied into Assets/ are all derived
+# from the commercial release and are not ours to distribute. The user supplies
+# their own copy (see README). These patterns are a backstop: if a future change
+# starts tracking one of these, the file is ignored rather than committed.
+gamedata/
+ports/another-world/gamedata/
+ports/another-world/packs/
+cores/*/dist/assets/
+build/*.bin
+*.smc
+*.sfc
+*.md5rom
+*.iso
+*.rom
+# ---------------------------------------------------------------------------
