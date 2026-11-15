@@ -220,6 +220,8 @@ Details, measurements and the failures that got here are in
 
 ## Credits and licensing
 
+- **This project's own code** (the Pocket core, the RTL additions, the build and extraction scripts)
+  is released under the **MIT licence** — see [`LICENSE`](LICENSE).
 - **Another World** / *Out of This World* is © Delphine Software International, designed by Éric
   Chahi. All game data, graphics, sound and music remain the property of their owners. This project
   ships no game data, and the extraction tools only operate on files you provide from a copy you
